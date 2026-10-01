@@ -48,12 +48,12 @@ type GraphFile struct {
 // lists are sorted by name byte order; relation lists are sorted by upstream
 // then downstream.
 type BatchReport struct {
-	FinalGraph           GraphFile  `json:"finalGraph"`
-	NewDatasets          []string   `json:"newDatasets"`
-	ChangedDatasets      []string   `json:"changedDatasets"`
-	AddedRelations       []Relation `json:"addedRelations"`
-	RemovedRelations     []Relation `json:"removedRelations"`
-	AffectedDownstreams  []string   `json:"affectedDownstreams"`
+	FinalGraph          GraphFile  `json:"finalGraph"`
+	NewDatasets         []string   `json:"newDatasets"`
+	ChangedDatasets     []string   `json:"changedDatasets"`
+	AddedRelations      []Relation `json:"addedRelations"`
+	RemovedRelations    []Relation `json:"removedRelations"`
+	AffectedDownstreams []string   `json:"affectedDownstreams"`
 }
 
 // adjacency maps a dataset name to its sorted, duplicate-free parent names.
@@ -223,7 +223,7 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	report := &BatchReport{
 		FinalGraph:          GraphFile{Datasets: adjacencyToDatasets(final)},
 		NewDatasets:         newNames,
-		ChangedDatasets:      changedNames,
+		ChangedDatasets:     changedNames,
 		AddedRelations:      added,
 		RemovedRelations:    removed,
 		AffectedDownstreams: affected,
@@ -448,6 +448,30 @@ func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 	return json.MarshalIndent(gf, "", "  ")
 }
 
+// graphFileAdjacency validates the on-disk graph structure (empty names,
+// duplicate datasets, missing upstreams) and returns the normalized parent
+// map. It does not check for cycles; use validateAcyclic for that.
+func graphFileAdjacency(gf GraphFile) (adjacency, error) {
+	adj := make(adjacency, len(gf.Datasets))
+	for _, ds := range gf.Datasets {
+		if ds.Name == "" {
+			return nil, fmt.Errorf("%w: graph contains a dataset with an empty name", ErrInvalidArgument)
+		}
+		if _, exists := adj[ds.Name]; exists {
+			return nil, fmt.Errorf("%w: dataset %q is declared more than once in the graph", ErrInvalidArgument, ds.Name)
+		}
+		adj[ds.Name] = uniqueSorted(ds.Upstreams)
+	}
+	for name, parents := range adj {
+		for _, parent := range parents {
+			if _, ok := adj[parent]; !ok {
+				return nil, fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
+			}
+		}
+	}
+	return adj, nil
+}
+
 // UnmarshalGraphFile parses the on-disk graph JSON, rebuilds the in-memory
 // graph (parents and children), and validates it. A graph that is structurally
 // invalid (empty names, duplicate datasets, missing upstreams, or cycles) is
@@ -457,30 +481,26 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	if err := json.Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph JSON: %w", err)
 	}
-	graph := make(map[string]*Lineage, len(gf.Datasets))
-	for _, ds := range gf.Datasets {
-		if ds.Name == "" {
-			return nil, fmt.Errorf("%w: graph contains a dataset with an empty name", ErrInvalidArgument)
-		}
-		if _, exists := graph[ds.Name]; exists {
-			return nil, fmt.Errorf("%w: dataset %q is declared more than once in the graph", ErrInvalidArgument, ds.Name)
-		}
-		graph[ds.Name] = &Lineage{Dataset: ds.Name, Parents: uniqueSorted(ds.Upstreams)}
+	adj, err := graphFileAdjacency(gf)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAcyclic(adj); err != nil {
+		return nil, err
+	}
+	graph := make(map[string]*Lineage, len(adj))
+	for name, parents := range adj {
+		graph[name] = &Lineage{Dataset: name, Parents: parents}
 	}
 	// Rebuild children from the parent edges so the in-memory graph is
 	// consistent regardless of how the file was produced.
-	for name, entry := range graph {
-		for _, parent := range entry.Parents {
-			if parentNode, ok := graph[parent]; ok {
-				parentNode.Children = append(parentNode.Children, name)
-			}
+	for name, parents := range adj {
+		for _, parent := range parents {
+			graph[parent].Children = append(graph[parent].Children, name)
 		}
 	}
 	for name := range graph {
 		graph[name].Children = uniqueSorted(graph[name].Children)
-	}
-	if err := ValidateGraph(graph); err != nil {
-		return nil, err
 	}
 	return graph, nil
 }

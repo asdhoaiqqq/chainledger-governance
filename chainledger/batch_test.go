@@ -586,11 +586,11 @@ func TestBatchJSONRoundTrip(t *testing.T) {
 // rejects structurally invalid graphs.
 func TestBatchUnmarshalRejectsInvalidGraphJSON(t *testing.T) {
 	cases := map[string]string{
-		"empty name":      `{"datasets":[{"name":"","upstreams":[]}]}`,
-		"duplicate":       `{"datasets":[{"name":"A","upstreams":[]},{"name":"A","upstreams":[]}]}`,
+		"empty name":       `{"datasets":[{"name":"","upstreams":[]}]}`,
+		"duplicate":        `{"datasets":[{"name":"A","upstreams":[]},{"name":"A","upstreams":[]}]}`,
 		"missing upstream": `{"datasets":[{"name":"A","upstreams":["ghost"]}]}`,
-		"cycle":           `{"datasets":[{"name":"A","upstreams":["B"]},{"name":"B","upstreams":["A"]}]}`,
-		"invalid json":    `{not json`,
+		"cycle":            `{"datasets":[{"name":"A","upstreams":["B"]},{"name":"B","upstreams":["A"]}]}`,
+		"invalid json":     `{not json`,
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {
