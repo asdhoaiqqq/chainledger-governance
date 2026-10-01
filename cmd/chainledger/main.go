@@ -32,6 +32,10 @@ func run(args []string) int {
 		return runBatch(args[1:], false)
 	case "apply":
 		return runBatch(args[1:], true)
+	case "snapshot":
+		return runSnapshot(args[1:])
+	case "compare":
+		return runCompare(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return 0
@@ -52,6 +56,14 @@ commands:
                               modifying the graph file
   apply <graph> <plan>        validate the batch, apply it to the graph file,
                               and print the report
+  snapshot <graph> <snapshot> save a read-only versioned snapshot of the
+                              current graph; an existing snapshot of the same
+                              content is left byte-for-byte untouched, a
+                              different or corrupt target is refused
+  compare <old-snapshot> <new-snapshot>
+                              read-only comparison of two snapshots; prints a
+                              JSON report of nodes, relations, and root-source
+                              sets that differ from the old to the new version
   help                        show this help
 
 The graph file is JSON:
@@ -59,6 +71,11 @@ The graph file is JSON:
 
 The plan file is JSON:
   {"changes": [{"name": "A", "upstreams": ["B"]}, ...]}
+
+The snapshot file is JSON with formatVersion 1, a semantic contentId, and the
+complete graph. Its bytes depend only on graph semantics, never on record
+order, upstream order, duplicate upstreams, JSON whitespace, save time, or
+file path. compare never writes anything.
 
 A batch registers new datasets or replaces every direct upstream of an
 existing dataset with the listed upstreams. An empty upstream list makes the
@@ -141,6 +158,129 @@ func verb(apply bool) string {
 		return "apply"
 	}
 	return "preview"
+}
+
+// runSnapshot implements `snapshot <graph.json> <snapshot.json>`. It reads and
+// validates the current graph without modifying it, builds a deterministic,
+// content-addressed snapshot, and saves it.
+//
+// Save rules, serialized against concurrent saves by an advisory lock on a
+// sibling lock file:
+//   - target absent: create it atomically (temp file + rename);
+//   - target present, a valid snapshot of the same content: succeed and leave
+//     the existing file's bytes untouched (idempotent);
+//   - target present with different content, or corrupt/unreadable: refuse and
+//     never overwrite it.
+//
+// The content identifier is printed only after the save has committed.
+func runSnapshot(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: chainledger snapshot <graph.json> <snapshot.json>")
+		return 2
+	}
+	graphPath := args[0]
+	snapshotPath := args[1]
+
+	graphData, err := os.ReadFile(graphPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read graph file %q: %v\n", graphPath, err)
+		return 1
+	}
+	graph, err := chainledger.UnmarshalGraphFile(graphData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid graph file %q: %v\n", graphPath, err)
+		return 1
+	}
+	snap, err := chainledger.BuildSnapshot(graph)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot build snapshot from %q: %v\n", graphPath, err)
+		return 1
+	}
+	data, err := chainledger.MarshalSnapshot(snap)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot serialize snapshot: %v\n", err)
+		return 1
+	}
+
+	// Hold a process-wide advisory lock for the whole check-then-write so
+	// concurrent saves cannot interleave between inspecting the target and
+	// committing the replacement.
+	lock, err := acquireLock(snapshotPath + ".lock")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot lock snapshot target %q: %v\n", snapshotPath, err)
+		return 1
+	}
+	defer lock.release()
+
+	existing, err := os.ReadFile(snapshotPath)
+	switch {
+	case err == nil:
+		oldSnap, perr := chainledger.ParseSnapshot(existing)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "error: refusing to overwrite %q: existing file is not a valid snapshot: %v\n", snapshotPath, perr)
+			return 1
+		}
+		if oldSnap.ContentID != snap.ContentID {
+			fmt.Fprintf(os.Stderr, "error: refusing to overwrite %q: it already holds a different snapshot (content %s); target content would be %s\n", snapshotPath, oldSnap.ContentID, snap.ContentID)
+			return 1
+		}
+		// Same content: success without touching the file's bytes.
+	case os.IsNotExist(err):
+		if err := atomicWrite(snapshotPath, data); err != nil {
+			fmt.Fprintf(os.Stderr, "error: cannot write snapshot file %q: %v\n", snapshotPath, err)
+			return 1
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: cannot inspect snapshot target %q: %v\n", snapshotPath, err)
+		return 1
+	}
+
+	// The save committed (or an identical snapshot was already present); only
+	// now is the content identifier reported.
+	fmt.Println(snap.ContentID)
+	return 0
+}
+
+// runCompare implements `compare <old.json> <new.json>`: a strictly read-only
+// comparison of two snapshots that prints the deterministic JSON report to
+// stdout. It never writes to either file.
+func runCompare(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: chainledger compare <old-snapshot.json> <new-snapshot.json>")
+		return 2
+	}
+	oldPath := args[0]
+	newPath := args[1]
+
+	oldData, err := os.ReadFile(oldPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read old snapshot %q: %v\n", oldPath, err)
+		return 1
+	}
+	oldSnap, err := chainledger.ParseSnapshot(oldData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid old snapshot %q: %v\n", oldPath, err)
+		return 1
+	}
+	newData, err := os.ReadFile(newPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read new snapshot %q: %v\n", newPath, err)
+		return 1
+	}
+	newSnap, err := chainledger.ParseSnapshot(newData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid new snapshot %q: %v\n", newPath, err)
+		return 1
+	}
+
+	report := chainledger.CompareSnapshots(oldSnap, newSnap)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot write report: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // atomicWrite writes data to a temporary file in the same directory as path

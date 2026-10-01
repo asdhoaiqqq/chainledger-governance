@@ -10,6 +10,10 @@
 go run ./cmd/chainledger demo
 go run ./cmd/chainledger version
 go run ./cmd/chainledger help
+go run ./cmd/chainledger preview <graph.json> <plan.json>
+go run ./cmd/chainledger apply <graph.json> <plan.json>
+go run ./cmd/chainledger snapshot <graph.json> <snapshot.json>
+go run ./cmd/chainledger compare <old.json> <new.json>
 go test ./...
 ```
 
@@ -67,6 +71,49 @@ go run ./cmd/chainledger apply <graph.json> <plan.json>
 ### 错误处理
 
 读取失败、JSON 无效或无法完成图文件写入时，返回明确错误和非零退出码，不输出成功报告，原图文件完整保留（写入采用临时文件加原子重命名）。
+
+## 本地血缘快照与版本比较
+
+在一次血缘调整前后各保存一份只读快照，用比较命令看清派生数据的根来源是否改变。快照只记录数据集名称及直接上游关系，源图文件不会被修改。
+
+```bash
+# 保存当前图为版本化快照，成功后向标准输出打印内容标识
+go run ./cmd/chainledger snapshot <graph.json> <snapshot.json>
+
+# 只读比较两个快照（方向固定为旧 -> 新），向标准输出输出 JSON 报告
+go run ./cmd/chainledger compare <old.json> <new.json>
+```
+
+### 快照格式
+
+```json
+{
+  "formatVersion": 1,
+  "contentId": "sha256:…",
+  "graph": {"datasets": [{"name": "A", "upstreams": []}]}
+}
+```
+
+- `formatVersion` 固定为 `1`；`contentId` 是 `sha256:` 加图语义的十六进制摘要；`graph` 保存完整图。
+- 内容标识仅由图的语义决定。记录顺序、上游顺序、重复上游、JSON 空白不同但语义相同的输入，生成相同的内容标识与逐字节一致的快照，不受保存时间和文件路径影响。
+- 读取快照时严格核对：缺少必要字段、不支持的格式版本、标识与图不符、JSON 无效，或图中存在空名称、重复节点、缺失上游、环，均拒绝并说明文件与原因，返回非零退出码且不输出成功报告。
+
+### 保存规则
+
+- 目标不存在：临时文件加原子重命名创建，写入失败不会留下半份快照；内容标识仅在成功写入后输出。
+- 目标已是同一内容的合法快照：成功且保持原文件字节不变（幂等，mtime 也不变）。
+- 目标内容不同，或是损坏文件：拒绝覆盖，原文件完整保留。
+- 两个保存同时指向同一目标时，通过目标旁的锁文件串行化“检查—写入”过程：同内容皆成功，不同内容只有一个生效、另一个拒绝，目标始终为合法快照。
+
+### 比较报告
+
+比较方向固定为旧版本到新版本，报告字段包括：`newDatasets`、`removedDatasets`、`changedDatasets`（直接上游实际变化的共有数据集）、`addedRelations`、`removedRelations`、`rootSourceChanges`。
+
+- 新增和删除的关系按集合差异计算；节点删除连带消失的关系也列入删除关系。
+- 根来源是沿上游能到达的无上游数据集，根本身的来源包含自己，多条路径只计一次。
+- `rootSourceChanges` 只覆盖两个版本共有的数据集，列出名称以及各自的新旧根来源集合；新增、删除的数据集不混入此列表。
+- 仅调整路径但仍到达同一组根来源时，不报告来源变化。
+- 空图可保存可比较；快照与自身比较时所有差异列表为空。节点与名称列表按名称字节顺序排列，关系列表先按上游再按下游排列，空列表输出 `[]`，相同语义的比较结果逐字节一致。`compare` 不写任何文件。
 
 ## 技术方向
 
