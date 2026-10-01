@@ -9,8 +9,28 @@
 ```bash
 go run ./cmd/chainledger demo
 go run ./cmd/chainledger version
+
+# 批量血缘调整：先预览影响，再决定是否应用
+go run ./cmd/chainledger lineage preview graph.json plan.json
+go run ./cmd/chainledger lineage apply   graph.json plan.json
+
 go test ./...
 ```
+
+血缘文件均为 JSON，每条记录包含数据集名称及直接上游名称列表：
+
+```json
+{ "nodes": [ { "name": "B", "upstreams": ["A"] } ] }
+```
+
+```json
+{ "adjustments": [ { "name": "A", "upstreams": ["B"] } ] }
+```
+
+`lineage preview` 输出影响报告且不改动图文件；`lineage apply` 使用相同的
+判断与报告，成功后把最终图原子写回原图文件。整批调整可登记新数据集（同批
+新数据集可相互引用），也可整体替换已有数据集的直接上游，合法性以全部替换
+完成后的图为准；非法批次被整体拒绝并返回非零退出码，原图保持完整。
 
 ## 技术方向
 
