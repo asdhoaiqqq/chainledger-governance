@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"testing"
 )
 
@@ -353,11 +354,17 @@ func dump(graph map[string]*Lineage) string {
 		e := graph[name]
 		s += fmt.Sprintf("%s:{P:%v C:%v} ", name, e.Parents, e.Children)
 	}
-	// Include non-roots too.
+	// Include non-roots too, sorted by name so the dump is deterministic
+	// regardless of map iteration order.
+	var nonRoots []string
 	for name, e := range graph {
-		if len(e.Parents) == 0 {
-			continue
+		if len(e.Parents) != 0 {
+			nonRoots = append(nonRoots, name)
 		}
+	}
+	sort.Strings(nonRoots)
+	for _, name := range nonRoots {
+		e := graph[name]
 		s += fmt.Sprintf("%s:{P:%v C:%v} ", name, e.Parents, e.Children)
 	}
 	return s + "]"
