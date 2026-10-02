@@ -206,3 +206,106 @@ func TestCLIUnknownCommand(t *testing.T) {
 		t.Errorf("stderr = %q, want unknown command error", stderr)
 	}
 }
+
+func TestCLIRemovalsPreviewKeepsGraphFile(t *testing.T) {
+	graphPath := writeFile(t, "graph.json", `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]},{"name":"C","upstreams":["B"]}]}`)
+	planPath := writeFile(t, "plan.json", `{"changes":[{"name":"D","upstreams":[]},{"name":"B","upstreams":["D"]}],"removals":["A"]}`)
+
+	original := readFile(t, graphPath)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"preview", graphPath, planPath})
+	})
+	if exit != 0 {
+		t.Fatalf("preview exit = %d, stderr = %s", exit, stderr)
+	}
+	if !strings.Contains(stdout, `"removedDatasets"`) {
+		t.Errorf("preview stdout missing removedDatasets: %s", stdout)
+	}
+	if !strings.Contains(stdout, `"affectedDownstreams"`) {
+		t.Errorf("preview stdout missing affectedDownstreams: %s", stdout)
+	}
+	// The graph file must be byte-for-byte unchanged after preview.
+	got := readFile(t, graphPath)
+	if got != original {
+		t.Errorf("graph file changed after preview:\n got %s\nwant %s", got, original)
+	}
+}
+
+func TestCLIRemovalsApplyWritesGraphBack(t *testing.T) {
+	graphPath := writeFile(t, "graph.json", `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]},{"name":"C","upstreams":["B"]}]}`)
+	planPath := writeFile(t, "plan.json", `{"changes":[{"name":"D","upstreams":[]},{"name":"B","upstreams":["D"]}],"removals":["A"]}`)
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"apply", graphPath, planPath})
+	})
+	if exit != 0 {
+		t.Fatalf("apply exit = %d, stderr = %s", exit, stderr)
+	}
+	if !strings.Contains(stdout, `"removedDatasets"`) {
+		t.Errorf("apply stdout missing removedDatasets: %s", stdout)
+	}
+	// The graph file must now reflect the final graph: A gone, B depends on D.
+	got := readFile(t, graphPath)
+	if strings.Contains(got, `"A"`) {
+		t.Errorf("A still in graph file after apply: %s", got)
+	}
+	if !strings.Contains(got, `"D"`) {
+		t.Errorf("D missing from graph file after apply: %s", got)
+	}
+	// Re-read and unmarshal to verify the structure is correct.
+	graph, err := chainledger.UnmarshalGraphFile([]byte(got))
+	if err != nil {
+		t.Fatalf("written graph file is invalid: %v", err)
+	}
+	if _, ok := graph["A"]; ok {
+		t.Errorf("A still in graph after apply")
+	}
+	if got := graph["B"].Parents; len(got) != 1 || got[0] != "D" {
+		t.Errorf("B.Parents = %v, want [D]", got)
+	}
+	if got := graph["C"].Parents; len(got) != 1 || got[0] != "B" {
+		t.Errorf("C.Parents = %v, want [B]", got)
+	}
+}
+
+func TestCLIRemovalsRejectionPreservesGraphFile(t *testing.T) {
+	graphPath := writeFile(t, "graph.json", `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`)
+	// Delete A only: B still references A, so the batch must fail.
+	planPath := writeFile(t, "plan.json", `{"removals":["A"]}`)
+
+	original := readFile(t, graphPath)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"apply", graphPath, planPath})
+	})
+	if exit == 0 {
+		t.Fatalf("apply expected non-zero exit on dangling reference, got 0")
+	}
+	if !strings.Contains(stderr, "A") || !strings.Contains(stderr, "B") {
+		t.Errorf("stderr = %q, want error naming both A and B", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty on rejection", stdout)
+	}
+	// The graph file must be completely preserved.
+	got := readFile(t, graphPath)
+	if got != original {
+		t.Errorf("graph file changed after rejected apply:\n got %s\nwant %s", got, original)
+	}
+}
+
+func TestCLIRemovalsDeleteAll(t *testing.T) {
+	graphPath := writeFile(t, "graph.json", `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`)
+	planPath := writeFile(t, "plan.json", `{"removals":["A","B"]}`)
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"apply", graphPath, planPath})
+	})
+	if exit != 0 {
+		t.Fatalf("apply exit = %d, stderr = %s", exit, stderr)
+	}
+	got := readFile(t, graphPath)
+	if !strings.Contains(got, `"datasets": []`) {
+		t.Errorf("graph file = %s, want empty datasets", got)
+	}
+	_ = stdout
+}

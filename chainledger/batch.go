@@ -20,8 +20,14 @@ type PlanChange struct {
 }
 
 // Plan is a batch of lineage adjustments read from a JSON file.
+//
+// Removals names datasets that must be absent from the final graph. Deleting a
+// name that does not currently exist is a no-op (it is not reported as an
+// actual removal), so a successful plan can be applied again with empty change
+// and impact lists. A name listed in Removals must not also appear in Changes.
 type Plan struct {
-	Changes []PlanChange `json:"changes"`
+	Changes  []PlanChange `json:"changes"`
+	Removals []string     `json:"removals"`
 }
 
 // Relation is a directed lineage edge: Upstream -> Downstream, meaning the
@@ -48,12 +54,13 @@ type GraphFile struct {
 // lists are sorted by name byte order; relation lists are sorted by upstream
 // then downstream.
 type BatchReport struct {
-	FinalGraph           GraphFile  `json:"finalGraph"`
-	NewDatasets          []string   `json:"newDatasets"`
-	ChangedDatasets      []string   `json:"changedDatasets"`
-	AddedRelations       []Relation `json:"addedRelations"`
-	RemovedRelations     []Relation `json:"removedRelations"`
-	AffectedDownstreams  []string   `json:"affectedDownstreams"`
+	FinalGraph          GraphFile  `json:"finalGraph"`
+	NewDatasets         []string   `json:"newDatasets"`
+	ChangedDatasets     []string   `json:"changedDatasets"`
+	RemovedDatasets     []string   `json:"removedDatasets"`
+	AddedRelations      []Relation `json:"addedRelations"`
+	RemovedRelations    []Relation `json:"removedRelations"`
+	AffectedDownstreams []string   `json:"affectedDownstreams"`
 }
 
 // adjacency maps a dataset name to its sorted, duplicate-free parent names.
@@ -181,11 +188,30 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 		}
 	}
 
+	// Validate removals: empty names, duplicate names, and names also declared
+	// as changes all reject the whole batch with the name and reason.
+	removalDecls := make(map[string]int, len(plan.Removals))
+	for _, name := range plan.Removals {
+		if name == "" {
+			return nil, nil, fmt.Errorf("%w: plan removals contain a dataset with an empty name", ErrInvalidArgument)
+		}
+		removalDecls[name]++
+		if removalDecls[name] > 1 {
+			return nil, nil, fmt.Errorf("%w: dataset %q is listed %d times in removals", ErrInvalidArgument, name, removalDecls[name])
+		}
+		if _, ok := declarations[name]; ok {
+			return nil, nil, fmt.Errorf("%w: dataset %q appears in both changes and removals", ErrInvalidArgument, name)
+		}
+	}
+
 	// Build the final adjacency: start from the original parents, replace each
 	// planned dataset's parents with its normalized upstreams.
 	final := make(adjacency, len(original)+len(plan.Changes))
 	for name, parents := range original {
 		final[name] = append([]string(nil), parents...)
+	}
+	for name := range removalDecls {
+		delete(final, name)
 	}
 	var newNames []string
 	var changedNames []string
@@ -203,10 +229,29 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	sort.Strings(newNames)
 	sort.Strings(changedNames)
 
+	// Datasets actually removed: names in removals that existed in the
+	// original graph. Deleting a name that does not exist is a no-op and is
+	// not reported, so a successful plan can be applied again with empty lists.
+	var removedNames []string
+	for name := range removalDecls {
+		if _, existed := original[name]; existed {
+			removedNames = append(removedNames, name)
+		}
+	}
+	sort.Strings(removedNames)
+
 	// Every upstream must resolve to a dataset that exists in the FINAL graph
-	// (new datasets may reference each other regardless of plan order).
-	for name, parents := range final {
-		for _, parent := range parents {
+	// (new datasets may reference each other regardless of plan order; a
+	// retained dataset that still references a deleted name is rejected here,
+	// with both the referrer and the referenced name in the error). Iterate
+	// over sorted names so the reported pair is deterministic.
+	names := make([]string, 0, len(final))
+	for name := range final {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for _, parent := range final[name] {
 			if _, ok := final[parent]; !ok {
 				return nil, nil, fmt.Errorf("%w: dataset %q references upstream %q which does not exist in the final graph", ErrNotFound, name, parent)
 			}
@@ -218,12 +263,13 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	}
 
 	added, removed := diffRelations(original, final)
-	affected := affectedDownstreams(original, final, newNames, changedNames)
+	affected := affectedDownstreams(original, final, newNames, changedNames, removedNames)
 
 	report := &BatchReport{
 		FinalGraph:          GraphFile{Datasets: adjacencyToDatasets(final)},
 		NewDatasets:         newNames,
 		ChangedDatasets:      changedNames,
+		RemovedDatasets:     removedNames,
 		AddedRelations:      added,
 		RemovedRelations:    removed,
 		AffectedDownstreams: affected,
@@ -234,6 +280,9 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	}
 	if report.ChangedDatasets == nil {
 		report.ChangedDatasets = []string{}
+	}
+	if report.RemovedDatasets == nil {
+		report.RemovedDatasets = []string{}
 	}
 	if report.AddedRelations == nil {
 		report.AddedRelations = []Relation{}
@@ -338,19 +387,24 @@ func sortRelations(rels []Relation) {
 }
 
 // affectedDownstreams computes the impact set: starting from the seed datasets
-// (new or actually changed), follow downstream (children) edges in BOTH the
-// original and the final graphs. Datasets that are themselves seeds are
-// excluded from the output; every other reachable dataset is included once.
+// (new, actually changed, or actually removed), follow downstream (children)
+// edges in BOTH the original and the final graphs. Datasets that are
+// themselves seeds are excluded from the output; every other reachable dataset
+// is included once.
 //
 // Walking both graphs matters when relations are deleted: a dataset that was
 // reachable downstream before the change (and thus loses a lineage path) is
-// still affected even if the edge is gone in the final graph.
-func affectedDownstreams(original, final adjacency, newNames, changedNames []string) []string {
-	seeds := make(map[string]bool, len(newNames)+len(changedNames))
+// still affected even if the edge is gone in the final graph. Removed datasets
+// are seeds too, so a downstream that lost its upstream node is counted.
+func affectedDownstreams(original, final adjacency, newNames, changedNames, removedNames []string) []string {
+	seeds := make(map[string]bool, len(newNames)+len(changedNames)+len(removedNames))
 	for _, name := range newNames {
 		seeds[name] = true
 	}
 	for _, name := range changedNames {
+		seeds[name] = true
+	}
+	for _, name := range removedNames {
 		seeds[name] = true
 	}
 
