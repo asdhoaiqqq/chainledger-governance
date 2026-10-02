@@ -36,6 +36,8 @@ func run(args []string) int {
 		return runSnapshot(args[1:])
 	case "compare":
 		return runCompare(args[1:])
+	case "trace":
+		return runTrace(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return 0
@@ -64,6 +66,10 @@ commands:
                               read-only comparison of two snapshots; prints a
                               JSON report of nodes, relations, and root-source
                               sets that differ from the old to the new version
+  trace <snapshot> <dataset>  read-only lineage trace of one dataset frozen in
+                              a snapshot; prints the snapshot's contentId, the
+                              queried dataset name, and every reachable root
+                              source with its shortest path
   help                        show this help
 
 The graph file is JSON:
@@ -280,6 +286,44 @@ func runCompare(args []string) int {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(report); err != nil {
 		fmt.Fprintf(os.Stderr, "error: cannot write report: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// runTrace implements `trace <snapshot.json> <dataset>`: a strictly read-only
+// lineage trace of one dataset frozen in a snapshot. It validates the WHOLE
+// snapshot (not just the reachable part) via ParseSnapshot, then prints the
+// deterministic JSON trace report to stdout. It never writes to the snapshot
+// or creates any other file.
+func runTrace(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: chainledger trace <snapshot.json> <dataset>")
+		return 2
+	}
+	snapshotPath := args[0]
+	dataset := args[1]
+
+	data, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read snapshot file %q: %v\n", snapshotPath, err)
+		return 1
+	}
+	snap, err := chainledger.ParseSnapshot(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid snapshot %q: %v\n", snapshotPath, err)
+		return 1
+	}
+	report, err := chainledger.TraceSnapshot(snap, dataset)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot write trace report: %v\n", err)
 		return 1
 	}
 	return 0
