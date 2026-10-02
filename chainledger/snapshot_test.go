@@ -169,6 +169,158 @@ func TestParseSnapshotRejections(t *testing.T) {
 	}
 }
 
+// TestParseSnapshotRejectsDuplicateFields: a known field declared twice within
+// the same object makes the whole snapshot ambiguous and must be rejected,
+// even when the duplicates carry identical values, the first is null, or the
+// surviving value would pass every version and content check.
+func TestParseSnapshotRejectsDuplicateFields(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+	// A complete, otherwise valid document; mutations below re-declare one
+	// known field inside it.
+	valid := doc(graph)
+
+	cases := map[string]struct {
+		data  string
+		field string
+	}{
+		"version 2 then 1": {
+			`{"formatVersion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"identical version twice": {
+			`{"formatVersion":1,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"contentId twice": {
+			`{"formatVersion":1,"contentId":"` + id + `","contentId":"` + id + `","graph":` + graph + `}`,
+			"contentId",
+		},
+		"null contentId then valid": {
+			`{"formatVersion":1,"contentId":null,"contentId":"` + id + `","graph":` + graph + `}`,
+			"contentId",
+		},
+		"empty graph then real graph": {
+			`{"formatVersion":1,"contentId":"` + id + `","graph":{"datasets":[]},"graph":` + graph + `}`,
+			"graph",
+		},
+		"null graph then real graph": {
+			`{"formatVersion":1,"contentId":"` + id + `","graph":null,"graph":` + graph + `}`,
+			"graph",
+		},
+		"datasets twice": {
+			doc(`{"datasets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets",
+		},
+		"name twice same value": {
+			doc(`{"datasets":[{"name":"A","name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"name",
+		},
+		"upstreams twice": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"],"upstreams":["A"]}]}`),
+			"upstreams",
+		},
+		"null upstreams then valid": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":null,"upstreams":["A"]}]}`),
+			"upstreams",
+		},
+		"escaped name key": {
+			doc(`{"datasets":[{"na\u006de":"A","name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"name",
+		},
+		"case variant name": {
+			doc(`{"datasets":[{"Name":"A","name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"name",
+		},
+		"case variant formatVersion": {
+			`{"FormatVersion":1,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"case variant datasets": {
+			doc(`{"Datasets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseSnapshot([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Errorf("err = %q, want it to name field %q", err, tc.field)
+			}
+		})
+	}
+
+	// The duplicate lives in the second dataset record; the error must locate
+	// it by datasets array index.
+	indexed := doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"],"upstreams":["A"]}]}`)
+	_, err := ParseSnapshot([]byte(indexed))
+	if err == nil || !strings.Contains(err.Error(), "index 1") {
+		t.Errorf("err = %v, want the datasets index of the offending record", err)
+	}
+
+	// Sanity: the unmutated document parses and keeps its content id.
+	parsed, err := ParseSnapshot([]byte(valid))
+	if err != nil {
+		t.Fatalf("valid snapshot rejected: %v", err)
+	}
+	if parsed.ContentID != id {
+		t.Errorf("content id = %s, want %s", parsed.ContentID, id)
+	}
+}
+
+// TestParseSnapshotDuplicateTolerances: repetitions that do NOT create
+// ambiguity stay legal — unknown fields may repeat anywhere, each dataset
+// record declares its own name, and duplicate names inside one upstreams
+// array are still deduplicated (that is not a repeated field).
+func TestParseSnapshotDuplicateTolerances(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]string{
+		"unknown top-level field repeats": `{"note":1,"note":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"unknown graph field repeats":     doc(`{"meta":"x","meta":"y","datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+		"unknown record field repeats":    doc(`{"datasets":[{"name":"A","note":"x","note":"y","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+		"duplicate names inside upstreams array": doc(
+			`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A","A"]}]}`),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParseSnapshot([]byte(data))
+			if err != nil {
+				t.Fatalf("ParseSnapshot rejected a legal document: %v", err)
+			}
+			if parsed.ContentID != id {
+				t.Errorf("content id = %s, want %s", parsed.ContentID, id)
+			}
+		})
+	}
+}
+
+// TestParseSnapshotCaseVariantSpellings: a field written once in any letter
+// casing the reader already supports keeps working; only declaring it twice
+// is an error.
+func TestParseSnapshotCaseVariantSpellings(t *testing.T) {
+	id := snapshotOf(t, `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`).ContentID
+	data := `{"FORMATVERSION":1,"ContentID":"` + id + `","GRAPH":{"Datasets":` +
+		`[{"Name":"A","Upstreams":[]},{"NAME":"B","UPSTREAMS":["A"]}]}}`
+	parsed, err := ParseSnapshot([]byte(data))
+	if err != nil {
+		t.Fatalf("case-variant spellings rejected: %v", err)
+	}
+	if parsed.ContentID != id {
+		t.Errorf("content id = %s, want %s", parsed.ContentID, id)
+	}
+}
+
 // TestCompareHeadlineRootSourceChange is the scenario from the product spec:
 // A is a root source of B, C depends on B; repointing B at another root X must
 // report BOTH B and C changing source from A to X.

@@ -396,3 +396,146 @@ func TestCLIHelpMentionsSnapshotCommands(t *testing.T) {
 		}
 	}
 }
+
+// dupFieldSnapshot produces a snapshot of graphJSON whose bytes then have one
+// known field declared a second time, so the document is ambiguous even
+// though the surviving values still describe the same graph.
+func dupFieldSnapshot(t *testing.T, graphJSON string) (path string, content string) {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "snap.json")
+	if _, stderr, exit := snapshotViaCLI(t, graphJSON, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	valid := readFile(t, target)
+	// Drop the lock file left by the seeding save so callers can assert that
+	// compare/trace create no lock of their own.
+	if err := os.Remove(target + ".lock"); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	// Declare formatVersion twice: first 2, then the valid 1. The reader would
+	// silently keep the 1 and every other check would pass.
+	dup := strings.Replace(valid, `"formatVersion": 1`, `"formatVersion": 2, "formatVersion": 1`, 1)
+	if dup == valid {
+		t.Fatalf("could not inject duplicate field into %s", valid)
+	}
+	return target, dup
+}
+
+func TestCLICompareRejectsDuplicateFields(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, good); exit != 0 {
+		t.Fatalf("snapshot good: %s", stderr)
+	}
+	dupPath, dupContent := dupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		side string
+	}{
+		{"duplicate in old snapshot", []string{"compare", dupPath, good}, "old snapshot"},
+		{"duplicate in new snapshot", []string{"compare", good, dupPath}, "new snapshot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, exit := captureStdout(t, func() int { return run(tc.args) })
+			if exit == 0 {
+				t.Fatalf("%v succeeded, want failure", tc.args)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty on rejection", stdout)
+			}
+			if !strings.Contains(stderr, tc.side) || !strings.Contains(stderr, dupPath) {
+				t.Errorf("stderr = %q, must name the %s file", stderr, tc.side)
+			}
+			if !strings.Contains(stderr, "formatVersion") {
+				t.Errorf("stderr = %q, must name the duplicated field", stderr)
+			}
+			// compare stays read-only and never creates a lock file.
+			if got := readFile(t, dupPath); got != dupContent {
+				t.Errorf("compare modified the snapshot:\n%s", got)
+			}
+			if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+				t.Errorf("compare created a lock file: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLITraceRejectsDuplicateFields(t *testing.T) {
+	dupPath, dupContent := dupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", dupPath, "C"})
+	})
+	if exit == 0 {
+		t.Fatalf("trace succeeded on an ambiguous snapshot")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty on rejection", stdout)
+	}
+	if !strings.Contains(stderr, dupPath) || !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the file and the duplicated field", stderr)
+	}
+	if got := readFile(t, dupPath); got != dupContent {
+		t.Errorf("trace modified the snapshot:\n%s", got)
+	}
+	if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("trace created a lock file: %v", err)
+	}
+}
+
+// TestCLISnapshotRefusesDuplicateFieldTarget: an existing target whose graph
+// only resolves because a repeated field was silently collapsed counts as
+// corrupt — the save is refused even when the resolved graph equals the
+// current content, and the target keeps every byte and its mtime.
+func TestCLISnapshotRefusesDuplicateFieldTarget(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "snap.json")
+
+	// Seed a valid snapshot of the same content, then inject a duplicate
+	// graph field: an empty graph first, the real graph second. The resolved
+	// graph still matches the current content exactly.
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	valid := readFile(t, target)
+	dup := strings.Replace(valid, `"graph": {`, `"graph": {"datasets": []}, "graph": {`, 1)
+	if dup == valid {
+		t.Fatalf("could not inject duplicate graph into %s", valid)
+	}
+	if err := os.WriteFile(target, []byte(dup), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+	infoBefore, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	graphPath := writeFile(t, "graph.json", abcGraph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"snapshot", graphPath, target})
+	})
+	if exit == 0 {
+		t.Fatalf("snapshot over a duplicate-field target succeeded")
+	}
+	if !strings.Contains(stderr, "refusing to overwrite") || !strings.Contains(stderr, target) {
+		t.Errorf("stderr = %q, want refusal naming the target", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no content id on refusal", stdout)
+	}
+	if got := readFile(t, target); got != dup {
+		t.Errorf("target changed after refusal:\n got %s\nwant %s", got, dup)
+	}
+	infoAfter, _ := os.Stat(target)
+	if !infoAfter.ModTime().Equal(infoBefore.ModTime()) {
+		t.Errorf("refusal rewrote the target: mtime %s -> %s", infoBefore.ModTime(), infoAfter.ModTime())
+	}
+}
