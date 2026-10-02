@@ -70,7 +70,8 @@ The graph file is JSON:
   {"datasets": [{"name": "A", "upstreams": []}, ...]}
 
 The plan file is JSON:
-  {"changes": [{"name": "A", "upstreams": ["B"]}, ...]}
+  {"changes": [{"name": "A", "upstreams": ["B"]}, ...],
+   "removals": ["C", ...]}
 
 The snapshot file is JSON with formatVersion 1, a semantic contentId, and the
 complete graph. Its bytes depend only on graph semantics, never on record
@@ -79,10 +80,15 @@ file path. compare never writes anything.
 
 A batch registers new datasets or replaces every direct upstream of an
 existing dataset with the listed upstreams. An empty upstream list makes the
-dataset a root. Datasets not mentioned in the plan keep their upstreams.
-New datasets may reference each other regardless of plan order; the final
-graph must be acyclic and every upstream must resolve to a dataset in the
-final graph. Preview and apply produce the same report for the same inputs.
+dataset a root. Datasets not mentioned in the plan keep their upstreams. The
+optional removals list unregisters datasets and every relation incident to
+them, but it never edits another dataset's upstreams: a retained dataset that
+would still reference a removed name (and is not itself removed or repointed
+in the same batch) rejects the batch; deleting every dataset yields a legal
+empty graph. New datasets may reference each other regardless of plan order;
+the final graph must be acyclic and every upstream must resolve to a dataset
+in the final graph. Preview and apply produce the same report for the same
+inputs.
 `)
 }
 

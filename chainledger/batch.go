@@ -20,8 +20,16 @@ type PlanChange struct {
 }
 
 // Plan is a batch of lineage adjustments read from a JSON file.
+//
+// Changes registers new datasets or replaces the complete direct-upstream list
+// of existing ones. Removals unregisters datasets: every relation incident to a
+// removed dataset disappears, but deletion never edits another dataset's
+// upstream list on its own — a retained dataset that still names a removed
+// dataset rejects the whole batch. A removal name absent from the current
+// graph is simply a no-op for that name.
 type Plan struct {
-	Changes []PlanChange `json:"changes"`
+	Changes  []PlanChange `json:"changes"`
+	Removals []string     `json:"removals,omitempty"`
 }
 
 // Relation is a directed lineage edge: Upstream -> Downstream, meaning the
@@ -48,12 +56,13 @@ type GraphFile struct {
 // lists are sorted by name byte order; relation lists are sorted by upstream
 // then downstream.
 type BatchReport struct {
-	FinalGraph           GraphFile  `json:"finalGraph"`
-	NewDatasets          []string   `json:"newDatasets"`
-	ChangedDatasets      []string   `json:"changedDatasets"`
-	AddedRelations       []Relation `json:"addedRelations"`
-	RemovedRelations     []Relation `json:"removedRelations"`
-	AffectedDownstreams  []string   `json:"affectedDownstreams"`
+	FinalGraph          GraphFile  `json:"finalGraph"`
+	NewDatasets         []string   `json:"newDatasets"`
+	ChangedDatasets     []string   `json:"changedDatasets"`
+	RemovedDatasets     []string   `json:"removedDatasets"`
+	AddedRelations      []Relation `json:"addedRelations"`
+	RemovedRelations    []Relation `json:"removedRelations"`
+	AffectedDownstreams []string   `json:"affectedDownstreams"`
 }
 
 // adjacency maps a dataset name to its sorted, duplicate-free parent names.
@@ -168,8 +177,9 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 		return nil, nil, err
 	}
 
-	// Validate the plan: empty names and duplicate declarations reject the
-	// whole batch, naming the dataset and the reason.
+	// Validate the plan: empty names, duplicate declarations within changes or
+	// removals, and a name appearing in both lists reject the whole batch,
+	// naming the dataset and the reason.
 	declarations := make(map[string]int, len(plan.Changes))
 	for _, change := range plan.Changes {
 		if change.Name == "" {
@@ -180,12 +190,34 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 			return nil, nil, fmt.Errorf("%w: dataset %q is declared %d times in the plan", ErrInvalidArgument, change.Name, declarations[change.Name])
 		}
 	}
+	removalCount := make(map[string]int, len(plan.Removals))
+	for _, name := range plan.Removals {
+		if name == "" {
+			return nil, nil, fmt.Errorf("%w: plan contains a removal with an empty name", ErrInvalidArgument)
+		}
+		removalCount[name]++
+		if removalCount[name] > 1 {
+			return nil, nil, fmt.Errorf("%w: dataset %q is listed %d times in removals", ErrInvalidArgument, name, removalCount[name])
+		}
+		if declarations[name] > 0 {
+			return nil, nil, fmt.Errorf("%w: dataset %q appears in both changes and removals", ErrInvalidArgument, name)
+		}
+	}
 
-	// Build the final adjacency: start from the original parents, replace each
-	// planned dataset's parents with its normalized upstreams.
+	// Build the final adjacency: start from the original parents, delete the
+	// datasets actually present in the graph (removing a name that does not
+	// exist is a no-op), then replace each planned dataset's parents with its
+	// normalized upstreams.
 	final := make(adjacency, len(original)+len(plan.Changes))
 	for name, parents := range original {
 		final[name] = append([]string(nil), parents...)
+	}
+	var removedNames []string
+	for _, name := range plan.Removals {
+		if _, exists := original[name]; exists {
+			removedNames = append(removedNames, name)
+			delete(final, name)
+		}
 	}
 	var newNames []string
 	var changedNames []string
@@ -200,11 +232,15 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 		}
 		final[change.Name] = wanted
 	}
+	sort.Strings(removedNames)
 	sort.Strings(newNames)
 	sort.Strings(changedNames)
 
 	// Every upstream must resolve to a dataset that exists in the FINAL graph
-	// (new datasets may reference each other regardless of plan order).
+	// (new datasets may reference each other regardless of plan order). This
+	// also enforces that deletion never silently strips an upstream reference:
+	// a retained dataset that still names a removed dataset is reported here
+	// with both names, instead of being quietly turned into a root.
 	for name, parents := range final {
 		for _, parent := range parents {
 			if _, ok := final[parent]; !ok {
@@ -212,18 +248,20 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 			}
 		}
 	}
-	// The final graph must be acyclic, judged after all replacements.
+	// The final graph must be acyclic, judged after all deletions and
+	// replacements.
 	if err := validateAcyclic(final); err != nil {
 		return nil, nil, err
 	}
 
 	added, removed := diffRelations(original, final)
-	affected := affectedDownstreams(original, final, newNames, changedNames)
+	affected := affectedDownstreams(original, final, newNames, changedNames, removedNames)
 
 	report := &BatchReport{
 		FinalGraph:          GraphFile{Datasets: adjacencyToDatasets(final)},
 		NewDatasets:         newNames,
-		ChangedDatasets:      changedNames,
+		ChangedDatasets:     changedNames,
+		RemovedDatasets:     removedNames,
 		AddedRelations:      added,
 		RemovedRelations:    removed,
 		AffectedDownstreams: affected,
@@ -234,6 +272,9 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	}
 	if report.ChangedDatasets == nil {
 		report.ChangedDatasets = []string{}
+	}
+	if report.RemovedDatasets == nil {
+		report.RemovedDatasets = []string{}
 	}
 	if report.AddedRelations == nil {
 		report.AddedRelations = []Relation{}
@@ -338,19 +379,24 @@ func sortRelations(rels []Relation) {
 }
 
 // affectedDownstreams computes the impact set: starting from the seed datasets
-// (new or actually changed), follow downstream (children) edges in BOTH the
-// original and the final graphs. Datasets that are themselves seeds are
-// excluded from the output; every other reachable dataset is included once.
+// (new, actually changed, or actually removed), follow downstream (children)
+// edges in BOTH the original and the final graphs. Datasets that are
+// themselves seeds are excluded from the output; every other reachable
+// dataset is included once.
 //
 // Walking both graphs matters when relations are deleted: a dataset that was
-// reachable downstream before the change (and thus loses a lineage path) is
-// still affected even if the edge is gone in the final graph.
-func affectedDownstreams(original, final adjacency, newNames, changedNames []string) []string {
-	seeds := make(map[string]bool, len(newNames)+len(changedNames))
+// reachable downstream before the change (and thus loses a lineage path, or
+// loses an ancestor to deletion) is still affected even if the edge or the
+// seed dataset itself is gone in the final graph.
+func affectedDownstreams(original, final adjacency, newNames, changedNames, removedNames []string) []string {
+	seeds := make(map[string]bool, len(newNames)+len(changedNames)+len(removedNames))
 	for _, name := range newNames {
 		seeds[name] = true
 	}
 	for _, name := range changedNames {
+		seeds[name] = true
+	}
+	for _, name := range removedNames {
 		seeds[name] = true
 	}
 
@@ -486,8 +532,9 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 }
 
 // UnmarshalPlan parses the plan JSON. The plan structure (empty names,
-// duplicate declarations) is validated later by computeBatch so that preview
-// and apply share identical rejection behavior.
+// duplicate declarations, names shared by changes and removals) is validated
+// later by computeBatch so that preview and apply share identical rejection
+// behavior.
 func UnmarshalPlan(data []byte) (Plan, error) {
 	var p Plan
 	if err := json.Unmarshal(data, &p); err != nil {
