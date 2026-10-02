@@ -14,6 +14,7 @@ go run ./cmd/chainledger preview <graph.json> <plan.json>
 go run ./cmd/chainledger apply <graph.json> <plan.json>
 go run ./cmd/chainledger snapshot <graph.json> <snapshot.json>
 go run ./cmd/chainledger compare <old.json> <new.json>
+go run ./cmd/chainledger trace <snapshot.json> <dataset>
 go test ./...
 ```
 
@@ -88,6 +89,9 @@ go run ./cmd/chainledger snapshot <graph.json> <snapshot.json>
 
 # 只读比较两个快照（方向固定为旧 -> 新），向标准输出输出 JSON 报告
 go run ./cmd/chainledger compare <old.json> <new.json>
+
+# 只读追溯单个快照中某数据集的根来源，向标准输出输出 JSON 报告
+go run ./cmd/chainledger trace <snapshot.json> <dataset>
 ```
 
 ### 快照格式
@@ -120,6 +124,15 @@ go run ./cmd/chainledger compare <old.json> <new.json>
 - `rootSourceChanges` 只覆盖两个版本共有的数据集，列出名称以及各自的新旧根来源集合；新增、删除的数据集不混入此列表。
 - 仅调整路径但仍到达同一组根来源时，不报告来源变化。
 - 空图可保存可比较；快照与自身比较时所有差异列表为空。节点与名称列表按名称字节顺序排列，关系列表先按上游再按下游排列，空列表输出 `[]`，相同语义的比较结果逐字节一致。`compare` 不写任何文件。
+
+### 来源追溯
+
+`trace` 回答“这个数据集的数据从哪里来”：只依据指定快照冻结的图，沿直接上游找出查询数据集可达的全部根来源，当前图后来的调整不影响该版本的查询结果。报告包含快照的 `contentId`、原样的查询名称 `dataset`，以及 `sources` 数组；每项给出 `root` 和 `path`——从查询数据集逐步沿直接上游走到该根的名称数组，首尾都包含在内。
+
+- 同一个根可能经多条分支到达，每个可达根只报告一次，并给出一条尽可能短（直接关系数量最少）的路径；长度相同时，从起点向终点逐项按名称的 UTF-8 字节顺序比较，选第一次出现差异时名称较小的那条。不同根可以共享中间数据集，各自保留对应路径。
+- 中间节点仍有上游时不算根；互不相连的数据集不进入报告；查询本身是根时只报告它自己，路径为单元素数组。
+- 来源条目按根名称字节顺序排列；名称区分大小写并保留前后空格，路径始终用数组表达。记录顺序、上游顺序、重复上游或 JSON 空白不同但语义相同的快照，对同一名称的查询输出逐字节一致的报告。
+- 查询前按既有规则验证整个快照；读取失败、JSON 无效、必要字段缺失、版本不支持、内容标识与图不符，或图中有空名称、重复数据集、缺失上游、环时，返回非零退出码并在标准错误说明文件与原因，标准输出为空。查询名称为空或不存在时同样失败并说明名称；空图合法，但其中没有可查询的数据集。参数数量不对时在标准错误输出用法并返回非零退出码。`trace` 不写任何文件，也不创建锁文件。
 
 ## 技术方向
 

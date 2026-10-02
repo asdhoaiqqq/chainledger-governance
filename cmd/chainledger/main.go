@@ -36,6 +36,8 @@ func run(args []string) int {
 		return runSnapshot(args[1:])
 	case "compare":
 		return runCompare(args[1:])
+	case "trace":
+		return runTrace(args[1:])
 	case "help", "-h", "--help":
 		usage()
 		return 0
@@ -64,6 +66,9 @@ commands:
                               read-only comparison of two snapshots; prints a
                               JSON report of nodes, relations, and root-source
                               sets that differ from the old to the new version
+  trace <snapshot> <dataset>  read-only source trace of one dataset within a
+                              single snapshot; prints a JSON report of every
+                              reachable root source with one shortest path
   help                        show this help
 
 The graph file is JSON:
@@ -75,7 +80,7 @@ The plan file is JSON:
 The snapshot file is JSON with formatVersion 1, a semantic contentId, and the
 complete graph. Its bytes depend only on graph semantics, never on record
 order, upstream order, duplicate upstreams, JSON whitespace, save time, or
-file path. compare never writes anything.
+file path. compare and trace never write anything.
 
 A batch registers new datasets, replaces every direct upstream of an
 existing dataset with the listed upstreams, and deletes the datasets named in
@@ -276,6 +281,45 @@ func runCompare(args []string) int {
 	}
 
 	report := chainledger.CompareSnapshots(oldSnap, newSnap)
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot write report: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// runTrace implements `trace <snapshot.json> <dataset>`: a strictly read-only
+// source trace against one snapshot that prints the deterministic JSON report
+// to stdout. The whole snapshot is validated before the query runs; any
+// failure is reported on stderr with a non-zero exit code and empty stdout,
+// and the snapshot file is never modified.
+func runTrace(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: chainledger trace <snapshot.json> <dataset>")
+		return 2
+	}
+	snapshotPath := args[0]
+	dataset := args[1]
+
+	data, err := os.ReadFile(snapshotPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot read snapshot %q: %v\n", snapshotPath, err)
+		return 1
+	}
+	snap, err := chainledger.ParseSnapshot(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: invalid snapshot %q: %v\n", snapshotPath, err)
+		return 1
+	}
+
+	report, err := chainledger.TraceSources(snap, dataset)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot trace %q in snapshot %q: %v\n", dataset, snapshotPath, err)
+		return 1
+	}
+
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(report); err != nil {
