@@ -401,6 +401,291 @@ func TestRootsSorted(t *testing.T) {
 	}
 }
 
+func impactNames(impacts []Impact) []string {
+	names := make([]string, len(impacts))
+	for i, im := range impacts {
+		names[i] = im.Dataset
+	}
+	return names
+}
+
+func assertImpact(t *testing.T, impacts []Impact, name string, wantDistance int, wantPath []string) {
+	t.Helper()
+	for _, im := range impacts {
+		if im.Dataset != name {
+			continue
+		}
+		if im.Distance != wantDistance {
+			t.Errorf("impact %s distance = %d, want %d", name, im.Distance, wantDistance)
+		}
+		if !sameStrings(im.Path, wantPath) {
+			t.Errorf("impact %s path = %v, want %v", name, im.Path, wantPath)
+		}
+		return
+	}
+	t.Fatalf("impact %q missing from %v", name, impactNames(impacts))
+}
+
+// The worked example from the spec: raw fans out to a and b, both feed report,
+// report feeds view. The merge node appears once at distance 2 with the
+// lexicographically smallest explanation path.
+func TestImpactsDiamondMerge(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "report", "a", "b")
+	mustRegister(t, graph, "view", "report")
+
+	impacts, err := Impacts(graph, "raw")
+	if err != nil {
+		t.Fatalf("Impacts(raw): %v", err)
+	}
+	if got, want := impactNames(impacts), []string{"a", "b", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpact(t, impacts, "a", 1, []string{"raw", "a"})
+	assertImpact(t, impacts, "b", 1, []string{"raw", "b"})
+	assertImpact(t, impacts, "report", 2, []string{"raw", "a", "report"})
+	assertImpact(t, impacts, "view", 3, []string{"raw", "a", "report", "view"})
+
+	// Querying an interior node starts a fresh scope: only its own downstream.
+	impacts, err = Impacts(graph, "report")
+	if err != nil {
+		t.Fatalf("Impacts(report): %v", err)
+	}
+	if got, want := impactNames(impacts), []string{"view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpact(t, impacts, "view", 1, []string{"report", "view"})
+}
+
+// After report is re-registered directly under raw, distances shorten and the
+// previously returned result keeps its original content because paths are copies.
+func TestImpactsReflectReregisterAndOldResultStable(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "report", "a", "b")
+	mustRegister(t, graph, "view", "report")
+
+	before, err := Impacts(graph, "raw")
+	if err != nil {
+		t.Fatalf("Impacts(raw): %v", err)
+	}
+	beforeCopy := make([]Impact, len(before))
+	for i, im := range before {
+		beforeCopy[i] = Impact{im.Dataset, im.Distance, append([]string(nil), im.Path...)}
+	}
+
+	// report now depends directly on raw as well; a and b remain its parents.
+	mustRegister(t, graph, "report", "raw", "a", "b")
+
+	after, err := Impacts(graph, "raw")
+	if err != nil {
+		t.Fatalf("Impacts(raw) after re-register: %v", err)
+	}
+	if got, want := impactNames(after), []string{"a", "b", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpact(t, after, "report", 1, []string{"raw", "report"})
+	assertImpact(t, after, "view", 2, []string{"raw", "report", "view"})
+
+	if !reflect.DeepEqual(before, beforeCopy) {
+		t.Fatalf("earlier result changed after re-register/new query: before=%v snapshot=%v", before, beforeCopy)
+	}
+}
+
+// Among multiple shortest paths the lexicographically smallest full name
+// sequence wins, compared name by name in Go string order, even when child list
+// order would suggest otherwise.
+func TestImpactsLexicographicallySmallestShortestPath(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "s")
+	// Register the lexicographically larger branch first so stored child order
+	// disagrees with the expected path choice.
+	mustRegister(t, graph, "z", "s")
+	mustRegister(t, graph, "a", "s")
+	mustRegister(t, graph, "m", "z", "a")
+
+	impacts, err := Impacts(graph, "s")
+	if err != nil {
+		t.Fatalf("Impacts(s): %v", err)
+	}
+	assertImpact(t, impacts, "m", 2, []string{"s", "a", "m"})
+
+	// Tie decided at the final hop: both x routes to n have equal length.
+	mustRegister(t, graph, "x1", "s")
+	mustRegister(t, graph, "x2", "s")
+	mustRegister(t, graph, "n", "x2", "x1")
+	impacts, err = Impacts(graph, "s")
+	if err != nil {
+		t.Fatalf("Impacts(s): %v", err)
+	}
+	assertImpact(t, impacts, "n", 2, []string{"s", "x1", "n"})
+
+	// A longer-looking but lexicographically smaller route must not replace a
+	// genuinely shorter path: distance takes priority. q joins at distance 2 via
+	// z, and at distance 3 via a -> m.
+	mustRegister(t, graph, "q", "m", "z")
+	impacts, err = Impacts(graph, "s")
+	if err != nil {
+		t.Fatalf("Impacts(s): %v", err)
+	}
+	assertImpact(t, impacts, "q", 2, []string{"s", "z", "q"})
+}
+
+// Same-distance results are ordered by dataset name regardless of the order in
+// which children were registered.
+func TestImpactsOrderedByDistanceThenName(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "root")
+	mustRegister(t, graph, "zebra", "root")
+	mustRegister(t, graph, "alpha", "root")
+	mustRegister(t, graph, "mid", "root")
+	mustRegister(t, graph, "leaf-z", "zebra")
+	mustRegister(t, graph, "leaf-a", "alpha")
+
+	impacts, err := Impacts(graph, "root")
+	if err != nil {
+		t.Fatalf("Impacts(root): %v", err)
+	}
+	want := []struct {
+		name string
+		dist int
+	}{
+		{"alpha", 1}, {"mid", 1}, {"zebra", 1},
+		{"leaf-a", 2}, {"leaf-z", 2},
+	}
+	if len(impacts) != len(want) {
+		t.Fatalf("got %d impacts %v, want %d", len(impacts), impactNames(impacts), len(want))
+	}
+	for i, w := range want {
+		if impacts[i].Dataset != w.name || impacts[i].Distance != w.dist {
+			t.Fatalf("position %d = (%s,%d), want (%s,%d); full=%v",
+				i, impacts[i].Dataset, impacts[i].Distance, w.name, w.dist, impacts)
+		}
+	}
+}
+
+// A registered origin without downstreams succeeds with an empty (but non-nil)
+// list; independent datasets and the origin itself never appear.
+func TestImpactsEmptyAndScope(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "lonely")
+	mustRegister(t, graph, "other")
+	mustRegister(t, graph, "p")
+	mustRegister(t, graph, "c", "p")
+
+	impacts, err := Impacts(graph, "lonely")
+	if err != nil {
+		t.Fatalf("Impacts(lonely): %v", err)
+	}
+	if impacts == nil || len(impacts) != 0 {
+		t.Fatalf("want empty non-nil list, got %v", impacts)
+	}
+
+	impacts, err = Impacts(graph, "p")
+	if err != nil {
+		t.Fatalf("Impacts(p): %v", err)
+	}
+	if got, want := impactNames(impacts), []string{"c"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("independent datasets leaked: got %v, want %v", got, want)
+	}
+	for _, im := range impacts {
+		for _, step := range im.Path {
+			if step == "p" && im.Dataset == "p" {
+				t.Fatal("origin must not appear in its own impact list")
+			}
+		}
+	}
+}
+
+func TestImpactsErrors(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "a")
+
+	impacts, err := Impacts(graph, "")
+	if err == nil || !strings.Contains(err.Error(), "name is required") {
+		t.Fatalf("empty origin: want required-name error, got %v", err)
+	}
+	if impacts != nil {
+		t.Fatalf("empty origin: want nil results, got %v", impacts)
+	}
+
+	impacts, err = Impacts(graph, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("unknown origin: want error naming ghost, got %v", err)
+	}
+	if impacts != nil {
+		t.Fatalf("unknown origin: want nil results, got %v", impacts)
+	}
+
+	// Non-empty name against an initialized-but-empty graph, and against nil.
+	impacts, err = Impacts(map[string]*Lineage{}, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") || impacts != nil {
+		t.Fatalf("empty graph: want naming error and nil results, got %v, %v", impacts, err)
+	}
+	impacts, err = Impacts(nil, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") || impacts != nil {
+		t.Fatalf("nil graph: want naming error and nil results, got %v, %v", impacts, err)
+	}
+}
+
+// Names match by exact registered value.
+func TestImpactsExactNameMatch(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "RAW", "raw")
+
+	if _, err := Impacts(graph, "RaW"); err == nil || !strings.Contains(err.Error(), "RaW") {
+		t.Fatalf("case-insensitive match: want error naming RaW, got %v", err)
+	}
+	impacts, err := Impacts(graph, "raw")
+	if err != nil {
+		t.Fatalf("Impacts(raw): %v", err)
+	}
+	assertImpact(t, impacts, "RAW", 1, []string{"raw", "RAW"})
+}
+
+// A query never mutates the graph, and mutating the returned list or paths
+// cannot reach back into the graph.
+func TestImpactsReadOnlyAndIsolated(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "report", "a", "b")
+	before := snapshot(graph)
+
+	impacts, err := Impacts(graph, "raw")
+	if err != nil {
+		t.Fatalf("Impacts(raw): %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("query changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+
+	// Abuse the returned slices, then confirm the graph is still untouched.
+	impacts[0].Path[0] = "tampered"
+	impacts[0].Path = append(impacts[0].Path, "extra")
+	impacts[0].Dataset = "tampered"
+	impacts[0].Distance = 99
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("mutating results changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+
+	// A failed query is also read-only.
+	if _, err := Impacts(graph, "missing"); err == nil {
+		t.Fatal("expected not-found error")
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("failed query changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertConsistent(t, graph)
+}
+
 type snap struct {
 	parents  map[string][]string
 	children map[string][]string

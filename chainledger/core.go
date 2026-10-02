@@ -146,6 +146,109 @@ func addChildOnce(children []string, child string) []string {
 	return out
 }
 
+// Impact names one dataset directly or indirectly downstream of an impact
+// query's origin. Distance is the number of lineage edges on the shortest path
+// from the origin to this dataset (a direct downstream has distance 1), and
+// Path is that shortest path written from the origin to the dataset, one name
+// per hop.
+type Impact struct {
+	Dataset  string
+	Distance int
+	Path     []string
+}
+
+// Impacts returns every dataset directly or indirectly downstream of origin,
+// i.e. every dataset reachable from origin by following child edges. The origin
+// itself is never listed, and datasets with no such connection never appear.
+//
+// Distance is the shortest edge count; each dataset is returned at most once
+// even where several branches merge into it. When several shortest paths exist,
+// the lexicographically smallest full path (name by name, Go string order) is
+// reported. Results are ordered by distance and then by dataset name, never by
+// registration order or the stored parent/child list order.
+//
+// The graph is read only: a successful or failed query changes no node, edge or
+// ordering. The returned Path slices are independent copies, so mutating them
+// cannot affect the graph. An empty origin is rejected as a missing name; an
+// origin absent from the graph (including an empty or nil graph) is rejected
+// with an error naming it and no partial results.
+func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
+	if origin == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[origin]; !ok {
+		return nil, errInvalid("dataset not found: " + origin)
+	}
+
+	// BFS one distance level at a time. A node commits its distance and best
+	// (lexicographically smallest) shortest path only once the whole level is
+	// known, so candidates reaching the same child through different parents in
+	// the same level can be compared before either wins. Register rejects
+	// cycles, so a committed node is never reached again at an equal level.
+	distance := map[string]int{origin: 0}
+	best := map[string][]string{origin: {origin}}
+	frontier := []string{origin}
+	for d := 0; len(frontier) > 0; d++ {
+		nextDistance := d + 1
+		candidates := map[string][]string{}
+		var next []string
+		for _, node := range frontier {
+			for _, child := range graph[node].Children {
+				if _, seen := distance[child]; seen {
+					continue // reached on an earlier, strictly shorter level
+				}
+				// Fresh backing array per candidate: paths must not alias each
+				// other or any slice stored in the graph.
+				candidate := make([]string, len(best[node])+1)
+				copy(candidate, best[node])
+				candidate[len(candidate)-1] = child
+				if current, ok := candidates[child]; !ok || lessPath(candidate, current) {
+					if !ok {
+						next = append(next, child)
+					}
+					candidates[child] = candidate
+				}
+			}
+		}
+		for _, child := range next {
+			distance[child] = nextDistance
+			best[child] = candidates[child]
+		}
+		frontier = next
+	}
+
+	impacts := make([]Impact, 0, len(distance)-1)
+	for name, d := range distance {
+		if name == origin {
+			continue
+		}
+		impacts = append(impacts, Impact{
+			Dataset:  name,
+			Distance: d,
+			Path:     append([]string(nil), best[name]...),
+		})
+	}
+	sort.Slice(impacts, func(i, j int) bool {
+		if impacts[i].Distance != impacts[j].Distance {
+			return impacts[i].Distance < impacts[j].Distance
+		}
+		return impacts[i].Dataset < impacts[j].Dataset
+	})
+	return impacts, nil
+}
+
+// lessPath reports whether path a sorts before path b as a name sequence:
+// names are compared with Go string order from the start, and an equal prefix
+// makes the shorter path smaller.
+func lessPath(a, b []string) bool {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return a[i] < b[i]
+		}
+	}
+	return len(a) < len(b)
+}
+
 // Roots lists datasets with no parents, in stable order.
 func Roots(graph map[string]*Lineage) []string {
 	var roots []string
