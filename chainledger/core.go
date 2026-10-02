@@ -1,7 +1,10 @@
 // Package chainledger implements the on-chain data governance core.
 package chainledger
 
-import "sort"
+import (
+	"slices"
+	"sort"
+)
 
 // Dataset is one ingestible on-chain data source with a declared schema version.
 type Dataset struct {
@@ -156,6 +159,84 @@ func Roots(graph map[string]*Lineage) []string {
 	}
 	sort.Strings(roots)
 	return roots
+}
+
+// Impact is one dataset downstream of the queried start dataset: it is
+// reachable from start by following child edges. Distance is the minimum
+// number of lineage edges from start (a direct downstream has distance 1)
+// and Path is one shortest explanation route, beginning at start and ending
+// at Name, listing datasets in upstream-to-downstream order.
+type Impact struct {
+	Name     string
+	Distance int
+	Path     []string
+}
+
+// ImpactOf reports every dataset directly or indirectly affected by start, i.e.
+// every dataset reachable from start along child edges. The start dataset
+// itself and datasets with no such connection are not included. When a dataset
+// is reached through several branches it appears exactly once with the
+// shortest distance; if several routes tie on distance, the route whose name
+// sequence is lexicographically smallest (compared element by element with Go
+// string ordering) is chosen. The result is ordered by distance ascending,
+// ties broken by dataset name, independent of registration or list order.
+//
+// The graph is only read, never modified: the returned slice and every Path
+// are freshly allocated, so mutating them cannot affect the graph.
+func ImpactOf(graph map[string]*Lineage, start string) ([]Impact, error) {
+	if start == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[start]; !ok {
+		return nil, errInvalid("unknown dataset " + start)
+	}
+
+	// BFS in distance order. Because every edge goes one level deeper, by the
+	// time a node is dequeued all equally-deep candidates have already been
+	// considered, so its best route is final and can be propagated.
+	distance := map[string]int{start: 0}
+	bestPath := map[string][]string{start: {start}}
+	queue := []string{start}
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+		base := bestPath[node]
+		for _, child := range graph[node].Children {
+			candidate := make([]string, 0, len(base)+1)
+			candidate = append(candidate, base...)
+			candidate = append(candidate, child)
+
+			d := distance[node] + 1
+			current, seen := distance[child]
+			if !seen {
+				distance[child] = d
+				bestPath[child] = candidate
+				queue = append(queue, child)
+				continue
+			}
+			if d < current || (d == current && slices.Compare(candidate, bestPath[child]) < 0) {
+				distance[child] = d
+				bestPath[child] = candidate
+			}
+		}
+	}
+
+	results := make([]Impact, 0, len(distance)-1)
+	for name, d := range distance {
+		if name == start {
+			continue
+		}
+		route := make([]string, len(bestPath[name]))
+		copy(route, bestPath[name])
+		results = append(results, Impact{Name: name, Distance: d, Path: route})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Distance != results[j].Distance {
+			return results[i].Distance < results[j].Distance
+		}
+		return results[i].Name < results[j].Name
+	})
+	return results, nil
 }
 
 type errInvalid string
