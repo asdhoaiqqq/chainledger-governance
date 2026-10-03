@@ -448,8 +448,14 @@ func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 // graph (parents and derived children). The graph is checked with the same
 // structural rules a snapshot enforces (empty names, duplicate datasets,
 // missing upstreams, and cycles); a structurally invalid graph is rejected so
-// it cannot be used as the basis for a batch.
+// it cannot be used as the basis for a batch. Like the snapshot reader, it
+// also rejects a known field declared twice within the same object — datasets
+// at the top level, name and upstreams inside each dataset record — so a
+// repeated declaration is never silently collapsed into one value.
 func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
+	if err := checkGraphFileDuplicateFields(data); err != nil {
+		return nil, err
+	}
 	var gf GraphFile
 	if err := json.Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph JSON: %w", err)

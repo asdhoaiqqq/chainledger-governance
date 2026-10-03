@@ -249,6 +249,25 @@ func checkDuplicateFields(data []byte) error {
 	return err
 }
 
+// checkGraphFileDuplicateFields applies the graph-level half of the snapshot
+// duplicate-field rule to a standalone graph file: datasets may be declared
+// only once at the top level of the graph object, and name and upstreams only
+// once inside each dataset record. The scan behaves exactly like the snapshot
+// scan (unescaped, case-folded field names; unknown fields ignored and free
+// to repeat; UseNumber so a legal large number cannot mask a later duplicate),
+// so a graph file and a snapshot holding the same document can never disagree
+// about a repeated declaration. Documents that are not shaped like a graph at
+// all are left to the regular parse, which reports the structural problem.
+func checkGraphFileDuplicateFields(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	err := checkGraphValue(dec, "at the top level of the graph")
+	if errors.Is(err, errAbortScan) {
+		return nil
+	}
+	return err
+}
+
 // checkTopLevelObject scans the top-level snapshot object for repeated
 // formatVersion/contentId/graph declarations, descending into graph values.
 func checkTopLevelObject(dec *json.Decoder) error {
@@ -273,7 +292,7 @@ func checkTopLevelObject(dec *json.Decoder) error {
 			seen[field] = true
 		}
 		if field == "graph" {
-			if err := checkGraphValue(dec); err != nil {
+			if err := checkGraphValue(dec, `in "graph"`); err != nil {
 				return err
 			}
 		} else if err := skipValue(dec); err != nil {
@@ -285,8 +304,11 @@ func checkTopLevelObject(dec *json.Decoder) error {
 }
 
 // checkGraphValue scans one graph value for a repeated datasets declaration,
-// descending into each dataset record of the datasets array.
-func checkGraphValue(dec *json.Decoder) error {
+// descending into each dataset record of the datasets array. location names
+// the object being scanned in the duplicate-datasets error: `in "graph"` for
+// the graph embedded in a snapshot, "at the top level of the graph" for a
+// standalone graph file.
+func checkGraphValue(dec *json.Decoder, location string) error {
 	tok, err := scanToken(dec)
 	if err != nil {
 		return err
@@ -304,7 +326,7 @@ func checkGraphValue(dec *json.Decoder) error {
 		}
 		if strings.EqualFold(key, "datasets") {
 			if seen {
-				return duplicateFieldError("datasets", `in "graph"`)
+				return duplicateFieldError("datasets", location)
 			}
 			seen = true
 			if err := checkDatasetsValue(dec); err != nil {

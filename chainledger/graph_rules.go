@@ -19,8 +19,10 @@
 //     empty graph stays legal.
 //
 // The snapshot-only envelope rules (required fields, format version, content
-// identifier, duplicate known fields) live in snapshot.go; this file is only
-// the common graph structure.
+// identifier) live in snapshot.go, together with the duplicate-known-field
+// scan both readers run before parsing (datasets in the graph object, name
+// and upstreams in each dataset record); this file is only the common graph
+// structure.
 package chainledger
 
 import (
