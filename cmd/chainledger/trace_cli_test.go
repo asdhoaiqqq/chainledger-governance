@@ -239,6 +239,148 @@ func TestCLITraceEquivalentSnapshotsSameReport(t *testing.T) {
 	}
 }
 
+// traceDeepGraph is the deep convergence fixture exercised end to end:
+//
+//	T -> A -> Z -> M -> R
+//	T -> B -> C -> M -> R
+//	T -> S -> D -> M -> K -> Q
+//	T -> S -> Q                 (shortcut changing only Q's path)
+//	T -> S -> D -> L -> R       (small-named but longer route to R)
+//	X -> U                      (disconnected branch)
+const traceDeepGraph = `{"datasets":[
+	{"name":"R","upstreams":[]},
+	{"name":"Q","upstreams":[]},
+	{"name":"M","upstreams":["R","K"]},
+	{"name":"K","upstreams":["Q"]},
+	{"name":"Z","upstreams":["M"]},
+	{"name":"A","upstreams":["Z"]},
+	{"name":"C","upstreams":["M"]},
+	{"name":"B","upstreams":["C"]},
+	{"name":"L","upstreams":["R"]},
+	{"name":"D","upstreams":["M","L"]},
+	{"name":"S","upstreams":["Q","D"]},
+	{"name":"T","upstreams":["A","B","S"]},
+	{"name":"X","upstreams":["U"]},
+	{"name":"U","upstreams":[]}
+]}`
+
+// traceDeepShuffled is semantically identical to traceDeepGraph but lists
+// records in another order (losing branch first), shuffles upstream lists,
+// repeats upstreams, and uses different JSON whitespace.
+const traceDeepShuffled = `{ "datasets" : [
+	{"upstreams":["M","M"],"name":"C"},
+	{ "name":"B","upstreams":["C"] },
+	{"upstreams":[],"name":"U"},
+	{"name":"X","upstreams":["U","U"]},
+	{"name":"T","upstreams":["S","A","B","A","S"]},
+	{"upstreams":["D","Q","D"],"name":"S"},
+	{"upstreams":["M","L","L","M"],"name":"D"},
+	{"name":"L","upstreams":["R"]},
+	{"upstreams":["Z"],"name":"A"},
+	{"name":"Z","upstreams":["M"]},
+	{"upstreams":["Q"],"name":"K"},
+	{"name":"M","upstreams":["K","R","K"]},
+	{"upstreams":[],"name":"Q"},
+	{"name":"R","upstreams":[]}
+]}`
+
+// TestCLITraceDeepConvergence exercises the path-selection rule through the
+// actual command: the equal-length merged routes to R are decided at the
+// first differing node (A before B, not by the smaller C deeper on the
+// losing route), Q keeps its own shortcut path, length beats the small-named
+// long route, the still-fed merge node M is not a root, and the
+// disconnected X/U branch is absent. Entries stay ordered by root name.
+func TestCLITraceDeepConvergence(t *testing.T) {
+	snapPath := snapshotForTrace(t, traceDeepGraph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", snapPath, "T"})
+	})
+	if exit != 0 {
+		t.Fatalf("trace exit = %d, stderr = %s", exit, stderr)
+	}
+	var report chainledger.TraceReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("trace stdout is not valid JSON: %v\n%s", err, stdout)
+	}
+	if report.Dataset != "T" {
+		t.Errorf("Dataset = %q, want %q", report.Dataset, "T")
+	}
+	snap, err := chainledger.ParseSnapshot([]byte(readFile(t, snapPath)))
+	if err != nil {
+		t.Fatalf("parse snapshot: %v", err)
+	}
+	if report.ContentID != snap.ContentID {
+		t.Errorf("ContentID = %q, want %q", report.ContentID, snap.ContentID)
+	}
+	want := []chainledger.SourceTrace{
+		{Root: "Q", Path: []string{"T", "S", "Q"}},
+		{Root: "R", Path: []string{"T", "A", "Z", "M", "R"}},
+	}
+	if !reflect.DeepEqual(report.Sources, want) {
+		t.Errorf("Sources = %+v, want %+v", report.Sources, want)
+	}
+}
+
+// TestCLITraceDeepGraphByteIdenticalAcrossReorderings requires the full
+// trace report printed by the command to be byte-for-byte identical when
+// the same deep graph is read with reordered records, reordered upstream
+// lists, repeated upstreams, and different whitespace.
+func TestCLITraceDeepGraphByteIdenticalAcrossReorderings(t *testing.T) {
+	s1 := snapshotForTrace(t, traceDeepGraph)
+	s2 := snapshotForTrace(t, traceDeepShuffled)
+	out1, stderr, exit := captureStdout(t, func() int { return run([]string{"trace", s1, "T"}) })
+	if exit != 0 {
+		t.Fatalf("trace s1: %s", stderr)
+	}
+	out2, stderr, exit := captureStdout(t, func() int { return run([]string{"trace", s2, "T"}) })
+	if exit != 0 {
+		t.Fatalf("trace s2: %s", stderr)
+	}
+	if out1 != out2 {
+		t.Errorf("equivalent deep snapshots produced different reports:\n%s\n%s", out1, out2)
+	}
+	var report chainledger.TraceReport
+	if err := json.Unmarshal([]byte(out1), &report); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	want := []chainledger.SourceTrace{
+		{Root: "Q", Path: []string{"T", "S", "Q"}},
+		{Root: "R", Path: []string{"T", "A", "Z", "M", "R"}},
+	}
+	if !reflect.DeepEqual(report.Sources, want) {
+		t.Errorf("Sources = %+v, want %+v", report.Sources, want)
+	}
+}
+
+// TestCLITraceQueryNameEchoedVerbatim pins that the report carries the
+// queried name exactly as typed, including leading and trailing spaces, and
+// that a disconnected branch does not change the answer.
+func TestCLITraceQueryNameEchoedVerbatim(t *testing.T) {
+	graph := `{"datasets":[
+		{"name":" de T ","upstreams":["R"]},
+		{"name":"R","upstreams":[]},
+		{"name":"X","upstreams":[]}
+	]}`
+	snapPath := snapshotForTrace(t, graph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", snapPath, " de T "})
+	})
+	if exit != 0 {
+		t.Fatalf("trace exit = %d, stderr = %s", exit, stderr)
+	}
+	var report chainledger.TraceReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if report.Dataset != " de T " {
+		t.Errorf("Dataset = %q, want verbatim %q", report.Dataset, " de T ")
+	}
+	want := []chainledger.SourceTrace{{Root: "R", Path: []string{" de T ", "R"}}}
+	if !reflect.DeepEqual(report.Sources, want) {
+		t.Errorf("Sources = %+v, want %+v", report.Sources, want)
+	}
+}
+
 func TestCLIHelpMentionsTrace(t *testing.T) {
 	stdout, _, exit := captureStdout(t, func() int { return run([]string{"help"}) })
 	if exit != 0 {
