@@ -1660,6 +1660,159 @@ func TestUpstreamsAfterRewireLongerRouteSurvives(t *testing.T) {
 	}
 }
 
+// Regression for detaching a middle dataset from ALL of its direct upstreams
+// by re-registering it with an empty upstream list, where the report still has
+// a second branch reaching back to the old source. raw derives a and z; middle
+// depends on raw and a; report depends on middle and z. Before the detach, raw
+// reaches report over two shortest routes of length 2 (raw -> middle -> report
+// and raw -> z -> report), and the lexicographically smaller middle route is
+// the explanation. Detaching middle makes it a new root without deleting it or
+// breaking its downstream edge to report: middle stays a distance-1 source, a
+// leaves report's sources entirely, but raw survives exactly once at distance
+// 2 through the remaining z branch, with the explanation re-derived as
+// raw -> z -> report instead of the removed middle route.
+func TestUpstreamsAfterDetachAllUpstreamsSecondBranchSurvives(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"a", "raw"},
+		{"z", "raw"},
+		{"middle", "raw", "a"},
+		{"report", "middle", "z"},
+	})
+	assertConsistent(t, graph)
+
+	wantBefore := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+	}
+	before := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(before, wantBefore) {
+		t.Fatalf("upstreams before detach = %v, want %v", before, wantBefore)
+	}
+	// Anchor: of the two length-2 routes from raw, the middle route explains.
+	assertUpstreamOnce(t, before, "raw", 2, []string{"raw", "middle", "report"})
+	beforeCopy := make([]Upstream, len(before))
+	for i, up := range before {
+		beforeCopy[i] = Upstream{up.Dataset, up.Distance, append([]string(nil), up.Path...)}
+	}
+
+	// Detach middle from every direct upstream. report's own direct
+	// dependencies are not part of the request and must not change.
+	mustRegister(t, graph, "middle")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"middle", "z"}, nil)
+	assertEntry(t, graph, "raw", nil, []string{"a", "z"})
+	assertEntry(t, graph, "a", []string{"raw"}, nil)
+	assertEntry(t, graph, "z", []string{"raw"}, []string{"report"})
+	graphBeforeQuery := snapshot(graph)
+
+	wantAfter := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "z", "report"}},
+	}
+	after := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(after, wantAfter) {
+		t.Fatalf("upstreams after detach = %v, want %v", after, wantAfter)
+	}
+	// Anchors with explicit messages: middle stays a direct source, a is gone,
+	// and raw survives exactly once via z — it must not follow a out of the
+	// result, nor keep the detached raw -> middle -> report explanation.
+	assertUpstreamOnce(t, after, "middle", 1, []string{"middle", "report"})
+	assertUpstreamOnce(t, after, "raw", 2, []string{"raw", "z", "report"})
+	if names := upstreamNames(after); slices.Contains(names, "a") || slices.Contains(names, "report") {
+		t.Fatalf("detached upstream or target leaked into %v", names)
+	}
+
+	// The query is read-only and does not resurrect middle's detached
+	// upstreams.
+	if !reflect.DeepEqual(snapshot(graph), graphBeforeQuery) {
+		t.Fatalf("query changed graph: before=%v after=%v", graphBeforeQuery, snapshot(graph))
+	}
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+
+	// The result obtained before the detach kept its original content.
+	if !reflect.DeepEqual(before, beforeCopy) {
+		t.Fatalf("earlier result changed after detach/new query: before=%v snapshot=%v", before, beforeCopy)
+	}
+}
+
+// Regression for detaching a middle dataset from ALL of its direct upstreams
+// where the report has no second branch back to the old sources. raw derives
+// a; middle depends on raw and a; report depends on middle alone. After the
+// detach, report's only remaining source is middle at distance 1: raw and a
+// stay registered in the graph but leave report's upstream list. Querying the
+// detached middle itself succeeds with a non-nil empty list — it is a root,
+// not a missing dataset, and never lists itself.
+func TestUpstreamsAfterDetachAllUpstreamsNoOtherBranch(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"a", "raw"},
+		{"middle", "raw", "a"},
+		{"report", "middle"},
+	})
+	assertConsistent(t, graph)
+
+	wantBefore := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+	}
+	before := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(before, wantBefore) {
+		t.Fatalf("upstreams before detach = %v, want %v", before, wantBefore)
+	}
+
+	// Detach middle from every direct upstream; report keeps depending on it.
+	mustRegister(t, graph, "middle")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"middle"}, nil)
+	assertEntry(t, graph, "raw", nil, []string{"a"})
+	assertEntry(t, graph, "a", []string{"raw"}, nil)
+	graphBeforeQuery := snapshot(graph)
+
+	// report's sources shrink to middle alone: raw and a are still registered
+	// but no longer connected to report.
+	wantAfter := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+	}
+	after := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(after, wantAfter) {
+		t.Fatalf("upstreams after detach = %v, want %v", after, wantAfter)
+	}
+	assertUpstreamOnce(t, after, "middle", 1, []string{"middle", "report"})
+	if names := upstreamNames(after); slices.Contains(names, "raw") || slices.Contains(names, "a") {
+		t.Fatalf("detached sources leaked into %v", names)
+	}
+	if _, ok := graph["raw"]; !ok {
+		t.Fatal("raw must stay registered after the detach")
+	}
+	if _, ok := graph["a"]; !ok {
+		t.Fatal("a must stay registered after the detach")
+	}
+
+	// The detached middle is a valid query target: a successful non-nil empty
+	// list, no not-found error, and it never lists itself.
+	middleUpstreams, err := Upstreams(graph, "middle")
+	if err != nil {
+		t.Fatalf("Upstreams(middle) after detach: %v", err)
+	}
+	if middleUpstreams == nil || len(middleUpstreams) != 0 {
+		t.Fatalf("want empty non-nil list from detached middle, got %v", middleUpstreams)
+	}
+
+	// The queries changed no node, relationship or stored list order, and did
+	// not resurrect middle's detached upstreams.
+	if !reflect.DeepEqual(snapshot(graph), graphBeforeQuery) {
+		t.Fatalf("queries changed graph: before=%v after=%v", graphBeforeQuery, snapshot(graph))
+	}
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+}
+
 // A rewire of middle whose new upstream list contains report would close the
 // cycle middle -> report -> middle, so the registration must be refused with
 // an error naming report. The refusal is atomic: afterwards Upstreams(report)
