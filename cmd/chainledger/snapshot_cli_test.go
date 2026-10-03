@@ -344,6 +344,94 @@ func TestCLICompareDirectionIsOldToNew(t *testing.T) {
 	}
 }
 
+// TestCLICompareMergeFullReroute end-to-end regression for the convergence
+// case: two roots feed several branches that merge into S, with D derived
+// after the merge. In the new version every branch that used to reach R1 is
+// rewired to R2. compare must report M1 and M2 as direct upstream changes,
+// list S and D once each with their full old/new root sets ({R1,R2} -> {R2}),
+// never mix S and D into changedDatasets, report only real direct-edge
+// differences, leave both snapshot files untouched, and emit byte-identical
+// JSON for semantically equal but reordered/duplicated inputs.
+func TestCLICompareMergeFullReroute(t *testing.T) {
+	oldGraph := `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R1"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`
+	newGraph := `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`
+	// Same two graphs with reversed records, shuffled and duplicated upstreams,
+	// and altered whitespace: semantics unchanged.
+	oldShuffled := `{ "datasets" : [ {"name":"D","upstreams":["S"]}, {"name":"S","upstreams":["M2","M1"]}, {"name":"M2","upstreams":["R2","R1","R2"]}, {"name":"M1","upstreams":["R1","R1"]}, {"name":"R2","upstreams":[]}, {"name":"R1","upstreams":[]} ] }`
+	newShuffled := `{ "datasets" : [ {"name":"D","upstreams":["S","S"]}, {"name":"S","upstreams":["M2","M1"]}, {"name":"M2","upstreams":["R2"]}, {"name":"M1","upstreams":["R2"]}, {"name":"R2","upstreams":[]}, {"name":"R1","upstreams":[]} ] }`
+
+	comparePair := func(t *testing.T, oldGraphJSON, newGraphJSON string) (string, string, string) {
+		t.Helper()
+		dir := t.TempDir()
+		pOld := writeFile(t, "oldg.json", oldGraphJSON)
+		pNew := writeFile(t, "newg.json", newGraphJSON)
+		oldPath := filepath.Join(dir, "old.json")
+		newPath := filepath.Join(dir, "new.json")
+		if _, stderr, exit := captureStdout(t, func() int { return run([]string{"snapshot", pOld, oldPath}) }); exit != 0 {
+			t.Fatalf("old snapshot: %s", stderr)
+		}
+		if _, stderr, exit := captureStdout(t, func() int { return run([]string{"snapshot", pNew, newPath}) }); exit != 0 {
+			t.Fatalf("new snapshot: %s", stderr)
+		}
+		oldBytes := readFile(t, oldPath)
+		newBytes := readFile(t, newPath)
+		stdout, stderr, exit := captureStdout(t, func() int { return run([]string{"compare", oldPath, newPath}) })
+		if exit != 0 {
+			t.Fatalf("compare exit = %d, stderr = %s", exit, stderr)
+		}
+		// compare is strictly read-only.
+		if got := readFile(t, oldPath); got != oldBytes {
+			t.Errorf("compare modified old snapshot:\n%s", got)
+		}
+		if got := readFile(t, newPath); got != newBytes {
+			t.Errorf("compare modified new snapshot:\n%s", got)
+		}
+		return stdout, oldBytes, newBytes
+	}
+
+	stdout, _, _ := comparePair(t, oldGraph, newGraph)
+	var report chainledger.CompareReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("compare stdout is not valid JSON: %v\n%s", err, stdout)
+	}
+
+	if len(report.NewDatasets) != 0 {
+		t.Errorf("NewDatasets = %v, want []", report.NewDatasets)
+	}
+	if len(report.RemovedDatasets) != 0 {
+		t.Errorf("RemovedDatasets = %v, want []", report.RemovedDatasets)
+	}
+	// Direct upstream changes: M1 and M2 only. S and D keep their direct
+	// upstreams and must not enter this list even though their roots move.
+	if got, want := report.ChangedDatasets, []string{"M1", "M2"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	// M1 swaps R1 for R2; M2 drops R1 (its R2 edge already existed), so only
+	// R2->M1 is added; indirect edges such as R2->S must not appear.
+	if got, want := report.AddedRelations, []chainledger.Relation{{Upstream: "R2", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v", got, want)
+	}
+	if got, want := report.RemovedRelations, []chainledger.Relation{{Upstream: "R1", Downstream: "M1"}, {Upstream: "R1", Downstream: "M2"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RemovedRelations = %v, want %v", got, want)
+	}
+	wantRootChanges := []chainledger.RootSourceChange{
+		{Dataset: "D", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+		{Dataset: "M2", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "S", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v", report.RootSourceChanges, wantRootChanges)
+	}
+
+	// Semantically equal inputs (reordered records/upstreams, duplicates,
+	// whitespace) must produce byte-for-byte identical compare output.
+	shuffledStdout, _, _ := comparePair(t, oldShuffled, newShuffled)
+	if shuffledStdout != stdout {
+		t.Fatalf("compare output differs for semantically equal snapshots:\n canonical:\n%s\n shuffled:\n%s", stdout, shuffledStdout)
+	}
+}
+
 // TestCLISnapshotConcurrentSamesContent exercises the flock-guarded
 // check-then-write from within one process: every concurrent save of identical
 // content succeeds, and the resulting file is a single valid snapshot.

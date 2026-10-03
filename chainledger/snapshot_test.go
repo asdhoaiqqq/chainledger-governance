@@ -765,6 +765,256 @@ func TestCompareNameCasingAndSpacingPreserved(t *testing.T) {
 	}
 }
 
+// Multi-branch merge graph shared by the regression tests below:
+//
+//	R1 (root) ──> M1 ──┐
+//	R1 (root) ──> M2 <─┴─ R2 (root)   (M2 takes both roots)
+//	              M1,M2 ──> S (merge) ──> D (further derived)
+//
+// R1 reaches the merge S through more than one branch (M1 and via M2), and R2
+// has its own path through M2. Root sets before any edit: M1={R1},
+// M2={R1,R2}, S={R1,R2}, D={R1,R2}.
+const mergeOldGraph = `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R1"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`
+
+// TestCompareMergePartialRerouteOnlyChangedBranchReported is the first
+// convergence regression: one branch that used to depend only on R1 is
+// repointed at R2, while the other branch still carries R1 and R2 into the
+// merge. The merge S and its downstream D still reach both roots, so they must
+// not appear among the root-source changes even though an ancestor changed;
+// the repointed branch M1 itself must still be reported as R1 -> R2, and must
+// not be hidden just because the merge's root set came out unchanged.
+func TestCompareMergePartialRerouteOnlyChangedBranchReported(t *testing.T) {
+	oldSnap := snapshotOf(t, mergeOldGraph)
+	newSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`)
+
+	report := CompareSnapshots(oldSnap, newSnap)
+	if len(report.NewDatasets) != 0 {
+		t.Errorf("NewDatasets = %v, want empty", report.NewDatasets)
+	}
+	if len(report.RemovedDatasets) != 0 {
+		t.Errorf("RemovedDatasets = %v, want empty", report.RemovedDatasets)
+	}
+	// Only M1's DIRECT upstream set changed; M2, S, and D keep theirs.
+	if got, want := report.ChangedDatasets, []string{"M1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	// Relation differences are the direct edges of M1 only; no indirect edge
+	// (e.g. R2 -> S or R2 -> D) is reported.
+	if got, want := report.AddedRelations, []Relation{{Upstream: "R2", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v", got, want)
+	}
+	if got, want := report.RemovedRelations, []Relation{{Upstream: "R1", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RemovedRelations = %v, want %v", got, want)
+	}
+	wantRootChanges := []RootSourceChange{
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v", report.RootSourceChanges, wantRootChanges)
+	}
+}
+
+// TestCompareMergeFullRerouteRootSetsPropagatedOnce is the second convergence
+// regression: every remaining path to R1 is rewired to R2. The merge S and the
+// dataset D derived after it genuinely lose R1, so each must appear once with
+// its complete old and new root sets, the new set holding only R2. At the same
+// time S and D keep identical direct upstreams, so they must not enter the
+// direct-change list merely because their sources moved.
+func TestCompareMergeFullRerouteRootSetsPropagatedOnce(t *testing.T) {
+	oldSnap := snapshotOf(t, mergeOldGraph)
+	newSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`)
+
+	report := CompareSnapshots(oldSnap, newSnap)
+	// M1 and M2 are the only datasets whose direct upstream set changed; S and
+	// D derive after the merge and must not be mixed into this list.
+	if got, want := report.ChangedDatasets, []string{"M1", "M2"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	// M1 swaps R1 for R2 (add R2->M1, remove R1->M1); M2 goes from {R1,R2} to
+	// {R2}, so its R2 edge was already present and only R1->M2 is removed.
+	if got, want := report.AddedRelations, []Relation{{Upstream: "R2", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v", got, want)
+	}
+	if got, want := report.RemovedRelations, []Relation{{Upstream: "R1", Downstream: "M1"}, {Upstream: "R1", Downstream: "M2"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RemovedRelations = %v, want %v", got, want)
+	}
+
+	wantRootChanges := []RootSourceChange{
+		{Dataset: "D", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+		{Dataset: "M2", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "S", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v", report.RootSourceChanges, wantRootChanges)
+	}
+
+	// Each common dataset appears at most once, R1 is gone from every new set,
+	// and the roots themselves are never listed.
+	seen := make(map[string]int)
+	for _, change := range report.RootSourceChanges {
+		seen[change.Dataset]++
+		for _, root := range change.NewRoots {
+			if root == "R1" {
+				t.Errorf("dataset %q still lists R1 as a new root: %v", change.Dataset, change.NewRoots)
+			}
+		}
+	}
+	for dataset, count := range seen {
+		if count > 1 {
+			t.Errorf("dataset %q is reported %d times, want once", dataset, count)
+		}
+	}
+	if seen["R1"] > 0 || seen["R2"] > 0 {
+		t.Errorf("unchanged root datasets must not be reported: %v", report.RootSourceChanges)
+	}
+}
+
+// TestCompareMergeRerouteSameRootSetNoSourceChange covers a pure path swap:
+// M1 stops depending on R1 directly and instead goes through an existing
+// intermediate M0 that itself derives from R1. M1, the merge, and everything
+// downstream still reach exactly the same roots, so rootSourceChanges must be
+// an empty [] even though a direct upstream changed. Added and removed
+// relations are still the real direct-edge differences; no indirect edge is
+// invented.
+func TestCompareMergeRerouteSameRootSetNoSourceChange(t *testing.T) {
+	// M0 derives from R1 in both versions; in the old graph nothing feeds from
+	// it yet.
+	oldSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M0","upstreams":["R1"]},{"name":"M1","upstreams":["R1"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`)
+	newSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M0","upstreams":["R1"]},{"name":"M1","upstreams":["M0"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`)
+
+	report := CompareSnapshots(oldSnap, newSnap)
+	if got, want := report.ChangedDatasets, []string{"M1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	if got, want := report.AddedRelations, []Relation{{Upstream: "M0", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v", got, want)
+	}
+	if got, want := report.RemovedRelations, []Relation{{Upstream: "R1", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RemovedRelations = %v, want %v", got, want)
+	}
+	if len(report.RootSourceChanges) != 0 {
+		t.Errorf("a path-only reroute to the same roots must not be a source change: %v", report.RootSourceChanges)
+	}
+	// No source changes still serializes as an explicit empty array.
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if !strings.Contains(string(data), `"rootSourceChanges":[]`) {
+		t.Errorf("report does not encode rootSourceChanges as []:\n%s", data)
+	}
+}
+
+// TestCompareMergeUnrelatedBranchUnchanged: alongside the merge component both
+// snapshots hold a disconnected component (root P with child Q) that never
+// changes. Its nodes and edges must not appear in any difference list; the
+// report stays exactly what the rerouted component alone would produce.
+func TestCompareMergeUnrelatedBranchUnchanged(t *testing.T) {
+	oldSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R1"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]},{"name":"P","upstreams":[]},{"name":"Q","upstreams":["P"]}]}`)
+	newSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]},{"name":"P","upstreams":[]},{"name":"Q","upstreams":["P"]}]}`)
+
+	report := CompareSnapshots(oldSnap, newSnap)
+	if len(report.NewDatasets) != 0 || len(report.RemovedDatasets) != 0 {
+		t.Errorf("unrelated component produced node differences: new=%v removed=%v", report.NewDatasets, report.RemovedDatasets)
+	}
+	if got, want := report.ChangedDatasets, []string{"M1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	if got, want := report.AddedRelations, []Relation{{Upstream: "R2", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v (P -> Q must stay out)", got, want)
+	}
+	if got, want := report.RemovedRelations, []Relation{{Upstream: "R1", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("RemovedRelations = %v, want %v", got, want)
+	}
+	wantRootChanges := []RootSourceChange{
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v (P and Q stay out)", report.RootSourceChanges, wantRootChanges)
+	}
+}
+
+// TestCompareMergeAddedNodeStaysOutOfRootChanges: on top of the partial
+// reroute, the new snapshot adds an isolated root Z. Z is reported as a new
+// dataset but must not appear among root-source changes (that list covers
+// common datasets only) and adds no relation.
+func TestCompareMergeAddedNodeStaysOutOfRootChanges(t *testing.T) {
+	oldSnap := snapshotOf(t, mergeOldGraph)
+	newSnap := snapshotOf(t, `{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"Z","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R1","R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`)
+
+	report := CompareSnapshots(oldSnap, newSnap)
+	if got, want := report.NewDatasets, []string{"Z"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("NewDatasets = %v, want %v", got, want)
+	}
+	// The isolated new node Z contributes no edge; the only added relation is
+	// the one from M1's reroute.
+	if got, want := report.AddedRelations, []Relation{{Upstream: "R2", Downstream: "M1"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("AddedRelations = %v, want %v (Z must add none)", got, want)
+	}
+	if got, want := report.ChangedDatasets, []string{"M1"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("ChangedDatasets = %v, want %v", got, want)
+	}
+	for _, change := range report.RootSourceChanges {
+		if change.Dataset == "Z" {
+			t.Errorf("new-only dataset Z must not appear in root source changes: %v", report.RootSourceChanges)
+		}
+	}
+	wantRootChanges := []RootSourceChange{
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v", report.RootSourceChanges, wantRootChanges)
+	}
+}
+
+// TestCompareMergeDeterministicBytesReordered pins byte-for-byte determinism
+// for the richest convergence case (full reroute): shuffling record order,
+// upstream order, repeating an upstream, or changing JSON whitespace must not
+// alter a single byte of the report. Root sets reached by several paths still
+// count each root once.
+func TestCompareMergeDeterministicBytesReordered(t *testing.T) {
+	oldInputs := []string{
+		mergeOldGraph,
+		// Records reversed, upstream lists shuffled with duplicates, loose
+		// whitespace: same semantics as mergeOldGraph.
+		`{ "datasets" : [ {"name":"D","upstreams":["S"]}, {"name":"S","upstreams":["M2","M1"]}, {"name":"M2","upstreams":["R2","R1","R1"]}, {"name":"M1","upstreams":["R1","R1"]}, {"name":"R2","upstreams":[]}, {"name":"R1","upstreams":[]} ] }`,
+	}
+	newInputs := []string{
+		`{"datasets":[{"name":"R1","upstreams":[]},{"name":"R2","upstreams":[]},{"name":"M1","upstreams":["R2"]},{"name":"M2","upstreams":["R2"]},{"name":"S","upstreams":["M1","M2"]},{"name":"D","upstreams":["S"]}]}`,
+		`{ "datasets" : [ {"name":"D","upstreams":["S","S"]}, {"name":"S","upstreams":["M2","M1"]}, {"name":"M2","upstreams":["R2","R2"]}, {"name":"M1","upstreams":["R2"]}, {"name":"R2","upstreams":[]}, {"name":"R1","upstreams":[]} ] }`,
+	}
+
+	var wantBytes []byte
+	for i := range oldInputs {
+		report := CompareSnapshots(snapshotOf(t, oldInputs[i]), snapshotOf(t, newInputs[i]))
+		got, err := json.Marshal(report)
+		if err != nil {
+			t.Fatalf("marshal report for input pair %d: %v", i, err)
+		}
+		if i == 0 {
+			wantBytes = got
+			continue
+		}
+		if string(got) != string(wantBytes) {
+			t.Fatalf("pair %d compare bytes differ for semantically equal snapshots:\n got %s\nwant %s", i, got, wantBytes)
+		}
+	}
+
+	// Sanity-check the deterministic report itself: S and D end with R2 only,
+	// multipath roots counted once, entries sorted by dataset name.
+	report := CompareSnapshots(snapshotOf(t, oldInputs[0]), snapshotOf(t, newInputs[0]))
+	wantRootChanges := []RootSourceChange{
+		{Dataset: "D", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "M1", OldRoots: []string{"R1"}, NewRoots: []string{"R2"}},
+		{Dataset: "M2", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+		{Dataset: "S", OldRoots: []string{"R1", "R2"}, NewRoots: []string{"R2"}},
+	}
+	if !reflect.DeepEqual(report.RootSourceChanges, wantRootChanges) {
+		t.Errorf("RootSourceChanges = %v\nwant %v", report.RootSourceChanges, wantRootChanges)
+	}
+}
+
 func assertEmptyReport(t *testing.T, report *CompareReport) {
 	t.Helper()
 	if len(report.NewDatasets) != 0 || len(report.RemovedDatasets) != 0 || len(report.ChangedDatasets) != 0 ||
