@@ -686,6 +686,265 @@ func TestImpactsReadOnlyAndIsolated(t *testing.T) {
 	assertConsistent(t, graph)
 }
 
+func mustImpacts(t *testing.T, graph map[string]*Lineage, origin string) []Impact {
+	t.Helper()
+	impacts, err := Impacts(graph, origin)
+	if err != nil {
+		t.Fatalf("Impacts(%s): %v", origin, err)
+	}
+	return impacts
+}
+
+// assertImpactOnce checks the entry for name and that name appears exactly once
+// in the result, even where several branches merge into it.
+func assertImpactOnce(t *testing.T, impacts []Impact, name string, wantDistance int, wantPath []string) {
+	t.Helper()
+	count := 0
+	for _, im := range impacts {
+		if im.Dataset == name {
+			count++
+		}
+	}
+	if count > 1 {
+		t.Fatalf("impact %q appears %d times in %v, want exactly once", name, count, impactNames(impacts))
+	}
+	assertImpact(t, impacts, name, wantDistance, wantPath)
+}
+
+// Re-wiring report from [a b] to [b] removes the short raw -> a -> report
+// path, but the longer raw -> a -> b -> report path still connects everything.
+// Distances and explanation paths must be recomputed under the current edges,
+// not inherited from before the re-wire.
+func TestImpactsAfterRewireLongerPathSurvives(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "a")
+	mustRegister(t, graph, "report", "a", "b")
+	mustRegister(t, graph, "view", "report")
+
+	before := mustImpacts(t, graph, "raw")
+	assertImpact(t, before, "report", 2, []string{"raw", "a", "report"})
+	assertImpact(t, before, "view", 3, []string{"raw", "a", "report", "view"})
+
+	// Drop the direct a -> report edge; only the route through b remains.
+	mustRegister(t, graph, "report", "b")
+	assertConsistent(t, graph)
+
+	impacts := mustImpacts(t, graph, "raw")
+	if got, want := impactNames(impacts), []string{"a", "b", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, impacts, "report", 3, []string{"raw", "a", "b", "report"})
+	assertImpactOnce(t, impacts, "view", 4, []string{"raw", "a", "b", "report", "view"})
+
+	// From the dropped upstream a, report was distance 1 before; now only the
+	// longer current path may be reported.
+	fromOld := mustImpacts(t, graph, "a")
+	if got, want := impactNames(fromOld), []string{"b", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impacts from old upstream = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, fromOld, "report", 2, []string{"a", "b", "report"})
+	assertImpactOnce(t, fromOld, "view", 3, []string{"a", "b", "report", "view"})
+}
+
+// When the re-wire severs the last lineage path from the old source, the
+// re-wired dataset and the downstreams reachable only through it leave the old
+// source's scope together, while the old source's other branches still return.
+// The new source sees the moved subtree with paths rooted at itself.
+func TestImpactsAfterRewireLastPathRemoved(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "mid", "raw")
+	mustRegister(t, graph, "leaf", "mid")
+	mustRegister(t, graph, "side", "raw")
+	mustRegister(t, graph, "sideleaf", "side")
+	mustRegister(t, graph, "newsrc")
+
+	// mid moves from raw to newsrc, keeping its own downstream leaf.
+	mustRegister(t, graph, "mid", "newsrc")
+	assertConsistent(t, graph)
+
+	fromOld := mustImpacts(t, graph, "raw")
+	if got, want := impactNames(fromOld), []string{"side", "sideleaf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impacts from old source = %v, want %v (mid and leaf must be gone)", got, want)
+	}
+	assertImpact(t, fromOld, "side", 1, []string{"raw", "side"})
+	assertImpact(t, fromOld, "sideleaf", 2, []string{"raw", "side", "sideleaf"})
+
+	fromNew := mustImpacts(t, graph, "newsrc")
+	if got, want := impactNames(fromNew), []string{"mid", "leaf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impacts from new source = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, fromNew, "mid", 1, []string{"newsrc", "mid"})
+	assertImpactOnce(t, fromNew, "leaf", 2, []string{"newsrc", "mid", "leaf"})
+
+	// The moved subtree is still intact when queried from itself.
+	fromMid := mustImpacts(t, graph, "mid")
+	assertImpact(t, fromMid, "leaf", 1, []string{"mid", "leaf"})
+
+	// Cutting mid loose entirely (no upstreams) empties the new source's scope:
+	// the source remains a valid origin and answers with an empty list.
+	mustRegister(t, graph, "mid")
+	assertConsistent(t, graph)
+	impacts, err := Impacts(graph, "newsrc")
+	if err != nil {
+		t.Fatalf("Impacts(newsrc) with no remaining downstream: %v", err)
+	}
+	if impacts == nil || len(impacts) != 0 {
+		t.Fatalf("want empty non-nil list from newsrc, got %v", impacts)
+	}
+	if got, want := impactNames(mustImpacts(t, graph, "raw")), []string{"side", "sideleaf"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("old source other branches = %v, want %v", got, want)
+	}
+}
+
+// An old source whose only downstream was re-wired away stays a legal query
+// origin and returns a successful empty list.
+func TestImpactsOldSourceLeftWithNoDownstream(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "old")
+	mustRegister(t, graph, "solo", "old")
+	mustRegister(t, graph, "newsrc")
+
+	mustRegister(t, graph, "solo", "newsrc")
+	assertConsistent(t, graph)
+
+	impacts, err := Impacts(graph, "old")
+	if err != nil {
+		t.Fatalf("Impacts(old) after losing its only downstream: %v", err)
+	}
+	if impacts == nil || len(impacts) != 0 {
+		t.Fatalf("want empty non-nil list from old, got %v", impacts)
+	}
+	assertImpact(t, mustImpacts(t, graph, "newsrc"), "solo", 1, []string{"newsrc", "solo"})
+}
+
+// A merge node reachable over two equal paths from the same origin: removing
+// one of them must not remove the dataset (and it still appears exactly once),
+// while removing the last one must drop it and its exclusive downstream.
+func TestImpactsRewireDiamondOnePathRemovedVsAllLost(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "old")
+	mustRegister(t, graph, "p1", "old")
+	mustRegister(t, graph, "p2", "old")
+	mustRegister(t, graph, "joined", "p1", "p2")
+	mustRegister(t, graph, "down", "joined")
+	mustRegister(t, graph, "outside")
+
+	before := mustImpacts(t, graph, "old")
+	assertImpactOnce(t, before, "joined", 2, []string{"old", "p1", "joined"})
+	assertImpactOnce(t, before, "down", 3, []string{"old", "p1", "joined", "down"})
+
+	// Delete one of the two paths: joined survives at the same distance via p2.
+	mustRegister(t, graph, "joined", "p2")
+	assertConsistent(t, graph)
+	oneLeft := mustImpacts(t, graph, "old")
+	if got, want := impactNames(oneLeft), []string{"p1", "p2", "joined", "down"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after dropping one path, impacts = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, oneLeft, "joined", 2, []string{"old", "p2", "joined"})
+	assertImpactOnce(t, oneLeft, "down", 3, []string{"old", "p2", "joined", "down"})
+
+	// Delete the last path: joined and its exclusive downstream down leave the
+	// old source's scope; the p1/p2 branches remain.
+	mustRegister(t, graph, "joined", "outside")
+	assertConsistent(t, graph)
+	noneLeft := mustImpacts(t, graph, "old")
+	if got, want := impactNames(noneLeft), []string{"p1", "p2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after dropping all paths, impacts = %v, want %v", got, want)
+	}
+	fromOutside := mustImpacts(t, graph, "outside")
+	assertImpactOnce(t, fromOutside, "joined", 1, []string{"outside", "joined"})
+	assertImpactOnce(t, fromOutside, "down", 2, []string{"outside", "joined", "down"})
+}
+
+// After a re-wire leaves two equal-length shortest paths, the lexicographically
+// smallest full name sequence wins regardless of the stored parent list order,
+// and neither registration order nor upstream list order affects the result.
+func TestImpactsRewireTieBreakAndOrderInvariance(t *testing.T) {
+	build := func(parents ...string) map[string]*Lineage {
+		graph := map[string]*Lineage{}
+		mustRegister(t, graph, "o")
+		mustRegister(t, graph, "x2", "o") // larger name registered first on purpose
+		mustRegister(t, graph, "x1", "o")
+		mustRegister(t, graph, "d", parents...)
+		mustRegister(t, graph, "e", "d")
+		return graph
+	}
+
+	// d ends up with parents [x2 x1] (list order disagreeing with name order)
+	// either by direct registration or by re-wiring from a single parent.
+	direct := build("x2", "x1")
+	rewired := build("x1")
+	mustRegister(t, rewired, "d", "x2", "x1")
+	assertConsistent(t, rewired)
+
+	want := mustImpacts(t, direct, "o")
+	assertImpactOnce(t, want, "d", 2, []string{"o", "x1", "d"})
+	assertImpactOnce(t, want, "e", 3, []string{"o", "x1", "d", "e"})
+	if got, wantNames := impactNames(want), []string{"x1", "x2", "d", "e"}; !reflect.DeepEqual(got, wantNames) {
+		t.Fatalf("impact order = %v, want %v", got, wantNames)
+	}
+
+	if got := mustImpacts(t, rewired, "o"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("re-wired graph impacts = %v, want %v (registration history must not matter)", got, want)
+	}
+
+	// Same final graph, but children registered in the opposite order and the
+	// upstream list flipped: the query result must be identical.
+	flipped := map[string]*Lineage{}
+	mustRegister(t, flipped, "o")
+	mustRegister(t, flipped, "x1", "o")
+	mustRegister(t, flipped, "x2", "o")
+	mustRegister(t, flipped, "d", "x1", "x2")
+	mustRegister(t, flipped, "e", "d")
+	if got := mustImpacts(t, flipped, "o"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("flipped build impacts = %v, want %v (registration and list order must not matter)", got, want)
+	}
+}
+
+// A rejected re-wire (unknown upstream, or an upstream that would close a
+// cycle through the dataset's own downstream) must name the offending upstream
+// and leave every previously queryable relationship exactly as it was.
+func TestFailedRewireLeavesImpactsUntouched(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "mid", "raw")
+	mustRegister(t, graph, "leaf", "mid")
+	mustRegister(t, graph, "newsrc")
+	mustRegister(t, graph, "newleaf", "newsrc")
+
+	rawBefore := mustImpacts(t, graph, "raw")
+	newBefore := mustImpacts(t, graph, "newsrc")
+	before := snapshot(graph)
+
+	// Unknown upstream: the error names the missing dataset.
+	err := Register(graph, Dataset{Name: "mid"}, []string{"newsrc", "ghost"})
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("want unknown-parent error naming ghost, got %v", err)
+	}
+
+	// Cyclic upstream: pointing mid at its own downstream leaf must name leaf.
+	err = Register(graph, Dataset{Name: "mid"}, []string{"leaf"})
+	if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "leaf") {
+		t.Fatalf("want cycle error naming leaf, got %v", err)
+	}
+
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("rejected re-wires changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	if got := mustImpacts(t, graph, "raw"); !reflect.DeepEqual(got, rawBefore) {
+		t.Fatalf("raw impacts changed after rejected re-wires: got %v, want %v", got, rawBefore)
+	}
+	if got := mustImpacts(t, graph, "newsrc"); !reflect.DeepEqual(got, newBefore) {
+		t.Fatalf("newsrc impacts changed after rejected re-wires: got %v, want %v", got, newBefore)
+	}
+	assertImpact(t, rawBefore, "mid", 1, []string{"raw", "mid"})
+	assertImpact(t, rawBefore, "leaf", 2, []string{"raw", "mid", "leaf"})
+	assertConsistent(t, graph)
+}
+
 type snap struct {
 	parents  map[string][]string
 	children map[string][]string
