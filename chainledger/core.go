@@ -207,67 +207,22 @@ type Impact struct {
 // origin absent from the graph (including an empty or nil graph) is rejected
 // with an error naming it and no partial results.
 func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
-	if origin == "" {
-		return nil, errInvalid("dataset name is required")
-	}
-	if _, ok := graph[origin]; !ok {
-		return nil, errInvalid("dataset not found: " + origin)
+	if err := requireDataset(graph, origin); err != nil {
+		return nil, err
 	}
 
-	// BFS one distance level at a time. A node commits its distance and best
-	// (lexicographically smallest) shortest path only once the whole level is
-	// known, so candidates reaching the same child through different parents in
-	// the same level can be compared before either wins. Register rejects
-	// cycles, so a committed node is never reached again at an equal level.
-	distance := map[string]int{origin: 0}
-	best := map[string][]string{origin: {origin}}
-	frontier := []string{origin}
-	for d := 0; len(frontier) > 0; d++ {
-		nextDistance := d + 1
-		candidates := map[string][]string{}
-		var next []string
-		for _, node := range frontier {
-			for _, child := range graph[node].Children {
-				if _, seen := distance[child]; seen {
-					continue // reached on an earlier, strictly shorter level
-				}
-				// Fresh backing array per candidate: paths must not alias each
-				// other or any slice stored in the graph.
-				candidate := make([]string, len(best[node])+1)
-				copy(candidate, best[node])
-				candidate[len(candidate)-1] = child
-				if current, ok := candidates[child]; !ok || lessPath(candidate, current) {
-					if !ok {
-						next = append(next, child)
-					}
-					candidates[child] = candidate
-				}
-			}
-		}
-		for _, child := range next {
-			distance[child] = nextDistance
-			best[child] = candidates[child]
-		}
-		frontier = next
-	}
-
-	impacts := make([]Impact, 0, len(distance)-1)
-	for name, d := range distance {
-		if name == origin {
-			continue
-		}
+	// Downstream walk: follow child edges away from the origin, so each newly
+	// reached dataset is appended to the committed path of the node it derives
+	// from.
+	hits := walkLineage(graph, origin, func(entry *Lineage) []string { return entry.Children }, appendHop)
+	impacts := make([]Impact, 0, len(hits))
+	for _, hit := range hits {
 		impacts = append(impacts, Impact{
-			Dataset:  name,
-			Distance: d,
-			Path:     append([]string(nil), best[name]...),
+			Dataset:  hit.dataset,
+			Distance: hit.distance,
+			Path:     hit.path,
 		})
 	}
-	sort.Slice(impacts, func(i, j int) bool {
-		if impacts[i].Distance != impacts[j].Distance {
-			return impacts[i].Distance < impacts[j].Distance
-		}
-		return impacts[i].Dataset < impacts[j].Dataset
-	})
 	return impacts, nil
 }
 
@@ -301,71 +256,133 @@ type Upstream struct {
 // (including an empty or nil graph) is rejected with an error naming it and
 // no partial results.
 func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
-	if target == "" {
-		return nil, errInvalid("dataset name is required")
-	}
-	if _, ok := graph[target]; !ok {
-		return nil, errInvalid("dataset not found: " + target)
+	if err := requireDataset(graph, target); err != nil {
+		return nil, err
 	}
 
-	// BFS one distance level at a time along parent edges, mirroring Impacts.
-	// A node commits its distance and best (lexicographically smallest)
-	// shortest path only once the whole level is known, so candidates reaching
-	// the same upstream through different children in the same level can be
-	// compared before either wins. Paths are stored from the upstream toward
-	// the target, so a candidate prepends the parent to the child's committed
-	// path; candidates for one parent share its name as the first hop, which
-	// makes the committed per-child paths directly comparable.
-	distance := map[string]int{target: 0}
-	best := map[string][]string{target: {target}}
-	frontier := []string{target}
+	// Upstream walk: follow parent edges away from the target. Paths are still
+	// written in the derivation direction (from the upstream to the target), so
+	// each newly reached upstream is prepended to the committed path of the
+	// node it feeds.
+	hits := walkLineage(graph, target, func(entry *Lineage) []string { return entry.Parents }, prependHop)
+	upstreams := make([]Upstream, 0, len(hits))
+	for _, hit := range hits {
+		upstreams = append(upstreams, Upstream{
+			Dataset:  hit.dataset,
+			Distance: hit.distance,
+			Path:     hit.path,
+		})
+	}
+	return upstreams, nil
+}
+
+// requireDataset enforces the query preconditions shared by Impacts and
+// Upstreams: an empty name is rejected as a missing name, and a name absent
+// from the graph (including an empty or nil graph) is rejected with an error
+// naming it. Nothing is read or written beyond the membership check.
+func requireDataset(graph map[string]*Lineage, name string) error {
+	if name == "" {
+		return errInvalid("dataset name is required")
+	}
+	if _, ok := graph[name]; !ok {
+		return errInvalid("dataset not found: " + name)
+	}
+	return nil
+}
+
+// lineageHit is one dataset reached by a lineage walk, before it is shaped
+// into the direction-specific result type (Impact or Upstream).
+type lineageHit struct {
+	dataset  string
+	distance int
+	path     []string
+}
+
+// walkLineage performs the level-by-level breadth-first traversal shared by
+// Impacts and Upstreams. edges selects which adjacency list to follow
+// (children downstream, parents upstream); extend builds a candidate path by
+// adding the newly reached name to the committed path of the node it was
+// reached from (appended downstream, prepended upstream), so paths always read
+// in the derivation direction regardless of the walk direction.
+//
+// A node commits its distance and best (lexicographically smallest) shortest
+// path only once the whole level is known, so candidates reaching the same
+// node through different frontier nodes in the same level can be compared
+// before either wins. Register rejects cycles, so a committed node is never
+// reached again at an equal level. The start node itself is never reported.
+//
+// Hits are ordered by distance and then by dataset name, never by
+// registration order or the stored parent/child list order. The graph is read
+// only, and every returned path is an independent copy that aliases neither
+// the graph nor any other result.
+func walkLineage(graph map[string]*Lineage, start string, edges func(*Lineage) []string, extend func(path []string, next string) []string) []lineageHit {
+	distance := map[string]int{start: 0}
+	best := map[string][]string{start: {start}}
+	frontier := []string{start}
 	for d := 0; len(frontier) > 0; d++ {
 		nextDistance := d + 1
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
-			for _, parent := range graph[node].Parents {
-				if _, seen := distance[parent]; seen {
+			for _, neighbor := range edges(graph[node]) {
+				if _, seen := distance[neighbor]; seen {
 					continue // reached on an earlier, strictly shorter level
 				}
-				// Fresh backing array per candidate: paths must not alias each
-				// other or any slice stored in the graph.
-				candidate := make([]string, len(best[node])+1)
-				candidate[0] = parent
-				copy(candidate[1:], best[node])
-				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+				candidate := extend(best[node], neighbor)
+				if current, ok := candidates[neighbor]; !ok || lessPath(candidate, current) {
 					if !ok {
-						next = append(next, parent)
+						next = append(next, neighbor)
 					}
-					candidates[parent] = candidate
+					candidates[neighbor] = candidate
 				}
 			}
 		}
-		for _, parent := range next {
-			distance[parent] = nextDistance
-			best[parent] = candidates[parent]
+		for _, neighbor := range next {
+			distance[neighbor] = nextDistance
+			best[neighbor] = candidates[neighbor]
 		}
 		frontier = next
 	}
 
-	upstreams := make([]Upstream, 0, len(distance)-1)
+	hits := make([]lineageHit, 0, len(distance)-1)
 	for name, d := range distance {
-		if name == target {
+		if name == start {
 			continue
 		}
-		upstreams = append(upstreams, Upstream{
-			Dataset:  name,
-			Distance: d,
-			Path:     append([]string(nil), best[name]...),
+		hits = append(hits, lineageHit{
+			dataset:  name,
+			distance: d,
+			path:     append([]string(nil), best[name]...),
 		})
 	}
-	sort.Slice(upstreams, func(i, j int) bool {
-		if upstreams[i].Distance != upstreams[j].Distance {
-			return upstreams[i].Distance < upstreams[j].Distance
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].distance != hits[j].distance {
+			return hits[i].distance < hits[j].distance
 		}
-		return upstreams[i].Dataset < upstreams[j].Dataset
+		return hits[i].dataset < hits[j].dataset
 	})
-	return upstreams, nil
+	return hits
+}
+
+// appendHop extends a path that grows away from the walk's start (downstream
+// queries) with one more hop at the end. The result always has a fresh backing
+// array: paths must not alias each other or any slice stored in the graph.
+func appendHop(path []string, next string) []string {
+	extended := make([]string, len(path)+1)
+	copy(extended, path)
+	extended[len(path)] = next
+	return extended
+}
+
+// prependHop extends a path that grows toward the walk's start (upstream
+// queries) with one more hop at the front, keeping the path written from the
+// upstream toward the queried target. The result always has a fresh backing
+// array: paths must not alias each other or any slice stored in the graph.
+func prependHop(path []string, next string) []string {
+	extended := make([]string, len(path)+1)
+	extended[0] = next
+	copy(extended[1:], path)
+	return extended
 }
 
 // lessPath reports whether path a sorts before path b as a name sequence:
