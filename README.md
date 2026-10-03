@@ -14,6 +14,110 @@ go test ./...
 
 命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。
 
+## 登记数据集与维护上游（Go 库）
+
+`chainledger.Register(graph, dataset, parents)` 把数据集登记进血缘图；对**已登记**的同名数据集再次调用，会用 `parents` **整体替换**它的直接上游列表（不是追加），它已有的下游全部保留，反向边同步更新。整个请求先校验后落库：只要校验失败，图中任何节点、边和顺序都不会改变，原来的血缘关系继续有效。
+
+参数的作用范围要分清：
+
+- 血缘只由 `dataset.Name` 和单独传入的 `parents` 列表维护。`Dataset.Upstreams` 字段不会被 `Register` 读取，不能用它替代 `parents`。
+- `Dataset.SchemaVersion` 和 `Dataset.Rows` 不会被保存为可查询的元数据；当前版本没有实现结构版本或行数管理，登记时填不填都不影响血缘行为。
+
+登记规则：
+
+- 上游必须**先登记**。`parents` 里出现未登记的名称会被拒绝，错误信息指出该名称（`unknown parent <名称>`），不会自动创建节点。
+- 数据集不能作为自己的上游；新边与现有血缘形成循环也会被拒绝，错误信息指出经由哪个上游成环。
+- `parents` 列表里有多个问题时，按输入顺序报告先遇到的那一个；被拒绝的请求不留下任何部分关系——列表中排在前面的、本身合法的上游也不会生效。
+- 多个上游共享祖先**不**算循环（例如 `b`、`c` 都依赖 `source` 时，`report` 可以同时依赖 `b` 和 `c`）；已经登记过的上游也可以继续保留在列表里。
+- 传入空 `parents`（`nil` 或空切片）会解除该数据集的全部上游，但数据集本身和它的下游都保留。
+
+下面的完整示例（[`examples/register`](examples/register/main.go)，可用 `go run ./examples/register` 独立运行）建立 `raw -> detail -> summary` 的血缘链和独立来源 `other`，先故意发起一个会成环的替换请求，再修正为合法请求，并用 `Impacts` 查询验证每一步的实际血缘：
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/asdhoaiqqq/chainledger-governance/chainledger"
+)
+
+func main() {
+	graph := map[string]*chainledger.Lineage{}
+
+	mustRegister := func(name string, parents ...string) {
+		if err := chainledger.Register(graph, chainledger.Dataset{Name: name}, parents); err != nil {
+			fmt.Fprintf(os.Stderr, "register %s: %v\n", name, err)
+			os.Exit(1)
+		}
+		fmt.Printf("registered %s parents=%v\n", name, parents)
+	}
+	mustRegister("raw")
+	mustRegister("detail", "raw")
+	mustRegister("summary", "detail")
+	mustRegister("other")
+
+	report := func(origin string) {
+		impacts, err := chainledger.Impacts(graph, origin)
+		if err != nil {
+			fmt.Printf("Impacts(%q) error: %v\n", origin, err)
+			return
+		}
+		fmt.Printf("Impacts(%q) -> %d downstream dataset(s):\n", origin, len(impacts))
+		for _, im := range impacts {
+			fmt.Printf("  %-8s distance=%d path=%v\n", im.Dataset, im.Distance, im.Path)
+		}
+	}
+
+	// other 已登记且本身合法，但 summary 是 detail 自己的下游，
+	// 新边 detail -> summary 会成环，整个请求被拒绝。
+	fmt.Println("\n-- re-register detail with upstreams [other summary] --")
+	if err := chainledger.Register(graph, chainledger.Dataset{Name: "detail"}, []string{"other", "summary"}); err != nil {
+		fmt.Printf("register detail refused: %v\n", err)
+	}
+	fmt.Println("after the refusal, nothing changed:")
+	report("raw")   // detail 和 summary 仍依赖 raw
+	report("other") // other 没有因被拒绝的请求获得任何下游
+
+	// 修正为只依赖 other：同名 Register 整体替换直接上游列表，
+	// raw 被移除；detail 自己的下游 summary 保留。
+	fmt.Println("\n-- re-register detail with upstreams [other] --")
+	mustRegister("detail", "other")
+	report("raw")   // raw 不再影响任何数据集
+	report("other") // other 现在能影响 detail，并经由它影响 summary
+}
+```
+
+预期输出：
+
+```text
+registered raw parents=[]
+registered detail parents=[raw]
+registered summary parents=[detail]
+registered other parents=[]
+
+-- re-register detail with upstreams [other summary] --
+register detail refused: cycle through summary for dataset detail
+after the refusal, nothing changed:
+Impacts("raw") -> 2 downstream dataset(s):
+  detail   distance=1 path=[raw detail]
+  summary  distance=2 path=[raw detail summary]
+Impacts("other") -> 0 downstream dataset(s):
+
+-- re-register detail with upstreams [other] --
+registered detail parents=[other]
+Impacts("raw") -> 0 downstream dataset(s):
+Impacts("other") -> 2 downstream dataset(s):
+  detail   distance=1 path=[other detail]
+  summary  distance=2 path=[other detail summary]
+```
+
+要点：
+
+- 被拒绝的请求不会部分生效：`other` 虽然已登记且本身合法，但整个请求被拒绝后 `detail` 仍依赖 `raw`，`summary` 仍依赖 `detail`，`other` 也没有获得 `detail` 这个下游。
+- 修正后的同名 `Register` 用 `[other]` 替换了 `detail` 的整个直接上游列表，而不是把 `other` 追加到 `raw` 后面：`raw` 不再影响 `detail` 和 `summary`，`other` 能影响二者；`detail` 原有的下游 `summary` 保留，所以 `other` 的影响沿 `other -> detail -> summary` 传递。查询方向、距离含义和结果顺序与下一节描述的公开行为一致。
+
 ## 查询下游影响（Go 库）
 
 `chainledger.Impacts(graph, origin)` 返回所有直接或间接依赖 `origin` 的数据集，即沿“下游”方向从 `origin` 出发可以到达的全部派生数据集。血缘图本身就是一个普通的内存 map，由 `chainledger.Register` 登记填充。
