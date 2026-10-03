@@ -1858,3 +1858,346 @@ func TestUpstreamsRejectedCycleRewireLeavesResultsUntouched(t *testing.T) {
 	assertUpstreamOnce(t, after, "a", 3, []string{"a", "z", "middle", "report"})
 	assertUpstreamOnce(t, after, "b", 3, []string{"b", "c", "middle", "report"})
 }
+
+// impactPath returns the explanation Path carried by the named impact record.
+func impactPath(impacts []Impact, name string) []string {
+	for _, im := range impacts {
+		if im.Dataset == name {
+			return im.Path
+		}
+	}
+	return nil
+}
+
+// upstreamPath returns the explanation Path carried by the named upstream record.
+func upstreamPath(upstreams []Upstream, name string) []string {
+	for _, up := range upstreams {
+		if up.Dataset == name {
+			return up.Path
+		}
+	}
+	return nil
+}
+
+// Regression for the independence of one returned explanation Path from the
+// others when several downstream records explain themselves through a shared
+// prefix. The chain source -> detail -> report -> view means the report and
+// view records both carry source, detail, report on their paths; the caller is
+// allowed to rewrite or extend the Path it got back (for display labels), but
+// such an edit must touch only that one record: the other records keep their
+// full original paths, names and distances, the graph keeps its registered
+// edges, and a later query is recomputed from the current lineage rather than
+// inheriting any edit — even when the edited path no longer names real lineage.
+func TestImpactsReturnedPathEditsIsolatedAcrossSharedPrefix(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"detail", "source"},
+		{"report", "detail"},
+		{"view", "report"},
+	})
+	assertConsistent(t, graph)
+	want := []Impact{
+		{Dataset: "detail", Distance: 1, Path: []string{"source", "detail"}},
+		{Dataset: "report", Distance: 2, Path: []string{"source", "detail", "report"}},
+		{Dataset: "view", Distance: 3, Path: []string{"source", "detail", "report", "view"}},
+	}
+
+	impacts := mustImpacts(t, graph, "source")
+	if !reflect.DeepEqual(impacts, want) {
+		t.Fatalf("impacts = %v, want %v", impacts, want)
+	}
+	before := snapshot(graph)
+
+	// Rewrite a name on the shared prefix inside report's path only (display
+	// relabeling). report's path and view's path both contain source, detail,
+	// report, so this is the aliasing-prone case: view must keep its full
+	// source -> view content, and detail must be untouched as well.
+	reportPath := impactPath(impacts, "report")
+	if reportPath == nil {
+		t.Fatal("report record missing")
+	}
+	reportPath[0] = "SOURCE-LABEL"
+
+	if got, want := impactPath(impacts, "report"),
+		[]string{"SOURCE-LABEL", "detail", "report"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("edited report path = %v, want %v", got, want)
+	}
+	if got, want := impactPath(impacts, "view"),
+		[]string{"source", "detail", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("view path changed through report's shared-prefix edit: got %v, want %v", got, want)
+	}
+	if got, want := impactPath(impacts, "detail"),
+		[]string{"source", "detail"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("detail path changed through report's edit: got %v, want %v", got, want)
+	}
+	// Only the path element changes: names and distances of the other records
+	// (and the edited record's own name/distance) keep their original values.
+	assertImpact(t, impacts, "detail", 1, []string{"source", "detail"})
+	assertImpact(t, impacts, "view", 3, []string{"source", "detail", "report", "view"})
+	if im := impacts[1]; im.Dataset != "report" || im.Distance != 2 {
+		t.Fatalf("report record name/distance changed: %+v", im)
+	}
+
+	// Append a display-only marker to report's path. The marker must appear on
+	// that single path and nowhere else; view and detail must neither gain it
+	// nor lose any original name.
+	reportPath = append(reportPath, "DISPLAY-MARK")
+	setImpactPath(impacts, "report", reportPath)
+	if got, want := impactPath(impacts, "report"),
+		[]string{"SOURCE-LABEL", "detail", "report", "DISPLAY-MARK"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("report path after marker = %v, want %v", got, want)
+	}
+	if got := impactPath(impacts, "view"); !reflect.DeepEqual(got,
+		[]string{"source", "detail", "report", "view"}) {
+		t.Fatalf("view path gained/lost a name from report's appended marker: got %v", got)
+	}
+	if got := impactPath(impacts, "detail"); !reflect.DeepEqual(got,
+		[]string{"source", "detail"}) {
+		t.Fatalf("detail path gained/lost a name from report's appended marker: got %v", got)
+	}
+
+	// The edited path no longer corresponds to any registered lineage, but the
+	// registered relationships are exactly as they were.
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("editing returned paths changed the graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertEntry(t, graph, "source", nil, []string{"detail"})
+	assertEntry(t, graph, "detail", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"detail"}, []string{"view"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertConsistent(t, graph)
+
+	// A subsequent query is determined by the current lineage: it returns the
+	// original dataset names, distances and paths, inheriting neither the
+	// relabeled name nor the display marker.
+	fresh := mustImpacts(t, graph, "source")
+	if !reflect.DeepEqual(fresh, want) {
+		t.Fatalf("query after returned-path edits = %v, want %v", fresh, want)
+	}
+}
+
+// setImpactPath replaces the Path field of the named impact record; it lets a
+// test exercise append-based edits the same way a caller reassigns Path.
+func setImpactPath(impacts []Impact, name string, path []string) {
+	for i := range impacts {
+		if impacts[i].Dataset == name {
+			impacts[i].Path = path
+			return
+		}
+	}
+}
+
+// Regression for the shared-suffix case in the upstream direction. Querying
+// view over source -> detail -> report -> view returns source, detail and
+// report, and every explanation path ends with report, view. Editing that
+// ending portion on one returned record (rewriting a shared name and appending
+// a display marker) must leave the other sources' original name sequences from
+// the source to view intact, with distances and ordering unchanged; the graph
+// and a later query are likewise unaffected.
+func TestUpstreamsReturnedPathEditsIsolatedAcrossSharedSuffix(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"detail", "source"},
+		{"report", "detail"},
+		{"view", "report"},
+	})
+	assertConsistent(t, graph)
+	want := []Upstream{
+		{Dataset: "report", Distance: 1, Path: []string{"report", "view"}},
+		{Dataset: "detail", Distance: 2, Path: []string{"detail", "report", "view"}},
+		{Dataset: "source", Distance: 3, Path: []string{"source", "detail", "report", "view"}},
+	}
+
+	upstreams := mustUpstreams(t, graph, "view")
+	if !reflect.DeepEqual(upstreams, want) {
+		t.Fatalf("upstreams = %v, want %v", upstreams, want)
+	}
+	before := snapshot(graph)
+
+	// Rewrite the shared ending inside detail's path only. All three paths end
+	// with report, view, so source and report must keep their own sequences.
+	detailPath := upstreamPath(upstreams, "detail")
+	if detailPath == nil {
+		t.Fatal("detail record missing")
+	}
+	detailPath[len(detailPath)-1] = "VIEW-LABEL"
+	if got, want := upstreamPath(upstreams, "detail"),
+		[]string{"detail", "report", "VIEW-LABEL"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("edited detail path = %v, want %v", got, want)
+	}
+	if got, want := upstreamPath(upstreams, "source"),
+		[]string{"source", "detail", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("source path changed through detail's shared-suffix edit: got %v, want %v", got, want)
+	}
+	if got, want := upstreamPath(upstreams, "report"),
+		[]string{"report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("report path changed through detail's shared-suffix edit: got %v, want %v", got, want)
+	}
+
+	// Append a display marker to detail's edited path. The other sources must
+	// neither gain the marker nor lose an original name.
+	detailPath = append(detailPath, "DISPLAY-MARK")
+	setUpstreamPath(upstreams, "detail", detailPath)
+	if got, want := upstreamPath(upstreams, "detail"),
+		[]string{"detail", "report", "VIEW-LABEL", "DISPLAY-MARK"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("detail path after marker = %v, want %v", got, want)
+	}
+	if got := upstreamPath(upstreams, "source"); !reflect.DeepEqual(got,
+		[]string{"source", "detail", "report", "view"}) {
+		t.Fatalf("source path gained/lost a name from detail's appended marker: got %v", got)
+	}
+	if got := upstreamPath(upstreams, "report"); !reflect.DeepEqual(got,
+		[]string{"report", "view"}) {
+		t.Fatalf("report path gained/lost a name from detail's appended marker: got %v", got)
+	}
+
+	// Distances and the distance/name ordering are unchanged for every record.
+	if got, want := upstreamNames(upstreams), []string{"report", "detail", "source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("upstream order changed: got %v, want %v", got, want)
+	}
+	assertUpstream(t, upstreams, "report", 1, []string{"report", "view"})
+	assertUpstream(t, upstreams, "source", 3, []string{"source", "detail", "report", "view"})
+	if up := upstreams[1]; up.Dataset != "detail" || up.Distance != 2 {
+		t.Fatalf("detail record name/distance changed: %+v", up)
+	}
+
+	// The edited path no longer names a valid lineage, but the graph is intact.
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("editing returned paths changed the graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertEntry(t, graph, "source", nil, []string{"detail"})
+	assertEntry(t, graph, "detail", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"detail"}, []string{"view"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertConsistent(t, graph)
+
+	// A later query recomputes from the registered edges: no relabel, no marker.
+	fresh := mustUpstreams(t, graph, "view")
+	if !reflect.DeepEqual(fresh, want) {
+		t.Fatalf("query after returned-path edits = %v, want %v", fresh, want)
+	}
+}
+
+// setUpstreamPath replaces the Path field of the named upstream record.
+func setUpstreamPath(upstreams []Upstream, name string, path []string) {
+	for i := range upstreams {
+		if upstreams[i].Dataset == name {
+			upstreams[i].Path = path
+			return
+		}
+	}
+}
+
+// Regression for two batches of query results taken against the same graph:
+// editing a returned path in one batch (both rewriting an element and appending
+// a name) must be confined to that single path. The other batch must keep,
+// immediately and without re-querying, the full content it had when it was
+// obtained, and subsequently obtained results must not inherit the display
+// marker or the replaced name either. The same checks run with both batches in
+// either role so neither query direction owns the isolation.
+func TestReturnedPathEditsDoNotLeakBetweenQueryBatches(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"detail", "source"},
+		{"report", "detail"},
+		{"view", "report"},
+	})
+	assertConsistent(t, graph)
+	before := snapshot(graph)
+
+	wantImpacts := []Impact{
+		{Dataset: "detail", Distance: 1, Path: []string{"source", "detail"}},
+		{Dataset: "report", Distance: 2, Path: []string{"source", "detail", "report"}},
+		{Dataset: "view", Distance: 3, Path: []string{"source", "detail", "report", "view"}},
+	}
+	wantUpstreams := []Upstream{
+		{Dataset: "report", Distance: 1, Path: []string{"report", "view"}},
+		{Dataset: "detail", Distance: 2, Path: []string{"detail", "report", "view"}},
+		{Dataset: "source", Distance: 3, Path: []string{"source", "detail", "report", "view"}},
+	}
+
+	cases := []struct {
+		name string
+		edit func(t *testing.T)
+	}{
+		{
+			name: "downstream batch edited",
+			edit: func(t *testing.T) {
+				downstream := mustImpacts(t, graph, "source")
+				upstreamBatch := mustUpstreams(t, graph, "view")
+
+				// Two kinds of caller-permitted edits to report's downstream
+				// path: rewrite an element then append a display name.
+				p := impactPath(downstream, "report")
+				p[1] = "DETAIL-LABEL"
+				p = append(p, "DISPLAY-MARK")
+				setImpactPath(downstream, "report", p)
+
+				if got, want := impactPath(downstream, "report"),
+					[]string{"source", "DETAIL-LABEL", "report", "DISPLAY-MARK"}; !reflect.DeepEqual(got, want) {
+					t.Fatalf("edited downstream report path = %v, want %v", got, want)
+				}
+				// The other batch immediately keeps the content it was obtained with.
+				if !reflect.DeepEqual(upstreamBatch, wantUpstreams) {
+					t.Fatalf("upstream batch changed through the other batch's edit: got %v, want %v",
+						upstreamBatch, wantUpstreams)
+				}
+				// Sibling records inside the edited batch are untouched too.
+				if got := impactPath(downstream, "view"); !reflect.DeepEqual(got,
+					[]string{"source", "detail", "report", "view"}) {
+					t.Fatalf("view path leaked the edit: got %v", got)
+				}
+			},
+		},
+		{
+			name: "upstream batch edited",
+			edit: func(t *testing.T) {
+				upstreamBatch := mustUpstreams(t, graph, "view")
+				downstream := mustImpacts(t, graph, "source")
+
+				p := upstreamPath(upstreamBatch, "detail")
+				p[0] = "DETAIL-LABEL"
+				p = append(p, "DISPLAY-MARK")
+				setUpstreamPath(upstreamBatch, "detail", p)
+
+				if got, want := upstreamPath(upstreamBatch, "detail"),
+					[]string{"DETAIL-LABEL", "report", "view", "DISPLAY-MARK"}; !reflect.DeepEqual(got, want) {
+					t.Fatalf("edited upstream detail path = %v, want %v", got, want)
+				}
+				// The other batch immediately keeps the content it was obtained with.
+				if !reflect.DeepEqual(downstream, wantImpacts) {
+					t.Fatalf("downstream batch changed through the other batch's edit: got %v, want %v",
+						downstream, wantImpacts)
+				}
+				if got := upstreamPath(upstreamBatch, "source"); !reflect.DeepEqual(got,
+					[]string{"source", "detail", "report", "view"}) {
+					t.Fatalf("source path leaked the edit: got %v", got)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.edit(t)
+
+			// The graph never participates in returned-value edits.
+			if !reflect.DeepEqual(snapshot(graph), before) {
+				t.Fatalf("graph changed after editing one batch: before=%v after=%v",
+					before, snapshot(graph))
+			}
+			assertConsistent(t, graph)
+
+			// Newly obtained results of both directions are recomputed from the
+			// current lineage and inherit neither marker nor replaced name.
+			if got := mustImpacts(t, graph, "source"); !reflect.DeepEqual(got, wantImpacts) {
+				t.Fatalf("new downstream results inherited a returned-value edit: got %v, want %v",
+					got, wantImpacts)
+			}
+			if got := mustUpstreams(t, graph, "view"); !reflect.DeepEqual(got, wantUpstreams) {
+				t.Fatalf("new upstream results inherited a returned-value edit: got %v, want %v",
+					got, wantUpstreams)
+			}
+		})
+	}
+}
