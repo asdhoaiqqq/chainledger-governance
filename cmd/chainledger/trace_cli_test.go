@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -236,6 +237,98 @@ func TestCLITraceEquivalentSnapshotsSameReport(t *testing.T) {
 	}
 	if out1 != out2 {
 		t.Errorf("equivalent snapshots produced different reports:\n%s\n%s", out1, out2)
+	}
+}
+
+// TestCLITraceDeepConvergingBranchesByteStable exercises the path-selection
+// rule through deep lineage end to end. T reaches R1 and R2 along two
+// four-relation branches that merge at M:
+//
+//	T -> A -> Z -> M -> {R1,R2}
+//	T -> B -> C -> M -> {R1,R2}
+//
+// The branch via A wins at the first differing name (A < B) even though the
+// other branch passes through C < Z. The complete JSON report must be
+// byte-for-byte identical when the same graph is reshuffled (record order,
+// upstream order, duplicate upstreams, whitespace), including a disconnected
+// branch, and must exactly match the golden bytes: sources ordered by root
+// name byte order and full path arrays from the query object to each root.
+func TestCLITraceDeepConvergingBranchesByteStable(t *testing.T) {
+	deepGraph := `{"datasets":[
+		{"name":"T","upstreams":["B","A"]},
+		{"name":"A","upstreams":["Z"]},
+		{"name":"Z","upstreams":["M"]},
+		{"name":"B","upstreams":["C"]},
+		{"name":"C","upstreams":["M"]},
+		{"name":"M","upstreams":["R2","R1"]},
+		{"name":"R1","upstreams":[]},
+		{"name":"R2","upstreams":[]},
+		{"name":"U","upstreams":["X"]},
+		{"name":"X","upstreams":[]}
+	]}`
+	shuffled := `{ "datasets" : [
+		{"upstreams":[],"name":"X"},
+		{"name":"U","upstreams":["X","X"]},
+		{"upstreams":[],"name":"R2"},
+		{"name":"R1","upstreams":[]},
+		{"upstreams":["R1","R2","R1"],"name":"M"},
+		{"name":"C","upstreams":["M","M"]},
+		{"upstreams":["M"],"name":"Z"},
+		{"name":"B","upstreams":["C"]},
+		{"name":"A","upstreams":["Z"]},
+		{"upstreams":["A","B","B","A"],"name":"T"}
+	] }`
+
+	s1 := snapshotForTrace(t, deepGraph)
+	s2 := snapshotForTrace(t, shuffled)
+
+	out1, stderr, exit := captureStdout(t, func() int { return run([]string{"trace", s1, "T"}) })
+	if exit != 0 {
+		t.Fatalf("trace s1: %s", stderr)
+	}
+	out2, stderr, exit := captureStdout(t, func() int { return run([]string{"trace", s2, "T"}) })
+	if exit != 0 {
+		t.Fatalf("trace s2: %s", stderr)
+	}
+	if out1 != out2 {
+		t.Errorf("equivalent deep snapshots produced different reports:\n%s\n%s", out1, out2)
+	}
+
+	// The content identifier comes from the snapshot actually read; the rest
+	// is the exact golden report, pinning formatting, key order, root-name
+	// ordering, and the full name arrays.
+	snap, err := chainledger.ParseSnapshot([]byte(readFile(t, s1)))
+	if err != nil {
+		t.Fatalf("parse snapshot: %v", err)
+	}
+	golden := "{\n" +
+		"  \"contentId\": " + fmt.Sprintf("%q", snap.ContentID) + ",\n" +
+		"  \"dataset\": \"T\",\n" +
+		"  \"sources\": [\n" +
+		"    {\n" +
+		"      \"root\": \"R1\",\n" +
+		"      \"path\": [\n" +
+		"        \"T\",\n" +
+		"        \"A\",\n" +
+		"        \"Z\",\n" +
+		"        \"M\",\n" +
+		"        \"R1\"\n" +
+		"      ]\n" +
+		"    },\n" +
+		"    {\n" +
+		"      \"root\": \"R2\",\n" +
+		"      \"path\": [\n" +
+		"        \"T\",\n" +
+		"        \"A\",\n" +
+		"        \"Z\",\n" +
+		"        \"M\",\n" +
+		"        \"R2\"\n" +
+		"      ]\n" +
+		"    }\n" +
+		"  ]\n" +
+		"}\n"
+	if out1 != golden {
+		t.Errorf("deep trace report differs from golden:\n got: %q\nwant: %q", out1, golden)
 	}
 }
 
