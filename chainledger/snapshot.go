@@ -63,32 +63,6 @@ type CompareReport struct {
 // contentIDPrefix names the hash algorithm used for content addressing.
 const contentIDPrefix = "sha256:"
 
-// graphAdjacencyFromFile builds the validated, normalized parent adjacency
-// directly from a parsed graph file. It rejects empty names, duplicate
-// datasets, and references to upstreams that are not declared; cycle checking
-// is the caller's responsibility (via validateAcyclic) so the reported reason
-// stays specific.
-func graphAdjacencyFromFile(gf GraphFile) (adjacency, error) {
-	adj := make(adjacency, len(gf.Datasets))
-	for _, ds := range gf.Datasets {
-		if ds.Name == "" {
-			return nil, fmt.Errorf("%w: graph contains a dataset with an empty name", ErrInvalidArgument)
-		}
-		if _, exists := adj[ds.Name]; exists {
-			return nil, fmt.Errorf("%w: dataset %q is declared more than once in the graph", ErrInvalidArgument, ds.Name)
-		}
-		adj[ds.Name] = uniqueSorted(ds.Upstreams)
-	}
-	for name, parents := range adj {
-		for _, parent := range parents {
-			if _, ok := adj[parent]; !ok {
-				return nil, fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
-			}
-		}
-	}
-	return adj, nil
-}
-
 // canonicalGraph serializes the graph's semantics deterministically: datasets
 // sorted by name byte order with sorted, duplicate-free upstream lists, compact
 // JSON with no insignificant whitespace. Two semantically equal graphs always
@@ -213,11 +187,10 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 	if err := json.Unmarshal(raw.Graph, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph in snapshot: %w", err)
 	}
-	adj, err := graphAdjacencyFromFile(gf)
+	// The graph embedded in a snapshot follows the same structural rules as a
+	// plain graph file, so both readers share one validation path.
+	adj, err := validateGraphFile(gf)
 	if err != nil {
-		return nil, err
-	}
-	if err := validateAcyclic(adj); err != nil {
 		return nil, err
 	}
 
