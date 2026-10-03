@@ -305,6 +305,124 @@ func TestParseSnapshotDuplicateTolerances(t *testing.T) {
 	}
 }
 
+// TestParseSnapshotRejectsUnicodeFoldDuplicates covers the ambiguity the
+// ASCII-only field comparison missed: encoding/json matches object keys to
+// struct fields with Unicode simple case folding, so a long s (U+017F, "ſ")
+// written in a key selects the same field as a plain "s". Two declarations
+// that fold to the same known field must reject the snapshot regardless of
+// whether the variant rune is written literally or as a JSON escape, whether
+// the values agree, the first value is null, or the declarations are swapped.
+// The error names the canonical field and the datasets index when the
+// repetition is inside a record.
+func TestParseSnapshotRejectsUnicodeFoldDuplicates(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]struct {
+		data  string
+		field string
+		index string // empty when the repetition is outside a dataset record
+	}{
+		"long s version 2 then 1": {
+			`{"formatVerſion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "",
+		},
+		"long s version written as escape": {
+			"{\"formatVer\\u017fion\":2,\"formatVersion\":1,\"contentId\":\"" + id + "\",\"graph\":" + graph + "}",
+			"formatVersion", "",
+		},
+		"plain version first, long s second": {
+			`{"formatVersion":1,"formatVerſion":2,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "",
+		},
+		"long s and plain version, same value": {
+			`{"formatVerſion":1,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "",
+		},
+		"long s datasets then plain": {
+			doc(`{"dataſets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets", "",
+		},
+		"plain datasets then long s": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}],"dataſets":[]}`),
+			"datasets", "",
+		},
+		"long s upstreams then plain in same record": {
+			doc(`{"datasets":[{"name":"A","upſtreams":[],"upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"upstreams", "index 0",
+		},
+		"long s upstreams null first in second record": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upſtreams":null,"upstreams":["A"]}]}`),
+			"upstreams", "index 1",
+		},
+		"escaped long s upstreams in same record": {
+			doc(`{"datasets":[{"name":"A","upſtreams":[],"upstreams":[]}]}`),
+			"upstreams", "index 0",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseSnapshot([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Errorf("err = %q, want it to name field %q", err, tc.field)
+			}
+			if tc.index != "" && !strings.Contains(err.Error(), tc.index) {
+				t.Errorf("err = %q, want it to locate %s", err, tc.index)
+			}
+		})
+	}
+
+	// The same Unicode-fold spelling appearing only ONCE must not be mistaken
+	// for a duplicate, even while the folded-twice documents above fail.
+	single := `{"formatVerſion":1,"contentId":"` + id + `","graph":` + graph + `}`
+	if _, err := ParseSnapshot([]byte(single)); err != nil {
+		t.Fatalf("a single long-s declaration must stay accepted: %v", err)
+	}
+}
+
+// TestParseSnapshotUnicodeFoldTolerances: spellings the decoder recognizes
+// stay legal when a known field is declared exactly once, spellings the
+// decoder does NOT map to a known field stay unknown, and keys nested inside
+// an unknown field never participate in the outer duplicate check.
+func TestParseSnapshotUnicodeFoldTolerances(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]string{
+		"single long s datasets":  doc(`{"dataſets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+		"single long s upstreams": doc(`{"datasets":[{"name":"A","upſtreams":[]},{"name":"B","upstreams":["A"]}]}`),
+		// "dataſsets" keeps both the long s and the plain s: it is a longer,
+		// genuinely different key the decoder does not bind to datasets.
+		"extra-s spelling stays unknown": doc(`{"dataſsets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+		// Duplicate keys inside an unknown outer value are irrelevant; neither
+		// the top-level nor any graph/record seen-set must notice them.
+		"same-named keys inside unknown field": `{"note":{"formatVersion":1,"formatVersion":2},"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		// The same known field declared once per distinct dataset record stays
+		// legal; the seen-set is per record, not shared across the array.
+		"upstreams once in every record": doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParseSnapshot([]byte(data))
+			if err != nil {
+				t.Fatalf("ParseSnapshot rejected a legal document: %v", err)
+			}
+			if parsed.ContentID != id {
+				t.Errorf("content id = %s, want %s", parsed.ContentID, id)
+			}
+		})
+	}
+}
+
 // TestParseSnapshotCaseVariantSpellings: a field written once in any letter
 // casing the reader already supports keeps working; only declaring it twice
 // is an error.
