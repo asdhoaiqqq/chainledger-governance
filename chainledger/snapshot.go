@@ -259,6 +259,10 @@ var errAbortScan = errors.New("chainledger: abort duplicate field scan")
 // regular parse, which reports the structural problem.
 func checkDuplicateFields(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// Numbers must arrive as json.Number, not float64: a legal JSON number
+	// outside the float64 range (e.g. 1e400) would otherwise fail Token(),
+	// abort the scan, and let a later duplicate declaration slip through.
+	dec.UseNumber()
 	err := checkTopLevelObject(dec)
 	if errors.Is(err, errAbortScan) {
 		return nil

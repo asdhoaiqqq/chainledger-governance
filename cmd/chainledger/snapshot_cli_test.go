@@ -540,6 +540,181 @@ func TestCLISnapshotRefusesDuplicateFieldTarget(t *testing.T) {
 	}
 }
 
+// hugeNumberDupFieldSnapshot seeds a valid snapshot of graphJSON, then returns
+// its path together with bytes that carry 1e400 — a legal JSON number outside
+// the float64 range — in an unknown field ahead of a doubled formatVersion
+// declaration (first 2, then the valid 1). The surviving values still describe
+// the same graph, so only the duplicate-field rule may decide the outcome; the
+// huge number must not switch that rule off. The caller writes the returned
+// content to the path itself.
+func hugeNumberDupFieldSnapshot(t *testing.T, graphJSON string) (path, content string) {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "snap.json")
+	if _, stderr, exit := snapshotViaCLI(t, graphJSON, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	valid := readFile(t, target)
+	if err := os.Remove(target + ".lock"); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	dup := strings.Replace(valid, `"formatVersion": 1`,
+		`"note": {"decoy": [1e400]}, "formatVersion": 2, "formatVersion": 1`, 1)
+	if dup == valid {
+		t.Fatalf("could not inject huge-number duplicate field into %s", valid)
+	}
+	return target, dup
+}
+
+func TestCLICompareRejectsHugeNumberDuplicateFields(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, good); exit != 0 {
+		t.Fatalf("snapshot good: %s", stderr)
+	}
+	dupPath, dupContent := hugeNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		side string
+	}{
+		{"duplicate behind huge number in old snapshot", []string{"compare", dupPath, good}, "old snapshot"},
+		{"duplicate behind huge number in new snapshot", []string{"compare", good, dupPath}, "new snapshot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, exit := captureStdout(t, func() int { return run(tc.args) })
+			if exit == 0 {
+				t.Fatalf("%v succeeded, want failure", tc.args)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty on rejection", stdout)
+			}
+			if !strings.Contains(stderr, tc.side) || !strings.Contains(stderr, dupPath) {
+				t.Errorf("stderr = %q, must name the %s file", stderr, tc.side)
+			}
+			if !strings.Contains(stderr, "formatVersion") {
+				t.Errorf("stderr = %q, must name the duplicated field", stderr)
+			}
+			if got := readFile(t, dupPath); got != dupContent {
+				t.Errorf("compare modified the snapshot:\n%s", got)
+			}
+			if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+				t.Errorf("compare created a lock file: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLITraceRejectsHugeNumberDuplicateFields(t *testing.T) {
+	dupPath, dupContent := hugeNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", dupPath, "C"})
+	})
+	if exit == 0 {
+		t.Fatalf("trace succeeded on an ambiguous snapshot")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty on rejection", stdout)
+	}
+	if !strings.Contains(stderr, dupPath) || !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the file and the duplicated field", stderr)
+	}
+	if got := readFile(t, dupPath); got != dupContent {
+		t.Errorf("trace modified the snapshot:\n%s", got)
+	}
+	if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("trace created a lock file: %v", err)
+	}
+}
+
+// TestCLISnapshotRefusesHugeNumberDuplicateFieldTarget: an existing target
+// whose duplicate formatVersion is preceded by a huge unknown-field number is
+// still corrupt — the save is refused and the target keeps every byte.
+func TestCLISnapshotRefusesHugeNumberDuplicateFieldTarget(t *testing.T) {
+	target, dup := hugeNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(target, []byte(dup), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+	infoBefore, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	graphPath := writeFile(t, "graph.json", abcGraph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"snapshot", graphPath, target})
+	})
+	if exit == 0 {
+		t.Fatalf("snapshot over a huge-number duplicate-field target succeeded")
+	}
+	if !strings.Contains(stderr, "refusing to overwrite") || !strings.Contains(stderr, target) {
+		t.Errorf("stderr = %q, want refusal naming the target", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no content id on refusal", stdout)
+	}
+	if got := readFile(t, target); got != dup {
+		t.Errorf("target changed after refusal:\n got %s\nwant %s", got, dup)
+	}
+	infoAfter, _ := os.Stat(target)
+	if !infoAfter.ModTime().Equal(infoBefore.ModTime()) {
+		t.Errorf("refusal rewrote the target: mtime %s -> %s", infoBefore.ModTime(), infoAfter.ModTime())
+	}
+}
+
+// TestCLICompareAcceptsHugeNumberInUnknownFields: a snapshot that carries
+// 1e400 only inside unknown fields — with no known field repeated — is legal;
+// compare and trace answer from the same graph semantics as without it.
+func TestCLICompareAcceptsHugeNumberInUnknownFields(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, plain); exit != 0 {
+		t.Fatalf("snapshot plain: %s", stderr)
+	}
+	annotated := filepath.Join(dir, "annotated.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, annotated); exit != 0 {
+		t.Fatalf("snapshot annotated: %s", stderr)
+	}
+	withNote := strings.Replace(readFile(t, annotated), `"formatVersion": 1`,
+		`"note": {"decoy": [1e400, {"deep": -1e400}]}, "formatVersion": 1`, 1)
+	if err := os.WriteFile(annotated, []byte(withNote), 0o644); err != nil {
+		t.Fatalf("write annotated: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"compare", plain, annotated})
+	})
+	if exit != 0 {
+		t.Fatalf("compare exit = %d, stderr = %s", exit, stderr)
+	}
+	var report chainledger.CompareReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("compare report invalid JSON: %v\n%s", err, stdout)
+	}
+	if len(report.NewDatasets) != 0 || len(report.RemovedDatasets) != 0 ||
+		len(report.ChangedDatasets) != 0 || len(report.AddedRelations) != 0 ||
+		len(report.RemovedRelations) != 0 || len(report.RootSourceChanges) != 0 {
+		t.Errorf("unknown-field annotation changed the comparison: %s", stdout)
+	}
+
+	traceStdout, traceStderr, traceExit := captureStdout(t, func() int {
+		return run([]string{"trace", annotated, "C"})
+	})
+	if traceExit != 0 {
+		t.Fatalf("trace exit = %d, stderr = %s", traceExit, traceStderr)
+	}
+	if !strings.Contains(traceStdout, `"root": "A"`) {
+		t.Errorf("trace report = %s, want root source A", traceStdout)
+	}
+}
+
 const (
 	// longS is U+017F LATIN SMALL LETTER LONG S, a Unicode simple case fold
 	// of ASCII "s": the JSON reader maps "formatVerſion" to formatVersion.

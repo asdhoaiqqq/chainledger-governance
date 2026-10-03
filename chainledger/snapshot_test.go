@@ -274,6 +274,98 @@ func TestParseSnapshotRejectsDuplicateFields(t *testing.T) {
 	}
 }
 
+// TestParseSnapshotHugeNumberDoesNotBypassDuplicateCheck: a legal JSON number
+// outside the float64 range (1e400) sitting in an unknown field must not
+// derail the duplicate-field scan. Whether it appears as the unknown field's
+// direct value, nested in an object, or inside an array, a known field
+// declared twice later in the document is still rejected, and moving the
+// fields around does not change the verdict.
+func TestParseSnapshotHugeNumberDoesNotBypassDuplicateCheck(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]struct {
+		data  string
+		field string
+		where string
+	}{
+		"direct value before top-level duplicate": {
+			`{"note":1e400,"formatVersion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"nested object before top-level duplicate": {
+			`{"note":{"a":{"b":1e400}},"formatVersion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"array element before top-level duplicate": {
+			`{"note":[0,[1e400]],"formatVersion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"duplicate declared before the number": {
+			`{"formatVersion":2,"formatVersion":1,"note":1e400,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"huge number inside graph before datasets duplicate": {
+			doc(`{"meta":1e400,"datasets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets", `"graph"`,
+		},
+		"huge number inside record before upstreams duplicate": {
+			doc(`{"datasets":[{"name":"A","note":[1e400],"upstreams":[]},{"name":"B","upstreams":["A"],"upstreams":["A"]}]}`),
+			"upstreams", "index 1",
+		},
+		"huge number as record name duplicate decoy": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"note":1e400,"name":"B","name":"B","upstreams":["A"]}]}`),
+			"name", "index 1",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseSnapshot([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) || !strings.Contains(err.Error(), tc.where) {
+				t.Errorf("err = %q, want it to name field %q and location %q", err, tc.field, tc.where)
+			}
+		})
+	}
+}
+
+// TestParseSnapshotHugeNumberInUnknownFieldsAccepted: unknown fields keep
+// their ignore-everything behavior even when they carry numbers outside the
+// float64 range. The snapshot reads successfully, and the extra bytes change
+// neither the content identifier nor the graph the reader resolves.
+func TestParseSnapshotHugeNumberInUnknownFieldsAccepted(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+
+	cases := map[string]string{
+		"top-level direct value":  `{"note":1e400,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"top-level nested object": `{"note":{"a":[1e400,{"b":-1e400}]},"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"top-level array":         `{"note":[1e400,2e999],"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"inside graph object":     `{"formatVersion":1,"contentId":"` + id + `","graph":{"meta":1e400,"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}}`,
+		"inside dataset record":   `{"formatVersion":1,"contentId":"` + id + `","graph":{"datasets":[{"name":"A","note":1e400,"upstreams":[]},{"name":"B","upstreams":["A"]}]}}`,
+		"repeated unknown field":  `{"note":1e400,"note":[1e400],"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParseSnapshot([]byte(data))
+			if err != nil {
+				t.Fatalf("legal snapshot with a huge unknown-field number rejected: %v", err)
+			}
+			if parsed.ContentID != id {
+				t.Errorf("content id = %s, want %s: unknown field changed the identity", parsed.ContentID, id)
+			}
+			if len(parsed.Graph.Datasets) != 2 {
+				t.Errorf("resolved graph = %+v, want the two declared datasets", parsed.Graph)
+			}
+		})
+	}
+}
+
 // TestParseSnapshotDuplicateTolerances: repetitions that do NOT create
 // ambiguity stay legal — unknown fields may repeat anywhere, each dataset
 // record declares its own name, and duplicate names inside one upstreams
