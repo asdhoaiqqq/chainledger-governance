@@ -1541,3 +1541,216 @@ func TestUpstreamsReflectReregisterAndOldResultStable(t *testing.T) {
 		t.Fatalf("earlier result changed after re-register/new query: before=%v snapshot=%v", before, beforeCopy)
 	}
 }
+
+// Regression for replacing a middle dataset's direct upstreams so that a
+// source's shortest route to a report disappears while a longer route keeps the
+// source participating. raw derives a and b; a derives z; b derives c; middle
+// depends on raw, z and c; report depends on middle. Initially raw reaches
+// report at distance 2 via raw -> middle -> report. Replacing middle's direct
+// upstreams with [z c] deletes that short route, but raw still derives both
+// branches, so it must remain listed exactly once, now at distance 4. The two
+// surviving routes raw -> a -> z -> middle -> report and
+// raw -> b -> c -> middle -> report have equal length; comparison starts at the
+// source and goes name by name, so the a/z route wins even though c sorts ahead
+// of z among middle's direct upstreams.
+func TestUpstreamsAfterMiddleRewireLongerRouteSurvives(t *testing.T) {
+	// Same final relationships built in different orders: the independent
+	// branches may be registered in either order, and middle's upstream lists
+	// may be declared in either order. Results must be identical.
+	builds := []struct {
+		name string
+		seq  [][]string
+	}{
+		{
+			name: "a-branch first, raw declared ahead of z/c",
+			seq: [][]string{
+				{"raw"},
+				{"a", "raw"},
+				{"z", "a"},
+				{"b", "raw"},
+				{"c", "b"},
+				{"middle", "raw", "z", "c"},
+				{"report", "middle"},
+			},
+		},
+		{
+			name: "b-branch first, raw declared last among middle's parents",
+			seq: [][]string{
+				{"raw"},
+				{"b", "raw"},
+				{"c", "b"},
+				{"a", "raw"},
+				{"z", "a"},
+				{"middle", "c", "z", "raw"},
+				{"report", "middle"},
+			},
+		},
+		{
+			name: "branches interleaved, raw placed between z and c",
+			seq: [][]string{
+				{"raw"},
+				{"a", "raw"},
+				{"b", "raw"},
+				{"z", "a"},
+				{"c", "b"},
+				{"middle", "z", "raw", "c"},
+				{"report", "middle"},
+			},
+		},
+	}
+
+	initialWant := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "c", Distance: 2, Path: []string{"c", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+		{Dataset: "z", Distance: 2, Path: []string{"z", "middle", "report"}},
+		{Dataset: "a", Distance: 3, Path: []string{"a", "z", "middle", "report"}},
+		{Dataset: "b", Distance: 3, Path: []string{"b", "c", "middle", "report"}},
+	}
+
+	// After the rewire: middle stays at 1, c/z stay at 2, a/b stay at 3, and raw
+	// moves to distance 4 with the source-anchored tie broken through a/z.
+	rewiredWant := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "c", Distance: 2, Path: []string{"c", "middle", "report"}},
+		{Dataset: "z", Distance: 2, Path: []string{"z", "middle", "report"}},
+		{Dataset: "a", Distance: 3, Path: []string{"a", "z", "middle", "report"}},
+		{Dataset: "b", Distance: 3, Path: []string{"b", "c", "middle", "report"}},
+		{Dataset: "raw", Distance: 4, Path: []string{"raw", "a", "z", "middle", "report"}},
+	}
+
+	// Replacement orders for middle must not change the outcome either; c sorts
+	// before z, so this deliberately tries both list directions.
+	replacements := [][]string{{"z", "c"}, {"c", "z"}}
+
+	for bi, build := range builds {
+		for _, replacement := range replacements {
+			t.Run(build.name+"/replace-"+strings.Join(replacement, ","), func(t *testing.T) {
+				graph := buildRegisteredGraph(t, build.seq)
+				assertConsistent(t, graph)
+
+				beforeQuery := snapshot(graph)
+				before := mustUpstreams(t, graph, "report")
+				if !reflect.DeepEqual(before, initialWant) {
+					t.Fatalf("build %d: initial upstreams = %v, want %v", bi, before, initialWant)
+				}
+				assertUpstreamOnce(t, before, "raw", 2, []string{"raw", "middle", "report"})
+				// Querying changes no node, edge or list order.
+				if !reflect.DeepEqual(snapshot(graph), beforeQuery) {
+					t.Fatalf("initial query changed graph: before=%v after=%v", beforeQuery, snapshot(graph))
+				}
+
+				// Replace middle's direct upstreams with the same-name Register.
+				mustRegister(t, graph, "middle", replacement...)
+				assertConsistent(t, graph)
+				assertEntry(t, graph, "middle", replacement, []string{"report"})
+				assertEntry(t, graph, "report", []string{"middle"}, nil)
+				// raw loses its direct edge to middle but keeps exactly its two
+				// branches (their stored order depends on registration order).
+				rawChildren := graph["raw"].Children
+				if len(rawChildren) != 2 ||
+					!slices.Contains(rawChildren, "a") || !slices.Contains(rawChildren, "b") {
+					t.Fatalf("raw children = %v, want exactly {a, b} after losing middle", rawChildren)
+				}
+
+				after := mustUpstreams(t, graph, "report")
+				if !reflect.DeepEqual(after, rewiredWant) {
+					t.Fatalf("build %d replacement %v: upstreams = %v, want %v",
+						bi, replacement, after, rewiredWant)
+				}
+
+				// The source neither disappears nor keeps the stale short path:
+				// it appears once at the longer distance with the full-path
+				// tie broken from the source (a < b at the first differing hop),
+				// not by middle's direct-upstream order (c < z).
+				assertUpstreamOnce(t, after, "raw", 4,
+					[]string{"raw", "a", "z", "middle", "report"})
+				for _, up := range after {
+					if up.Dataset == "raw" && reflect.DeepEqual(up.Path,
+						[]string{"raw", "middle", "report"}) {
+						t.Fatalf("stale short path %v still reported for raw after rewire", up.Path)
+					}
+				}
+
+				// report's own direct dependency was never touched: it still
+				// reaches the full source set through middle, and never lists
+				// itself.
+				if names := upstreamNames(after); slices.Contains(names, "report") {
+					t.Fatalf("target leaked into its own upstreams: %v", names)
+				}
+				if got, want := len(after), 6; got != want {
+					t.Fatalf("got %d upstreams %v, want %d", got, upstreamNames(after), want)
+				}
+
+				// The result captured before the rewire keeps its old content.
+				if !reflect.DeepEqual(before, initialWant) {
+					t.Fatalf("earlier result changed after rewire: got %v, want %v", before, initialWant)
+				}
+				// And the new query itself left the graph untouched.
+				mustRegister(t, graph, "middle", replacement...) // idempotent no-op re-register
+				again := mustUpstreams(t, graph, "report")
+				if !reflect.DeepEqual(again, rewiredWant) {
+					t.Fatalf("repeat query differs: %v, want %v", again, rewiredWant)
+				}
+			})
+		}
+	}
+}
+
+// Replacing middle's upstreams with a list that includes report would close a
+// loop (middle -> report -> middle). Registration must report a cycle naming
+// report, refuse the whole request without partial replacement, and a following
+// Upstreams(report) must return exactly the pre-request sources, distances and
+// paths.
+func TestUpstreamsAfterRejectedCyclicMiddleRewire(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "z", "a")
+	mustRegister(t, graph, "c", "b")
+	mustRegister(t, graph, "middle", "raw", "z", "c")
+	mustRegister(t, graph, "report", "middle")
+	assertConsistent(t, graph)
+
+	before := mustUpstreams(t, graph, "report")
+	want := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "c", Distance: 2, Path: []string{"c", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+		{Dataset: "z", Distance: 2, Path: []string{"z", "middle", "report"}},
+		{Dataset: "a", Distance: 3, Path: []string{"a", "z", "middle", "report"}},
+		{Dataset: "b", Distance: 3, Path: []string{"b", "c", "middle", "report"}},
+	}
+	if !reflect.DeepEqual(before, want) {
+		t.Fatalf("initial upstreams = %v, want %v", before, want)
+	}
+	graphBefore := snapshot(graph)
+
+	// The cyclic parent appears first in one attempt and later in another; both
+	// must be rejected with a cycle error naming report.
+	attempts := [][]string{{"report", "z", "c"}, {"z", "c", "report"}, {"z", "report", "c"}}
+	for attempt, parents := range attempts {
+		err := Register(graph, Dataset{Name: "middle"}, parents)
+		if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "report") {
+			t.Fatalf("attempt %d parents %v: want cycle error naming report, got %v", attempt, parents, err)
+		}
+		// No partial replacement: raw is still a direct parent of middle and the
+		// declared order is unchanged.
+		assertEntry(t, graph, "middle", []string{"raw", "z", "c"}, []string{"report"})
+		assertEntry(t, graph, "report", []string{"middle"}, nil)
+		assertEntry(t, graph, "raw", nil, []string{"a", "b", "middle"})
+		assertConsistent(t, graph)
+		if !reflect.DeepEqual(snapshot(graph), graphBefore) {
+			t.Fatalf("attempt %d: rejected registration changed graph: before=%v after=%v",
+				attempt, graphBefore, snapshot(graph))
+		}
+
+		// The query after the refusal must be indistinguishable from before.
+		after := mustUpstreams(t, graph, "report")
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("attempt %d: upstreams after rejected rewire = %v, want %v", attempt, after, before)
+		}
+		assertUpstreamOnce(t, after, "raw", 2, []string{"raw", "middle", "report"})
+	}
+}
