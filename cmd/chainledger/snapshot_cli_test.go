@@ -652,6 +652,180 @@ func TestCLITraceRejectsUnicodeFoldDuplicates(t *testing.T) {
 	}
 }
 
+// bigNumberDupFieldSnapshot seeds a valid snapshot of graphJSON, then returns
+// its path together with bytes that carry an irrelevant unknown "note" field
+// whose value is the legal-but-oversized JSON number 1e400, immediately before
+// a duplicated formatVersion declaration (2 then the valid 1). Before the
+// fix the oversized number aborted the duplicate-field scan, so the file was
+// wrongly accepted as a snapshot of exactly this content.
+func bigNumberDupFieldSnapshot(t *testing.T, graphJSON string) (path, content string) {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "snap.json")
+	if _, stderr, exit := snapshotViaCLI(t, graphJSON, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	valid := readFile(t, target)
+	if err := os.Remove(target + ".lock"); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	dup := strings.Replace(valid, `"formatVersion": 1`,
+		`"note": 1e400, "formatVersion": 2, "formatVersion": 1`, 1)
+	if dup == valid {
+		t.Fatalf("could not inject a big-number-prefixed duplicate field into %s", valid)
+	}
+	return target, dup
+}
+
+func TestCLICompareRejectsBigNumberMaskedDuplicates(t *testing.T) {
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, good); exit != 0 {
+		t.Fatalf("snapshot good: %s", stderr)
+	}
+	dupPath, dupContent := bigNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		side string
+	}{
+		{"duplicate in old snapshot", []string{"compare", dupPath, good}, "old snapshot"},
+		{"duplicate in new snapshot", []string{"compare", good, dupPath}, "new snapshot"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, exit := captureStdout(t, func() int { return run(tc.args) })
+			if exit == 0 {
+				t.Fatalf("%v succeeded, want failure", tc.args)
+			}
+			if stdout != "" {
+				t.Errorf("stdout = %q, want empty on rejection", stdout)
+			}
+			if !strings.Contains(stderr, tc.side) || !strings.Contains(stderr, dupPath) {
+				t.Errorf("stderr = %q, must name the %s file", stderr, tc.side)
+			}
+			if !strings.Contains(stderr, "formatVersion") || !strings.Contains(stderr, "more than once") {
+				t.Errorf("stderr = %q, must explain the duplicated field", stderr)
+			}
+			if got := readFile(t, dupPath); got != dupContent {
+				t.Errorf("compare modified the snapshot:\n%s", got)
+			}
+			if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+				t.Errorf("compare created a lock file: %v", err)
+			}
+		})
+	}
+}
+
+func TestCLITraceRejectsBigNumberMaskedDuplicates(t *testing.T) {
+	dupPath, dupContent := bigNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", dupPath, "C"})
+	})
+	if exit == 0 {
+		t.Fatalf("trace succeeded on a big-number-masked ambiguous snapshot")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty on rejection", stdout)
+	}
+	if !strings.Contains(stderr, dupPath) || !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the file and the duplicated field", stderr)
+	}
+	if got := readFile(t, dupPath); got != dupContent {
+		t.Errorf("trace modified the snapshot:\n%s", got)
+	}
+	if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("trace created a lock file: %v", err)
+	}
+}
+
+// TestCLISnapshotRefusesBigNumberMaskedDuplicateTarget: an existing target
+// whose ambiguity is hidden behind an oversized unknown number still counts as
+// corrupt. Saving the same content must refuse, preserve every byte and the
+// mtime, and print no content identifier.
+func TestCLISnapshotRefusesBigNumberMaskedDuplicateTarget(t *testing.T) {
+	target, dup := bigNumberDupFieldSnapshot(t, abcGraph)
+	if err := os.WriteFile(target, []byte(dup), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+	infoBefore, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	graphPath := writeFile(t, "graph.json", abcGraph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"snapshot", graphPath, target})
+	})
+	if exit == 0 {
+		t.Fatalf("snapshot over a big-number-masked duplicate target succeeded")
+	}
+	if !strings.Contains(stderr, "refusing to overwrite") || !strings.Contains(stderr, target) {
+		t.Errorf("stderr = %q, want refusal naming the target", stderr)
+	}
+	if !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the duplicated field", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no content id on refusal", stdout)
+	}
+	if got := readFile(t, target); got != dup {
+		t.Errorf("target changed after refusal:\n got %s\nwant %s", got, dup)
+	}
+	infoAfter, _ := os.Stat(target)
+	if !infoAfter.ModTime().Equal(infoBefore.ModTime()) {
+		t.Errorf("refusal rewrote the target: mtime %s -> %s", infoBefore.ModTime(), infoAfter.ModTime())
+	}
+}
+
+// TestCLITraceAcceptsLegalSnapshotWithBigNumbers: a large number sitting in an
+// ignored unknown field (directly or nested) is not itself an error; the
+// snapshot reads, the report prints, and the content id is unaffected.
+func TestCLITraceAcceptsLegalSnapshotWithBigNumbers(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "snap.json")
+	if _, stderr, exit := snapshotViaCLI(t, abcGraph, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	if err := os.Remove(target + ".lock"); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	valid := readFile(t, target)
+	withBig := strings.Replace(valid, `"formatVersion": 1`,
+		`"note": 1e400, "meta": {"x": [1e400, {"y": 1e999}], "note": 2e400}, "formatVersion": 1`, 1)
+	if withBig == valid {
+		t.Fatalf("could not inject big-number unknown fields")
+	}
+	if err := os.WriteFile(target, []byte(withBig), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", target, "B"})
+	})
+	if exit != 0 {
+		t.Fatalf("trace rejected a legal snapshot carrying oversized numbers: %s", stderr)
+	}
+	var report struct {
+		ContentID string `json:"contentId"`
+		Dataset   string `json:"dataset"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatalf("trace stdout is not JSON: %v\n%s", err, stdout)
+	}
+	if report.Dataset != "B" {
+		t.Errorf("dataset = %q, want B", report.Dataset)
+	}
+	if !strings.HasPrefix(report.ContentID, "sha256:") {
+		t.Errorf("content id = %q", report.ContentID)
+	}
+}
+
 // TestCLISnapshotRefusesUnicodeFoldDuplicateTarget: an existing target whose
 // values only resolve because a long-s fold spelling and the canonical
 // spelling both set formatVersion counts as corrupt — even though the

@@ -274,6 +274,118 @@ func TestParseSnapshotRejectsDuplicateFields(t *testing.T) {
 	}
 }
 
+// TestParseSnapshotLargeJSONNumberCannotMaskDuplicates is the regression for
+// the bypass where a legal JSON number outside the float64 range (1e400)
+// aborted the duplicate-field scan, so a repeated known field placed after it
+// went unreported and the file was accepted as long as the surviving graph
+// matched the content id. The unrelated number may be the direct value of an
+// unknown field or nested inside an unknown object or array at any level;
+// moving the number relative to the duplicate must not change the verdict.
+func TestParseSnapshotLargeJSONNumberCannotMaskDuplicates(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]struct {
+		data     string
+		field    string
+		location string
+	}{
+		"big direct value before duplicated version": {
+			`{"note":1e400,"formatVersion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"big number in array before duplicated contentId": {
+			`{"note":[1e400,{"deep":1e999}],"formatVersion":1,"contentId":"` + id + `","contentId":"` + id + `","graph":` + graph + `}`,
+			"contentId", "top level",
+		},
+		"big number nested in object before duplicated graph": {
+			`{"meta":{"keep":[1e400]},"formatVersion":1,"contentId":"` + id + `","graph":null,"graph":` + graph + `}`,
+			"graph", "top level",
+		},
+		"null first value with big number before it": {
+			`{"note":-1e400,"contentId":null,"contentId":"` + id + `","formatVersion":1,"graph":` + graph + `}`,
+			"contentId", "top level",
+		},
+		"duplicate before the big number": {
+			`{"formatVersion":2,"formatVersion":1,"note":1e400,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion", "top level",
+		},
+		"big number nested inside graph before duplicated datasets": {
+			doc(`{"note":{"deep":[1e400]},"datasets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets", `in "graph"`,
+		},
+		"big direct value in record before duplicated name": {
+			doc(`{"datasets":[{"note":1e400,"name":"A","name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"name", `index 0 of "datasets"`,
+		},
+		"big number nested in record before duplicated upstreams": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"vals":[[1e400],{"x":[1e999]}],"name":"B","upstreams":["A"],"upstreams":["A"]}]}`),
+			"upstreams", `index 1 of "datasets"`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseSnapshot([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Errorf("err = %q, want it to name duplicated field %q", err, tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.location) {
+				t.Errorf("err = %q, want it to locate the duplicate %q", err, tc.location)
+			}
+		})
+	}
+}
+
+// TestParseSnapshotLargeJSONNumberInUnknownFieldsAccepted: an oversized-but-
+// legal JSON number carries no lineage semantics, so a snapshot with no
+// repeated known field must still read successfully even when such numbers
+// appear directly in unknown fields or nested in their objects and arrays. The
+// unknown fields (and duplicate keys nested inside them) stay ignored, the
+// graph's content identifier is unchanged, and genuinely malformed JSON still
+// fails.
+func TestParseSnapshotLargeJSONNumberInUnknownFieldsAccepted(t *testing.T) {
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+
+	cases := map[string]string{
+		"big direct value": `{"note":1e400,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"big values nested in unknown fields": `{"formatVersion":1,"contentId":"` + id +
+			`","graph":{"datasets":[{"name":"A","upstreams":[],"note":{"name":1,"name":2,"big":[1e400,{"z":1e999}]}},{"name":"B","upstreams":["A"]}],"meta":[1e400,-1e400]}}`,
+		"repeated unknown field holding big numbers": `{"note":1e400,"note":2e400,"formatVersion":1,"contentId":"` + id + `","graph":` +
+			graph + `,"extra":{"datasets":1e400,"formatVersion":1e400}}`,
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParseSnapshot([]byte(data))
+			if err != nil {
+				t.Fatalf("ParseSnapshot rejected a legal document with big numbers: %v", err)
+			}
+			if parsed.ContentID != id {
+				t.Errorf("content id = %s, want %s; unknown fields must not change content identity", parsed.ContentID, id)
+			}
+		})
+	}
+
+	// A big number does not excuse malformed JSON: the syntax error still has
+	// to surface with a non-zero failure.
+	for name, broken := range map[string]string{
+		"truncated after big number": `{"note":1e400,"formatVersion":`,
+		"malformed number syntax":    `{"note":1e,"formatVersion":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseSnapshot([]byte(broken)); err == nil {
+				t.Fatalf("ParseSnapshot accepted malformed JSON %q", broken)
+			}
+		})
+	}
+}
+
 // TestParseSnapshotDuplicateTolerances: repetitions that do NOT create
 // ambiguity stay legal — unknown fields may repeat anywhere, each dataset
 // record declares its own name, and duplicate names inside one upstreams

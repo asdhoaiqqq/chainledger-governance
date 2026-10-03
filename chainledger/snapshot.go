@@ -249,6 +249,14 @@ var errAbortScan = errors.New("chainledger: abort duplicate field scan")
 // duplicates carry identical values, the first is null, or the surviving value
 // would pass every other check.
 //
+// The decoder uses UseNumber so numbers are kept verbatim instead of being
+// converted to float64: a perfectly legal JSON number outside the float64
+// range (such as 1e400), even one buried in an ignored unknown field's value,
+// must not make the decoder error out and abort the whole scan — otherwise an
+// unrelated large number placed before a repeated known field would hide that
+// duplication. Malformed number syntax still fails and is left to the regular
+// parse to report.
+//
 // Field names are compared after JSON string unescaping and with the same
 // Unicode simple case-folding the decoder applies to its case-insensitive
 // field lookup (equivalent to strings.EqualFold), so "name", "Name", and
@@ -259,6 +267,7 @@ var errAbortScan = errors.New("chainledger: abort duplicate field scan")
 // regular parse, which reports the structural problem.
 func checkDuplicateFields(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	err := checkTopLevelObject(dec)
 	if errors.Is(err, errAbortScan) {
 		return nil
