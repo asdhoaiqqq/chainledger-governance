@@ -309,3 +309,73 @@ func TestCLIRemovalsDeleteAll(t *testing.T) {
 	}
 	_ = stdout
 }
+
+// TestCLIGraphFileDuplicateFieldsRejected: a graph file that declares a known
+// field twice (here upstreams inside one dataset record, and datasets at the
+// top level) is ambiguous, so preview, apply, and snapshot must all refuse
+// it: non-zero exit, empty stdout, stderr naming the graph file and the
+// repeated field. Apply must leave the graph file untouched and snapshot must
+// not create its target.
+func TestCLIGraphFileDuplicateFieldsRejected(t *testing.T) {
+	graphs := map[string]struct {
+		data  string
+		field string
+	}{
+		"upstreams twice in record": {`{"datasets":[{"name":"B","upstreams":["A"],"upstreams":[]},{"name":"A","upstreams":[]}]}`, `"upstreams"`},
+		"datasets twice":            {`{"datasets":[{"name":"A","upstreams":[]}],"datasets":[]}`, `"datasets"`},
+	}
+	planPath := writeFile(t, "plan.json", `{"changes":[],"removals":[]}`)
+
+	for name, tc := range graphs {
+		t.Run(name, func(t *testing.T) {
+			graphPath := writeFile(t, "graph.json", tc.data)
+			original := readFile(t, graphPath)
+			snapPath := filepath.Join(t.TempDir(), "snap.json")
+
+			stdout, stderr, exit := captureStdout(t, func() int {
+				return run([]string{"preview", graphPath, planPath})
+			})
+			if exit == 0 {
+				t.Fatalf("preview succeeded on duplicate-field graph, stdout = %s", stdout)
+			}
+			if stdout != "" {
+				t.Errorf("preview stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, graphPath) || !strings.Contains(stderr, tc.field) {
+				t.Errorf("preview stderr = %q, want it to name %q and field %s", stderr, graphPath, tc.field)
+			}
+
+			stdout, stderr, exit = captureStdout(t, func() int {
+				return run([]string{"apply", graphPath, planPath})
+			})
+			if exit == 0 {
+				t.Fatalf("apply succeeded on duplicate-field graph, stdout = %s", stdout)
+			}
+			if stdout != "" {
+				t.Errorf("apply stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, graphPath) || !strings.Contains(stderr, tc.field) {
+				t.Errorf("apply stderr = %q, want it to name %q and field %s", stderr, graphPath, tc.field)
+			}
+			if got := readFile(t, graphPath); got != original {
+				t.Errorf("apply modified the rejected graph file:\n got %s\nwant %s", got, original)
+			}
+
+			stdout, stderr, exit = captureStdout(t, func() int {
+				return run([]string{"snapshot", graphPath, snapPath})
+			})
+			if exit == 0 {
+				t.Fatalf("snapshot succeeded on duplicate-field graph, stdout = %s", stdout)
+			}
+			if stdout != "" {
+				t.Errorf("snapshot stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, graphPath) || !strings.Contains(stderr, tc.field) {
+				t.Errorf("snapshot stderr = %q, want it to name %q and field %s", stderr, graphPath, tc.field)
+			}
+			if _, err := os.Stat(snapPath); !os.IsNotExist(err) {
+				t.Errorf("snapshot target must not be created for a rejected graph, stat err = %v", err)
+			}
+		})
+	}
+}

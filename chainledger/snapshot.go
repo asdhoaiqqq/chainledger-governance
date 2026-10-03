@@ -249,6 +249,22 @@ func checkDuplicateFields(data []byte) error {
 	return err
 }
 
+// checkGraphFileDuplicateFields applies the same repeated-known-field rule to
+// a standalone graph file: datasets may be declared only once in the
+// top-level graph object, and name and upstreams only once in each dataset
+// record. This keeps UnmarshalGraphFile in lockstep with ParseSnapshot, which
+// runs the identical scan on the embedded graph, so preview, apply, and
+// snapshot can never disagree about a graph file that repeats a known field.
+func checkGraphFileDuplicateFields(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	err := checkGraphValue(dec, "at the top level of the graph")
+	if errors.Is(err, errAbortScan) {
+		return nil
+	}
+	return err
+}
+
 // checkTopLevelObject scans the top-level snapshot object for repeated
 // formatVersion/contentId/graph declarations, descending into graph values.
 func checkTopLevelObject(dec *json.Decoder) error {
@@ -273,7 +289,7 @@ func checkTopLevelObject(dec *json.Decoder) error {
 			seen[field] = true
 		}
 		if field == "graph" {
-			if err := checkGraphValue(dec); err != nil {
+			if err := checkGraphValue(dec, `in "graph"`); err != nil {
 				return err
 			}
 		} else if err := skipValue(dec); err != nil {
@@ -285,8 +301,11 @@ func checkTopLevelObject(dec *json.Decoder) error {
 }
 
 // checkGraphValue scans one graph value for a repeated datasets declaration,
-// descending into each dataset record of the datasets array.
-func checkGraphValue(dec *json.Decoder) error {
+// descending into each dataset record of the datasets array. location names
+// the graph object itself in the duplicate error ("in \"graph\"" when the
+// graph is embedded in a snapshot, the top-level description for a standalone
+// graph file).
+func checkGraphValue(dec *json.Decoder, location string) error {
 	tok, err := scanToken(dec)
 	if err != nil {
 		return err
@@ -304,7 +323,7 @@ func checkGraphValue(dec *json.Decoder) error {
 		}
 		if strings.EqualFold(key, "datasets") {
 			if seen {
-				return duplicateFieldError("datasets", `in "graph"`)
+				return duplicateFieldError("datasets", location)
 			}
 			seen = true
 			if err := checkDatasetsValue(dec); err != nil {

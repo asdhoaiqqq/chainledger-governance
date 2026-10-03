@@ -16,11 +16,14 @@
 //   - names are case-sensitive and surrounding whitespace is kept verbatim;
 //   - record order and upstream order are irrelevant, duplicate upstreams count
 //     as one relationship, and an empty upstream list marks a root, so an
-//     empty graph stays legal.
+//     empty graph stays legal;
+//   - a known field declared twice within the same object (datasets in the
+//     graph object, name or upstreams in a dataset record) is rejected, however
+//     the two declarations are spelled.
 //
 // The snapshot-only envelope rules (required fields, format version, content
-// identifier, duplicate known fields) live in snapshot.go; this file is only
-// the common graph structure.
+// identifier, and duplicates of the snapshot's own fields) live in
+// snapshot.go; this file is only the common graph structure.
 package chainledger
 
 import (
