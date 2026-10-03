@@ -1222,3 +1222,322 @@ func snapshot(graph map[string]*Lineage) snap {
 	}
 	return s
 }
+
+func upstreamNames(upstreams []Upstream) []string {
+	names := make([]string, len(upstreams))
+	for i, up := range upstreams {
+		names[i] = up.Dataset
+	}
+	return names
+}
+
+func assertUpstream(t *testing.T, upstreams []Upstream, name string, wantDistance int, wantPath []string) {
+	t.Helper()
+	for _, up := range upstreams {
+		if up.Dataset != name {
+			continue
+		}
+		if up.Distance != wantDistance {
+			t.Errorf("upstream %s distance = %d, want %d", name, up.Distance, wantDistance)
+		}
+		if !sameStrings(up.Path, wantPath) {
+			t.Errorf("upstream %s path = %v, want %v", name, up.Path, wantPath)
+		}
+		return
+	}
+	t.Fatalf("upstream %q missing from %v", name, upstreamNames(upstreams))
+}
+
+func mustUpstreams(t *testing.T, graph map[string]*Lineage, target string) []Upstream {
+	t.Helper()
+	upstreams, err := Upstreams(graph, target)
+	if err != nil {
+		t.Fatalf("Upstreams(%s): %v", target, err)
+	}
+	return upstreams
+}
+
+// assertUpstreamOnce checks the entry for name and that name appears exactly
+// once in the result, even where it feeds the target through several branches.
+func assertUpstreamOnce(t *testing.T, upstreams []Upstream, name string, wantDistance int, wantPath []string) {
+	t.Helper()
+	count := 0
+	for _, up := range upstreams {
+		if up.Dataset == name {
+			count++
+		}
+	}
+	if count > 1 {
+		t.Fatalf("upstream %q appears %d times in %v, want exactly once", name, count, upstreamNames(upstreams))
+	}
+	assertUpstream(t, upstreams, name, wantDistance, wantPath)
+}
+
+// The provenance counterpart of the downstream merge scenario: source feeds a
+// and b; a feeds z; b feeds c; report depends on z and c together. Querying
+// report walks the parent edges, so source appears once at distance 3. Both
+// source->a->z->report and source->b->c->report have length 3; a rule that
+// only compares report's direct upstreams would wrongly prefer the c route
+// (c < z), but the full-path rule compares from the upstream onward and picks
+// the a route, because the paths first differ at hop 1 where a < b.
+func TestUpstreamsMergedBranchesFullPathTieBreak(t *testing.T) {
+	// Each sequence builds the same graph with a legal but different
+	// registration order; the second also flips report's upstream list. Names,
+	// distances and paths must come out identical regardless.
+	sequences := [][][]string{
+		{
+			{"source"},
+			{"b", "source"}, // b-side branch registered first
+			{"a", "source"},
+			{"c", "b"},
+			{"z", "a"},
+			{"report", "c", "z"}, // c listed ahead of z on purpose
+			{"view", "report"},
+			{"isolated"},
+		},
+		{
+			{"source"},
+			{"a", "source"}, // opposite branch registered first
+			{"z", "a"},
+			{"b", "source"},
+			{"c", "b"},
+			{"report", "z", "c"}, // direct-upstream order flipped
+			{"view", "report"},
+			{"isolated"},
+		},
+	}
+
+	want := []Upstream{
+		{Dataset: "c", Distance: 1, Path: []string{"c", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "z", "report"}},
+		{Dataset: "b", Distance: 2, Path: []string{"b", "c", "report"}},
+		{Dataset: "source", Distance: 3, Path: []string{"source", "a", "z", "report"}},
+	}
+
+	for i, seq := range sequences {
+		graph := buildRegisteredGraph(t, seq)
+		assertConsistent(t, graph)
+		before := snapshot(graph)
+
+		upstreams := mustUpstreams(t, graph, "report")
+		if !reflect.DeepEqual(upstreams, want) {
+			t.Fatalf("sequence %d: upstreams = %v, want %v", i, upstreams, want)
+		}
+
+		// Anchor with an explicit message: the shared source is explained
+		// through a/z even though c sorts ahead of z.
+		assertUpstreamOnce(t, upstreams, "source", 3, []string{"source", "a", "z", "report"})
+
+		// The target itself, its downstream, and an unconnected dataset never
+		// appear.
+		names := upstreamNames(upstreams)
+		if slices.Contains(names, "report") || slices.Contains(names, "view") || slices.Contains(names, "isolated") {
+			t.Fatalf("sequence %d: target, downstream or isolated dataset leaked into %v", i, names)
+		}
+
+		// The query changes no node, relationship or stored list order.
+		if !reflect.DeepEqual(snapshot(graph), before) {
+			t.Fatalf("sequence %d: query changed graph: before=%v after=%v", i, before, snapshot(graph))
+		}
+	}
+}
+
+// With a direct source->report edge added on top of the merge scenario, edge
+// count takes priority over lexicographic order: source shortens to distance 1
+// with path [source report], and the length-3 route through a must not
+// survive. The direct edge's position in report's declared upstream list must
+// not change the result.
+func TestUpstreamsMergedBranchesDirectEdgeShortensSource(t *testing.T) {
+	builds := [][]string{
+		{"source", "c", "z"}, // direct edge first
+		{"c", "z", "source"}, // direct edge last
+	}
+
+	want := []Upstream{
+		{Dataset: "c", Distance: 1, Path: []string{"c", "report"}},
+		{Dataset: "source", Distance: 1, Path: []string{"source", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "z", "report"}},
+		{Dataset: "b", Distance: 2, Path: []string{"b", "c", "report"}},
+	}
+
+	for i, newParents := range builds {
+		graph := buildRegisteredGraph(t, [][]string{
+			{"source"},
+			{"b", "source"},
+			{"a", "source"},
+			{"c", "b"},
+			{"z", "a"},
+			{"report", "c", "z"},
+		})
+		mustRegister(t, graph, "report", newParents...)
+		assertConsistent(t, graph)
+
+		upstreams := mustUpstreams(t, graph, "report")
+		if !reflect.DeepEqual(upstreams, want) {
+			t.Fatalf("build %d: upstreams = %v, want %v", i, upstreams, want)
+		}
+		assertUpstreamOnce(t, upstreams, "source", 1, []string{"source", "report"})
+	}
+}
+
+// A registered target without upstreams succeeds with an empty (but non-nil)
+// list; the target's own downstreams and independent datasets never appear.
+func TestUpstreamsEmptyAndScope(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "lonely")
+	mustRegister(t, graph, "other")
+	mustRegister(t, graph, "p")
+	mustRegister(t, graph, "c", "p")
+
+	upstreams, err := Upstreams(graph, "lonely")
+	if err != nil {
+		t.Fatalf("Upstreams(lonely): %v", err)
+	}
+	if upstreams == nil || len(upstreams) != 0 {
+		t.Fatalf("want empty non-nil list, got %v", upstreams)
+	}
+
+	// A root has no upstreams even though it has a downstream.
+	upstreams, err = Upstreams(graph, "p")
+	if err != nil {
+		t.Fatalf("Upstreams(p): %v", err)
+	}
+	if upstreams == nil || len(upstreams) != 0 {
+		t.Fatalf("want empty non-nil list for root p, got %v", upstreams)
+	}
+
+	// The leaf sees only its own upstream chain, not unrelated datasets.
+	upstreams = mustUpstreams(t, graph, "c")
+	if got, want := upstreamNames(upstreams), []string{"p"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("independent datasets leaked: got %v, want %v", got, want)
+	}
+	assertUpstream(t, upstreams, "p", 1, []string{"p", "c"})
+}
+
+func TestUpstreamsErrors(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "a")
+
+	upstreams, err := Upstreams(graph, "")
+	if err == nil || !strings.Contains(err.Error(), "name is required") {
+		t.Fatalf("empty target: want required-name error, got %v", err)
+	}
+	if upstreams != nil {
+		t.Fatalf("empty target: want nil results, got %v", upstreams)
+	}
+
+	upstreams, err = Upstreams(graph, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("unknown target: want error naming ghost, got %v", err)
+	}
+	if upstreams != nil {
+		t.Fatalf("unknown target: want nil results, got %v", upstreams)
+	}
+
+	// Non-empty name against an initialized-but-empty graph, and against nil.
+	upstreams, err = Upstreams(map[string]*Lineage{}, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") || upstreams != nil {
+		t.Fatalf("empty graph: want naming error and nil results, got %v, %v", upstreams, err)
+	}
+	upstreams, err = Upstreams(nil, "ghost")
+	if err == nil || !strings.Contains(err.Error(), "ghost") || upstreams != nil {
+		t.Fatalf("nil graph: want naming error and nil results, got %v, %v", upstreams, err)
+	}
+}
+
+// Names match by exact registered value.
+func TestUpstreamsExactNameMatch(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "RAW", "raw")
+
+	if _, err := Upstreams(graph, "RaW"); err == nil || !strings.Contains(err.Error(), "RaW") {
+		t.Fatalf("case-insensitive match: want error naming RaW, got %v", err)
+	}
+	upstreams, err := Upstreams(graph, "RAW")
+	if err != nil {
+		t.Fatalf("Upstreams(RAW): %v", err)
+	}
+	assertUpstream(t, upstreams, "raw", 1, []string{"raw", "RAW"})
+}
+
+// A query never mutates the graph, and mutating the returned list or paths
+// cannot reach back into the graph, into other records, or into later queries.
+func TestUpstreamsReadOnlyAndIsolated(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "report", "a", "b")
+	before := snapshot(graph)
+
+	upstreams, err := Upstreams(graph, "report")
+	if err != nil {
+		t.Fatalf("Upstreams(report): %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("query changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+
+	// Abuse the returned slices, then confirm the graph and a repeated query
+	// are both untouched.
+	upstreams[0].Path[0] = "tampered"
+	upstreams[0].Path = append(upstreams[0].Path, "extra")
+	upstreams[0].Dataset = "tampered"
+	upstreams[0].Distance = 99
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("mutating results changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	fresh := mustUpstreams(t, graph, "report")
+	assertUpstream(t, fresh, "raw", 2, []string{"raw", "a", "report"})
+
+	// A failed query is also read-only.
+	if _, err := Upstreams(graph, "missing"); err == nil {
+		t.Fatal("expected not-found error")
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("failed query changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertConsistent(t, graph)
+}
+
+// After report's direct upstreams are replaced by a same-name Register, a new
+// query reflects the current edges, while the previously returned result keeps
+// its original content.
+func TestUpstreamsReflectReregisterAndOldResultStable(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "a", "raw")
+	mustRegister(t, graph, "b", "raw")
+	mustRegister(t, graph, "report", "a", "b")
+
+	before, err := Upstreams(graph, "report")
+	if err != nil {
+		t.Fatalf("Upstreams(report): %v", err)
+	}
+	assertUpstreamOnce(t, before, "raw", 2, []string{"raw", "a", "report"})
+	beforeCopy := make([]Upstream, len(before))
+	for i, up := range before {
+		beforeCopy[i] = Upstream{up.Dataset, up.Distance, append([]string(nil), up.Path...)}
+	}
+
+	// report now depends on b only: a leaves its upstream set entirely, raw
+	// remains reachable through b at distance 2 via the surviving route.
+	mustRegister(t, graph, "report", "b")
+
+	after, err := Upstreams(graph, "report")
+	if err != nil {
+		t.Fatalf("Upstreams(report) after re-register: %v", err)
+	}
+	if got, want := upstreamNames(after), []string{"b", "raw"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("upstream order = %v, want %v", got, want)
+	}
+	assertUpstreamOnce(t, after, "b", 1, []string{"b", "report"})
+	assertUpstreamOnce(t, after, "raw", 2, []string{"raw", "b", "report"})
+
+	if !reflect.DeepEqual(before, beforeCopy) {
+		t.Fatalf("earlier result changed after re-register/new query: before=%v snapshot=%v", before, beforeCopy)
+	}
+}

@@ -271,6 +271,103 @@ func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
 	return impacts, nil
 }
 
+// Upstream names one dataset directly or indirectly upstream of a provenance
+// query's target. Distance is the number of lineage edges on the shortest path
+// from this upstream to the target (a direct upstream has distance 1), and
+// Path is that shortest path written along the actual derivation direction,
+// from this upstream to the queried dataset, one name per hop.
+type Upstream struct {
+	Dataset  string
+	Distance int
+	Path     []string
+}
+
+// Upstreams returns every dataset directly or indirectly upstream of target,
+// i.e. every dataset reachable from target by following parent edges. The
+// target itself is never listed, its downstreams never appear, and datasets
+// with no such connection never appear.
+//
+// Distance is the shortest edge count; each upstream is returned at most once
+// even where it feeds the target through several branches. When several
+// shortest paths exist, the lexicographically smallest full path (name by
+// name from the upstream onward, Go string order) is reported. Results are
+// ordered by distance and then by upstream name, never by registration order
+// or the stored parent/child list order.
+//
+// The graph is read only: a successful or failed query changes no node, edge
+// or ordering. The returned Path slices are independent copies, so mutating
+// them cannot affect the graph, other records, or later queries. An empty
+// target is rejected as a missing name; a target absent from the graph
+// (including an empty or nil graph) is rejected with an error naming it and
+// no partial results.
+func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
+	if target == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[target]; !ok {
+		return nil, errInvalid("dataset not found: " + target)
+	}
+
+	// BFS one distance level at a time along parent edges, mirroring Impacts.
+	// A node commits its distance and best (lexicographically smallest)
+	// shortest path only once the whole level is known, so candidates reaching
+	// the same upstream through different children in the same level can be
+	// compared before either wins. Paths are stored from the upstream toward
+	// the target, so a candidate prepends the parent to the child's committed
+	// path; candidates for one parent share its name as the first hop, which
+	// makes the committed per-child paths directly comparable.
+	distance := map[string]int{target: 0}
+	best := map[string][]string{target: {target}}
+	frontier := []string{target}
+	for d := 0; len(frontier) > 0; d++ {
+		nextDistance := d + 1
+		candidates := map[string][]string{}
+		var next []string
+		for _, node := range frontier {
+			for _, parent := range graph[node].Parents {
+				if _, seen := distance[parent]; seen {
+					continue // reached on an earlier, strictly shorter level
+				}
+				// Fresh backing array per candidate: paths must not alias each
+				// other or any slice stored in the graph.
+				candidate := make([]string, len(best[node])+1)
+				candidate[0] = parent
+				copy(candidate[1:], best[node])
+				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+					if !ok {
+						next = append(next, parent)
+					}
+					candidates[parent] = candidate
+				}
+			}
+		}
+		for _, parent := range next {
+			distance[parent] = nextDistance
+			best[parent] = candidates[parent]
+		}
+		frontier = next
+	}
+
+	upstreams := make([]Upstream, 0, len(distance)-1)
+	for name, d := range distance {
+		if name == target {
+			continue
+		}
+		upstreams = append(upstreams, Upstream{
+			Dataset:  name,
+			Distance: d,
+			Path:     append([]string(nil), best[name]...),
+		})
+	}
+	sort.Slice(upstreams, func(i, j int) bool {
+		if upstreams[i].Distance != upstreams[j].Distance {
+			return upstreams[i].Distance < upstreams[j].Distance
+		}
+		return upstreams[i].Dataset < upstreams[j].Dataset
+	})
+	return upstreams, nil
+}
+
 // lessPath reports whether path a sorts before path b as a name sequence:
 // names are compared with Go string order from the start, and an equal prefix
 // makes the shorter path smaller.

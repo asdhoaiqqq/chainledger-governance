@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -299,6 +299,65 @@ fmt.Printf("downstream=%d err=%v\n", len(impacts), err) // downstream=0 err=<nil
 ### 查询是只读的
 
 `Impacts` 不会修改血缘关系：成功或失败的查询都不改变任何节点、边或内部列表顺序。返回的每个 `Path` 都是独立拷贝，调用方可以随意修改返回的切片，不会影响图中记录，也不会影响之后的查询。反过来，图被新的 `Register` 调用改写后，需要再次调用 `Impacts` 才能得到与当前关系一致的结果。
+
+## 查询上游来源（Go 库）
+
+`chainledger.Upstreams(graph, target)` 是 `Impacts` 的反向查询：给定一个已登记的数据集名称，返回它的全部**直接和间接上游**，即沿“上游”方向从 `target` 出发沿 parent 边可以到达的全部来源数据集。查询只使用当前登记的血缘关系：`target` 自己、它的下游、以及没有依赖关系的数据集都不会出现；同一个来源经多条分支参与派生时，结果里只保留一条记录。
+
+每个结果是一条 `chainledger.Upstream`：
+
+- `Dataset`：上游数据集名称。
+- `Distance`：从该上游到 `target` 的**最短依赖边数**。直接上游距离为 1。
+- `Path`：这条最短路径上的名称序列，沿实际派生方向**从该上游写到 `target`**，首尾都包含在内。
+
+路径选择与排序规则和 `Impacts` 完全对称：先选边数最少的路径；同样短时**从上游开始**逐跳比较整条路径上的名称，取 Go 字符串顺序较小的一条。结果按距离升序排列，同距离按上游名称排列，登记顺序和上游列表书写顺序都不影响结果。
+
+沿用「查询下游影响」一节的血缘图（`source` 派生 `a`、`b`，`z` 依赖 `a`，`c` 依赖 `b`，`report` 依赖 `z`、`c`，另有 `report` 的下游 `view` 和无关的 `isolated`），查询 `report` 的来源：
+
+```go
+upstreams, err := chainledger.Upstreams(graph, "report")
+if err != nil {
+	fmt.Fprintf(os.Stderr, "Upstreams: %v\n", err)
+	os.Exit(1)
+}
+for _, up := range upstreams {
+	fmt.Printf("%-8s distance=%d path=%v\n", up.Dataset, up.Distance, up.Path)
+}
+```
+
+预期输出：
+
+```text
+c        distance=1 path=[c report]
+z        distance=1 path=[z report]
+a        distance=2 path=[a z report]
+b        distance=2 path=[b c report]
+source   distance=3 path=[source a z report]
+```
+
+要点：
+
+- `source` 同时经过 `a -> z` 和 `b -> c` 两条分支参与 `report` 的派生，但**只出现一次**，距离取最短边数 3。
+- 两条长度都是 3 的路线中，选中的是 `[source, a, z, report]`：比较从上游 `source` 开始逐跳进行，第一个不同的名称是第 1 跳的 `a` 与 `b`，`a < b`，所以选 a 侧路线；**不能**只比较 `report` 的直接上游（那样会因 `c < z` 错选 b 侧路线）。
+- `report` 的下游 `view` 和无关的 `isolated` 都不会出现在结果里。
+
+若再给 `report` 增加对 `source` 的直接依赖（同名登记替换直接上游列表），`source` 的距离变为 1，路径为 `[source, report]`——边数最少优先于词典序：
+
+```text
+c        distance=1 path=[c report]
+source   distance=1 path=[source report]
+z        distance=1 path=[z report]
+a        distance=2 path=[a z report]
+b        distance=2 path=[b c report]
+```
+
+失败与边界行为也和 `Impacts` 一致：
+
+- 名称为空：返回缺少名称的错误（`dataset name is required`），结果为 nil。
+- 名称不存在（包括对空图或 nil 图查询任何非空名称）：错误信息指出该名称（如 `dataset not found: ghost`），结果为 nil。名称按登记值精确匹配，区分大小写。
+- 已登记但没有上游的数据集：查询成功，返回**非 nil 的空列表**。
+
+查询是只读的：不改变任何节点、关系或列表顺序；返回的每条 `Path` 都是独立拷贝，调用方修改它不会影响图、其他记录的路径或之后的查询结果。用同名 `Register` 替换直接上游后，再次查询反映新关系，而之前取得的结果仍保留原内容。完整可运行示例位于 [`examples/upstreams`](examples/upstreams/main.go)，可在仓库根目录执行 `go run ./examples/upstreams` 复现上面的输出。
 
 ## 技术方向
 
