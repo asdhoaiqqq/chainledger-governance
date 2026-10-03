@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Sources` 函数，见「查询上游来源（Go 库）」一节；完整可运行示例分别位于 [`examples/impacts`](examples/impacts/main.go) 和 [`examples/sources`](examples/sources/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -299,6 +299,150 @@ fmt.Printf("downstream=%d err=%v\n", len(impacts), err) // downstream=0 err=<nil
 ### 查询是只读的
 
 `Impacts` 不会修改血缘关系：成功或失败的查询都不改变任何节点、边或内部列表顺序。返回的每个 `Path` 都是独立拷贝，调用方可以随意修改返回的切片，不会影响图中记录，也不会影响之后的查询。反过来，图被新的 `Register` 调用改写后，需要再次调用 `Impacts` 才能得到与当前关系一致的结果。
+
+## 查询上游来源（Go 库）
+
+`chainledger.Sources(graph, dataset)` 是 `Impacts` 的反方向：给定一个**已登记**的数据集名称，返回它的全部直接和间接上游，即沿“上游”方向（`Parents` 边）从该数据集出发能够追溯到的全部来源。血缘图仍是由 `chainledger.Register` 填充的同一个内存 map。
+
+每个结果是一条 `chainledger.Source`：
+
+- `Name`：上游数据集名称。
+- `Distance`：从该上游到待查数据集的**最短依赖边数**。直接上游距离为 1。
+- `Path`：这条最短路径上的名称序列，**沿实际派生方向**从该上游写到待查数据集，首尾都包含在内，逐跳说明这份数据是怎么派生出来的。
+
+待查数据集自己、它的下游以及与它没有依赖关系的数据集都不会出现；同一个来源经多条分支参与派生时只保留一条记录。结果先按距离升序排列，距离相同再按上游名称（Go 字符串顺序）排列，登记顺序和登记时给出的上游列表顺序都不影响结果。
+
+沿用与上一节相同的汇合血缘，这次反过来查询 `report`：
+
+```
+source ──> a ──> z ──┐
+  │                  ├──> report ──> view
+  └──> b ──> c ──────┘
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/asdhoaiqqq/chainledger-governance/chainledger"
+)
+
+func main() {
+	// 血缘图就是一个普通的内存 map，由 Register 填充。
+	graph := map[string]*chainledger.Lineage{}
+
+	register := func(name string, parents ...string) {
+		if err := chainledger.Register(graph, chainledger.Dataset{Name: name}, parents); err != nil {
+			fmt.Fprintf(os.Stderr, "register %s: %v\n", name, err)
+			os.Exit(1)
+		}
+	}
+
+	// 故意先登记 b 侧分支，并在 report 的上游列表中把 c 写在 z 前面。
+	register("source")
+	register("b", "source")
+	register("a", "source")
+	register("c", "b")
+	register("z", "a")
+	register("report", "c", "z")
+	register("view", "report")
+	register("isolated")
+
+	sources, err := chainledger.Sources(graph, "report")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Sources: %v\n", err)
+		os.Exit(1)
+	}
+	for _, s := range sources {
+		fmt.Printf("%-8s distance=%d path=%v\n", s.Name, s.Distance, s.Path)
+	}
+}
+```
+
+预期输出（与 [`examples/sources`](examples/sources/main.go) 的实际打印一致）：
+
+```text
+c        distance=1 path=[c report]
+z        distance=1 path=[z report]
+a        distance=2 path=[a z report]
+b        distance=2 path=[b c report]
+source   distance=3 path=[source a z report]
+```
+
+要点：
+
+- `report` 的直接上游是 `c`、`z`（距离 1）；继续向上各追溯一跳得到 `b`、`a`（距离 2）；共同的根 `source` 经两条分支参与派生，但**只出现一次**，距离为 3。
+- 待查数据集 `report` 自己、它的下游 `view`、与它无关的 `isolated` 都不会出现（`view` 只在查询 `Sources(graph, "view")` 时作为起点被追溯，路径为 `[source a z report view]`，距离 4）。
+
+### 说明路径如何选择
+
+规则与 `Impacts` 完全对称，只是方向相反：
+
+1. **先选边数最少的路径。** 只要存在更短路径，词典序再小的长路径也不会被选中。
+2. **若有多条同样短的路径，从上游开始逐跳比较整条路径上的名称**，取 Go 字符串顺序较小的一条；前缀完全相同时，较短的路径更小。
+
+注意比较的是**整条路径**，不能只看汇合点的直接上游。上例中 `source` 到 `report` 的两条最短路径长度相同：
+
+- `[source, a, z, report]`
+- `[source, b, c, report]`
+
+如果只比较 `report` 的直接上游，会因为 `c < z` 而错误地选择 `b -> c` 路线。实际规则从来源端开始逐跳比较：两条路径第一个不同的名称是第 1 跳的 `a` 与 `b`，因为 `a < b`，选中的是 `[source, a, z, report]`。也正因为比较基于名称而不是登记历史，“先登记 b 侧分支”和“`report` 的上游列表把 `c` 写在 `z` 前面”都不会改变结果。
+
+### 替换上游后再次查询
+
+同名再次调用 `Register` 是**替换**直接上游列表；再次查询时，来源范围与说明路径都按当前关系重新计算。接上例，让 `report` 额外直接依赖 `source`：
+
+```go
+if err := chainledger.Register(graph, chainledger.Dataset{Name: "report"},
+	[]string{"source", "c", "z"}); err != nil {
+	fmt.Fprintf(os.Stderr, "register report: %v\n", err)
+	os.Exit(1)
+}
+sources, err = chainledger.Sources(graph, "report")
+// 错误处理同上，略
+```
+
+此时 `source` 既有长度 3 的老路线，也有长度 1 的新边，距离优先，输出变为：
+
+```text
+c        distance=1 path=[c report]
+source   distance=1 path=[source report]
+z        distance=1 path=[z report]
+a        distance=2 path=[a z report]
+b        distance=2 path=[b c report]
+```
+
+移除一条追溯路线不等于来源消失：只要还存在任何一条路线，该来源仍会出现，只是距离与说明路径按现存路线重算；只有当通往某个来源的**所有**路线都被移除时，它才会从结果中消失。之前已经取得的结果是独立拷贝，图被改写后它们仍保留原内容，不受新关系影响。
+
+### 查询失败与“成功但没有上游”
+
+三种情况要区分开，约定与 `Impacts` 一致：
+
+```go
+// 空名称：报错，提示缺少名称，返回 nil 结果。
+if _, err := chainledger.Sources(graph, ""); err != nil {
+	fmt.Println(err) // dataset name is required
+}
+
+// 名称不存在：报错，错误信息中指出该名称，返回 nil 结果。
+if _, err := chainledger.Sources(graph, "ghost"); err != nil {
+	fmt.Println(err) // dataset not found: ghost
+}
+
+// 已登记但没有上游的数据集（根）：查询成功，返回空列表（非 nil）。
+sources, err := chainledger.Sources(graph, "source")
+// err == nil，len(sources) == 0
+fmt.Printf("upstream=%d err=%v\n", len(sources), err) // upstream=0 err=<nil>
+```
+
+名称按登记值精确匹配（区分大小写）；对空图或 nil 图查询任何非空名称都按“不存在”处理。
+
+### 查询是只读的
+
+`Sources` 不会修改血缘关系：成功或失败的查询都不改变任何节点、边或内部列表顺序。返回的每个 `Path` 都是独立拷贝，调用方修改返回路径不会影响图、其他记录的路径或之后的查询结果。反过来，图被新的 `Register` 调用改写后，需要再次调用 `Sources` 才能得到与当前关系一致的结果。
 
 ## 技术方向
 

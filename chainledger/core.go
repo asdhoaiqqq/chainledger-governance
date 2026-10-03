@@ -271,6 +271,104 @@ func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
 	return impacts, nil
 }
 
+// Source names one dataset directly or indirectly upstream of a provenance
+// query's dataset. Distance is the number of lineage edges on the shortest
+// derivation path from this source to the queried dataset (a direct upstream
+// has distance 1), and Path is that shortest path written in derivation order,
+// from the source through each hop to the queried dataset.
+type Source struct {
+	Name     string
+	Distance int
+	Path     []string
+}
+
+// Sources returns every dataset directly or indirectly upstream of dataset,
+// i.e. every dataset from which dataset is reachable by following parent edges
+// in derivation order. The queried dataset itself is never listed, its
+// downstreams are never listed, and datasets with no such connection never
+// appear.
+//
+// Distance is the shortest edge count; each source is returned at most once
+// even where one source feeds the dataset through several merging branches.
+// When several shortest paths exist, the lexicographically smallest full path
+// (name by name from the source, Go string order) is reported; the final
+// upstream's name alone never decides the tie. Results are ordered by distance
+// and then by source name, never by registration order or the stored
+// parent/child list order.
+//
+// The graph is read only: a successful or failed query changes no node, edge or
+// ordering. The returned Path slices are independent copies, so mutating them
+// cannot affect the graph or any other result. An empty dataset name is
+// rejected as a missing name; a name absent from the graph (including an empty
+// or nil graph) is rejected with an error naming it and no partial results.
+func Sources(graph map[string]*Lineage, dataset string) ([]Source, error) {
+	if dataset == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[dataset]; !ok {
+		return nil, errInvalid("dataset not found: " + dataset)
+	}
+
+	// BFS one distance level at a time, traversing parent edges away from the
+	// queried dataset. A node commits its distance and best (lexicographically
+	// smallest) shortest derivation path only once the whole level is known, so
+	// sources reaching one parent through different branches in the same level
+	// can be compared before either wins. Register rejects cycles, so a
+	// committed node is never reached again at an equal level.
+	distance := map[string]int{dataset: 0}
+	best := map[string][]string{dataset: {dataset}}
+	frontier := []string{dataset}
+	for d := 0; len(frontier) > 0; d++ {
+		nextDistance := d + 1
+		candidates := map[string][]string{}
+		var next []string
+		for _, node := range frontier {
+			for _, parent := range graph[node].Parents {
+				if _, seen := distance[parent]; seen {
+					continue // reached on an earlier, strictly shorter level
+				}
+				// The path is written in derivation order (source -> dataset),
+				// but discovery runs the other way, so the new hop is inserted
+				// ahead of the path-so-far. Fresh backing array per candidate:
+				// paths must not alias each other or any slice in the graph.
+				candidate := make([]string, len(best[node])+1)
+				copy(candidate[1:], best[node])
+				candidate[0] = parent
+				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+					if !ok {
+						next = append(next, parent)
+					}
+					candidates[parent] = candidate
+				}
+			}
+		}
+		for _, parent := range next {
+			distance[parent] = nextDistance
+			best[parent] = candidates[parent]
+		}
+		frontier = next
+	}
+
+	sources := make([]Source, 0, len(distance)-1)
+	for name, dist := range distance {
+		if name == dataset {
+			continue
+		}
+		sources = append(sources, Source{
+			Name:     name,
+			Distance: dist,
+			Path:     append([]string(nil), best[name]...),
+		})
+	}
+	sort.Slice(sources, func(i, j int) bool {
+		if sources[i].Distance != sources[j].Distance {
+			return sources[i].Distance < sources[j].Distance
+		}
+		return sources[i].Name < sources[j].Name
+	})
+	return sources, nil
+}
+
 // lessPath reports whether path a sorts before path b as a name sequence:
 // names are compared with Go string order from the start, and an equal prefix
 // makes the shorter path smaller.
