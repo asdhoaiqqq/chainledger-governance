@@ -945,6 +945,134 @@ func TestFailedRewireLeavesImpactsUntouched(t *testing.T) {
 	assertConsistent(t, graph)
 }
 
+// Deep merge where the tie-break must compare whole paths, not the merge
+// node's direct upstream names: source -> a -> z and source -> b -> c both
+// feed report, and report feeds view. The two shortest paths to report are
+// source->a->z->report and source->b->c->report. Comparing only report's
+// direct upstreams would pick c (c < z); comparing full paths name by name
+// picks the a branch because a < b. view must extend that same winning path.
+func TestImpactsDeepMergeComparesFullPaths(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "source")
+	mustRegister(t, graph, "a", "source")
+	mustRegister(t, graph, "b", "source")
+	mustRegister(t, graph, "z", "a")
+	mustRegister(t, graph, "c", "b")
+	mustRegister(t, graph, "report", "z", "c")
+	mustRegister(t, graph, "view", "report")
+	mustRegister(t, graph, "unrelated")
+	assertConsistent(t, graph)
+
+	before := snapshot(graph)
+	impacts, err := Impacts(graph, "source")
+	if err != nil {
+		t.Fatalf("Impacts(source): %v", err)
+	}
+
+	// Distance ascending, name ascending within a distance; the origin and
+	// the disconnected dataset never appear.
+	if got, want := impactNames(impacts), []string{"a", "b", "c", "z", "report", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, impacts, "a", 1, []string{"source", "a"})
+	assertImpactOnce(t, impacts, "b", 1, []string{"source", "b"})
+	assertImpactOnce(t, impacts, "c", 2, []string{"source", "b", "c"})
+	assertImpactOnce(t, impacts, "z", 2, []string{"source", "a", "z"})
+	// The crux: c < z as report's direct upstreams, but the full path through
+	// a is lexicographically smaller than the one through b, so the z route wins.
+	assertImpactOnce(t, impacts, "report", 3, []string{"source", "a", "z", "report"})
+	assertImpactOnce(t, impacts, "view", 4, []string{"source", "a", "z", "report", "view"})
+
+	// The query is read-only: no node, edge or ordering may change.
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("Impacts mutated the graph: before=%v after=%v", before, snapshot(graph))
+	}
+}
+
+// The same deep-merge graph built through different legal registration
+// orders, and with report's direct upstream list flipped, must yield byte
+// identical names, distances and paths.
+func TestImpactsDeepMergeRegistrationOrderInvariance(t *testing.T) {
+	baseline := map[string]*Lineage{}
+	mustRegister(t, baseline, "source")
+	mustRegister(t, baseline, "a", "source")
+	mustRegister(t, baseline, "b", "source")
+	mustRegister(t, baseline, "z", "a")
+	mustRegister(t, baseline, "c", "b")
+	mustRegister(t, baseline, "report", "z", "c")
+	mustRegister(t, baseline, "view", "report")
+	want := mustImpacts(t, baseline, "source")
+
+	// Branches registered in the opposite order, report's upstreams flipped.
+	flipped := map[string]*Lineage{}
+	mustRegister(t, flipped, "source")
+	mustRegister(t, flipped, "b", "source")
+	mustRegister(t, flipped, "a", "source")
+	mustRegister(t, flipped, "c", "b")
+	mustRegister(t, flipped, "z", "a")
+	mustRegister(t, flipped, "report", "c", "z")
+	mustRegister(t, flipped, "view", "report")
+	assertConsistent(t, flipped)
+	if got := mustImpacts(t, flipped, "source"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("flipped build impacts = %v, want %v", got, want)
+	}
+
+	// report first registered with one upstream, then re-registered with both
+	// in flipped order: the final graph is identical, so the query must be too.
+	rewired := map[string]*Lineage{}
+	mustRegister(t, rewired, "source")
+	mustRegister(t, rewired, "a", "source")
+	mustRegister(t, rewired, "b", "source")
+	mustRegister(t, rewired, "z", "a")
+	mustRegister(t, rewired, "c", "b")
+	mustRegister(t, rewired, "report", "z")
+	mustRegister(t, rewired, "view", "report")
+	mustRegister(t, rewired, "report", "c", "z")
+	assertConsistent(t, rewired)
+	if got := mustImpacts(t, rewired, "source"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("re-registered build impacts = %v, want %v", got, want)
+	}
+}
+
+// Adding a direct source -> report dependency makes the shorter route win for
+// report and view even though the a-branch path is lexicographically smaller:
+// distance always beats name order. The a/b branches stay in the results.
+func TestImpactsDeepMergeDirectEdgeShortestWins(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "source")
+	mustRegister(t, graph, "a", "source")
+	mustRegister(t, graph, "b", "source")
+	mustRegister(t, graph, "z", "a")
+	mustRegister(t, graph, "c", "b")
+	mustRegister(t, graph, "report", "z", "c")
+	mustRegister(t, graph, "view", "report")
+
+	// report gains a direct edge from source, keeping z and c as upstreams.
+	mustRegister(t, graph, "report", "z", "c", "source")
+	assertConsistent(t, graph)
+
+	before := snapshot(graph)
+	impacts, err := Impacts(graph, "source")
+	if err != nil {
+		t.Fatalf("Impacts(source): %v", err)
+	}
+	if got, want := impactNames(impacts), []string{"a", "b", "report", "c", "view", "z"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impact order = %v, want %v", got, want)
+	}
+	assertImpactOnce(t, impacts, "a", 1, []string{"source", "a"})
+	assertImpactOnce(t, impacts, "b", 1, []string{"source", "b"})
+	// Distance 1 beats the lexicographically smaller source->a->z->report path.
+	assertImpactOnce(t, impacts, "report", 1, []string{"source", "report"})
+	assertImpactOnce(t, impacts, "c", 2, []string{"source", "b", "c"})
+	assertImpactOnce(t, impacts, "z", 2, []string{"source", "a", "z"})
+	// view follows the new short route, not the old a/z one.
+	assertImpactOnce(t, impacts, "view", 2, []string{"source", "report", "view"})
+
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("Impacts mutated the graph: before=%v after=%v", before, snapshot(graph))
+	}
+}
+
 type snap struct {
 	parents  map[string][]string
 	children map[string][]string
