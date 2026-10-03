@@ -904,6 +904,180 @@ func TestImpactsRewireTieBreakAndOrderInvariance(t *testing.T) {
 	}
 }
 
+// buildRegisteredGraph applies a sequence of [name, parents...] registrations
+// in the given order, failing the test if any registration is rejected.
+func buildRegisteredGraph(t *testing.T, registrations [][]string) map[string]*Lineage {
+	t.Helper()
+	graph := map[string]*Lineage{}
+	for _, r := range registrations {
+		mustRegister(t, graph, r[0], r[1:]...)
+	}
+	return graph
+}
+
+// Regression for a multi-path merge where comparing the full explanation path
+// and comparing only the merge node's direct upstream name give different
+// answers. source feeds a and b; a feeds z; b feeds c; report depends on z and
+// c together (c declared ahead of z on purpose); view depends on report. From
+// source both source->a->z->report and source->b->c->report have length 3. A
+// rule that only compares the final upstream would wrongly prefer the c route
+// (c < z); the full-path rule must compare from the origin and pick the a
+// route, because the paths first differ at hop 1 where a < b. view inherits
+// that explanation one hop further on.
+func TestImpactsMergedBranchesFullPathTieBreak(t *testing.T) {
+	// Each sequence builds the same graph with a legal but different
+	// registration order; the second also flips report's upstream list, and the
+	// third registers the isolated node early. Names, distances and paths must
+	// come out identical regardless.
+	sequences := [][][]string{
+		{
+			{"source"},
+			{"b", "source"}, // b-side branch registered first
+			{"a", "source"},
+			{"c", "b"},
+			{"z", "a"},
+			{"report", "c", "z"}, // c listed ahead of z on purpose
+			{"view", "report"},
+			{"isolated"},
+		},
+		{
+			{"source"},
+			{"a", "source"}, // opposite branch registered first
+			{"z", "a"},
+			{"b", "source"},
+			{"c", "b"},
+			{"report", "z", "c"}, // direct-upstream order flipped
+			{"view", "report"},
+			{"isolated"},
+		},
+		{
+			{"source"},
+			{"isolated"},
+			{"b", "source"},
+			{"a", "source"},
+			{"z", "a"},
+			{"c", "b"},
+			{"report", "c", "z"},
+			{"view", "report"},
+		},
+	}
+
+	want := []Impact{
+		{Dataset: "a", Distance: 1, Path: []string{"source", "a"}},
+		{Dataset: "b", Distance: 1, Path: []string{"source", "b"}},
+		{Dataset: "c", Distance: 2, Path: []string{"source", "b", "c"}},
+		{Dataset: "z", Distance: 2, Path: []string{"source", "a", "z"}},
+		{Dataset: "report", Distance: 3, Path: []string{"source", "a", "z", "report"}},
+		{Dataset: "view", Distance: 4, Path: []string{"source", "a", "z", "report", "view"}},
+	}
+
+	for i, seq := range sequences {
+		graph := buildRegisteredGraph(t, seq)
+		assertConsistent(t, graph)
+		before := snapshot(graph)
+
+		impacts := mustImpacts(t, graph, "source")
+		if !reflect.DeepEqual(impacts, want) {
+			t.Fatalf("sequence %d: impacts = %v, want %v", i, impacts, want)
+		}
+
+		// Anchors with explicit messages: the merge node is explained exactly
+		// once through a/z even though c sorts ahead of z, and view continues
+		// along that same route.
+		assertImpactOnce(t, impacts, "report", 3, []string{"source", "a", "z", "report"})
+		assertImpactOnce(t, impacts, "view", 4, []string{"source", "a", "z", "report", "view"})
+
+		// The origin itself and an unconnected dataset never appear.
+		if names := impactNames(impacts); slices.Contains(names, "source") || slices.Contains(names, "isolated") {
+			t.Fatalf("sequence %d: origin or isolated dataset leaked into %v", i, names)
+		}
+
+		// The query changes no node, relationship or stored list order.
+		if !reflect.DeepEqual(snapshot(graph), before) {
+			t.Fatalf("sequence %d: query changed graph: before=%v after=%v", i, before, snapshot(graph))
+		}
+	}
+}
+
+// With a direct source->report edge added on top of the merge scenario, edge
+// count takes priority over lexicographic order: report shortens to distance 1
+// and view to 2, both via the new edge, and the lexicographically smaller
+// length-3 route through a must not survive. The a/z and b/c branches remain
+// reachable on their own. The new upstream's position in report's declared
+// list must not change the result.
+func TestImpactsMergedBranchesDirectEdgeShortensMerge(t *testing.T) {
+	// Two builds with opposite registration and upstream-list orders; the
+	// direct edge is inserted at a different position in each.
+	builds := []struct {
+		registrations [][]string
+		newParents    []string
+	}{
+		{
+			registrations: [][]string{
+				{"source"},
+				{"b", "source"},
+				{"a", "source"},
+				{"c", "b"},
+				{"z", "a"},
+				{"report", "c", "z"},
+				{"view", "report"},
+				{"isolated"},
+			},
+			newParents: []string{"source", "c", "z"}, // direct edge first
+		},
+		{
+			registrations: [][]string{
+				{"source"},
+				{"a", "source"},
+				{"z", "a"},
+				{"b", "source"},
+				{"c", "b"},
+				{"report", "z", "c"},
+				{"view", "report"},
+				{"isolated"},
+			},
+			newParents: []string{"c", "z", "source"}, // direct edge last
+		},
+	}
+
+	want := []Impact{
+		{Dataset: "a", Distance: 1, Path: []string{"source", "a"}},
+		{Dataset: "b", Distance: 1, Path: []string{"source", "b"}},
+		{Dataset: "report", Distance: 1, Path: []string{"source", "report"}},
+		{Dataset: "c", Distance: 2, Path: []string{"source", "b", "c"}},
+		{Dataset: "view", Distance: 2, Path: []string{"source", "report", "view"}},
+		{Dataset: "z", Distance: 2, Path: []string{"source", "a", "z"}},
+	}
+
+	for i, build := range builds {
+		graph := buildRegisteredGraph(t, build.registrations)
+		mustRegister(t, graph, "report", build.newParents...)
+		assertConsistent(t, graph)
+		before := snapshot(graph)
+
+		impacts := mustImpacts(t, graph, "source")
+		if !reflect.DeepEqual(impacts, want) {
+			t.Fatalf("build %d: impacts = %v, want %v", i, impacts, want)
+		}
+
+		// The short route wins even though the old a-route is lexicographically
+		// smaller than any other length-3 explanation; both appear once.
+		assertImpactOnce(t, impacts, "report", 1, []string{"source", "report"})
+		assertImpactOnce(t, impacts, "view", 2, []string{"source", "report", "view"})
+
+		// Both merged branches are still listed as affected datasets.
+		assertImpact(t, impacts, "z", 2, []string{"source", "a", "z"})
+		assertImpact(t, impacts, "c", 2, []string{"source", "b", "c"})
+
+		if names := impactNames(impacts); slices.Contains(names, "source") || slices.Contains(names, "isolated") {
+			t.Fatalf("build %d: origin or isolated dataset leaked into %v", i, names)
+		}
+		if !reflect.DeepEqual(snapshot(graph), before) {
+			t.Fatalf("build %d: query changed graph: before=%v after=%v", i, before, snapshot(graph))
+		}
+	}
+}
+
 // A rejected re-wire (unknown upstream, or an upstream that would close a
 // cycle through the dataset's own downstream) must name the offending upstream
 // and leave every previously queryable relationship exactly as it was.
