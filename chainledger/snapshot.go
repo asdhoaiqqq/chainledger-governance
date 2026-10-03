@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // SnapshotFormatVersion is the only on-disk snapshot format understood.
@@ -156,12 +157,12 @@ func isJSONNull(raw json.RawMessage) bool {
 // ParseSnapshot parses and strictly validates one snapshot document: required
 // fields must be present and well-typed, no known field may be declared twice
 // within the same object (even with identical values, a null first, or a
-// spelling that merely differs in case or escapes), the format version must be
-// supported, the embedded graph must be structurally valid (no empty names,
-// duplicate datasets, missing upstreams, or cycles), and the content
-// identifier must correspond exactly to the graph. A tampered, corrupt, or
-// otherwise invalid snapshot is rejected, so a bad file can never be trusted
-// as a version.
+// spelling equivalent under Unicode case folding or JSON escaping), the
+// format version must be supported, the embedded graph must be structurally
+// valid (no empty names, duplicate datasets, missing upstreams, or cycles),
+// and the content identifier must correspond exactly to the graph. A
+// tampered, corrupt, or otherwise invalid snapshot is rejected, so a bad file
+// can never be trusted as a version.
 func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 	if err := checkDuplicateFields(data); err != nil {
 		return nil, err
@@ -249,10 +250,13 @@ var errAbortScan = errors.New("chainledger: abort duplicate field scan")
 // would pass every other check.
 //
 // Field names are compared after JSON string unescaping and with the same
-// ASCII case-folding the decoder applies, so "name", "name", and "Name"
-// all collide. Unknown fields keep their ignore-everything behavior and may
-// repeat freely. Documents that are not shaped like a snapshot at all are left
-// to the regular parse, which reports the structural problem.
+// Unicode simple case-folding the decoder applies to its case-insensitive
+// field lookup (equivalent to strings.EqualFold), so "name", "Name", and
+// "name" all collide, and so do spellings that only differ in a fold
+// equivalent rune such as "formatVerſion" (long s) and "formatVersion".
+// Unknown fields keep their ignore-everything behavior and may repeat freely.
+// Documents that are not shaped like a snapshot at all are left to the
+// regular parse, which reports the structural problem.
 func checkDuplicateFields(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	err := checkTopLevelObject(dec)
@@ -315,7 +319,7 @@ func checkGraphValue(dec *json.Decoder) error {
 		if err != nil {
 			return err
 		}
-		if asciiFoldEqual(key, "datasets") {
+		if strings.EqualFold(key, "datasets") {
 			if seen {
 				return duplicateFieldError("datasets", `in "graph"`)
 			}
@@ -390,11 +394,11 @@ func duplicateFieldError(field, location string) error {
 // field it selects, matching the decoder's case-insensitive field lookup.
 func snapshotField(key string) (string, bool) {
 	switch {
-	case asciiFoldEqual(key, "formatVersion"):
+	case strings.EqualFold(key, "formatVersion"):
 		return "formatVersion", true
-	case asciiFoldEqual(key, "contentId"):
+	case strings.EqualFold(key, "contentId"):
 		return "contentId", true
-	case asciiFoldEqual(key, "graph"):
+	case strings.EqualFold(key, "graph"):
 		return "graph", true
 	}
 	return "", false
@@ -404,33 +408,12 @@ func snapshotField(key string) (string, bool) {
 // field it selects, matching the decoder's case-insensitive field lookup.
 func datasetField(key string) (string, bool) {
 	switch {
-	case asciiFoldEqual(key, "name"):
+	case strings.EqualFold(key, "name"):
 		return "name", true
-	case asciiFoldEqual(key, "upstreams"):
+	case strings.EqualFold(key, "upstreams"):
 		return "upstreams", true
 	}
 	return "", false
-}
-
-// asciiFoldEqual reports whether a and b are equal under ASCII case folding,
-// the same rule encoding/json uses when matching object keys to struct fields.
-func asciiFoldEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca, cb := a[i], b[i]
-		if 'A' <= ca && ca <= 'Z' {
-			ca += 'a' - 'A'
-		}
-		if 'A' <= cb && cb <= 'Z' {
-			cb += 'a' - 'A'
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }
 
 // scanToken reads one token; any decode failure aborts the scan so the

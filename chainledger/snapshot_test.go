@@ -321,7 +321,142 @@ func TestParseSnapshotCaseVariantSpellings(t *testing.T) {
 	}
 }
 
-// TestCompareHeadlineRootSourceChange is the scenario from the product spec:
+// TestParseSnapshotRejectsUnicodeFoldDuplicates: two keys that the JSON
+// reader resolves to the same struct field through Unicode simple case
+// folding — not merely ASCII case — make the snapshot ambiguous. U+017F
+// LATIN SMALL LETTER LONG S ("ſ") is a fold equivalent of "s", so
+// "formatVerſion" and "formatVersion" select the same field, as do
+// "dataſets"/"datasets" and "upſtreams"/"upstreams". Writing the rune
+// directly or via a JSON escape must not matter, and identical values, a null
+// first value, or reversed declaration order must not save the document. The
+// error names the canonical field and, inside a datasets record, its index.
+func TestParseSnapshotRejectsUnicodeFoldDuplicates(t *testing.T) {
+	const (
+		longS = "ſ" // U+017F LATIN SMALL LETTER LONG S, folds to ASCII "s"
+		// longSEscape is the JSON escape spelling of the same rune as literal
+		// document bytes (backslash, u, 0, 1, 7, f).
+		longSEscape = "\\" + "u017f"
+	)
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+	doc := func(body string) string {
+		return `{"formatVersion":1,"contentId":"` + id + `","graph":` + body + `}`
+	}
+
+	cases := map[string]struct {
+		data  string
+		field string
+	}{
+		"long s version 2 then 1": {
+			`{"formatVer` + longS + `ion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"long s version reversed order": {
+			`{"formatVersion":1,"formatVer` + longS + `ion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"long s version identical values": {
+			`{"formatVer` + longS + `ion":1,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"long s version via JSON escape": {
+			`{"formatVer` + longSEscape + `ion":2,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"null long s version then valid": {
+			`{"formatVer` + longS + `ion":null,"formatVersion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+			"formatVersion",
+		},
+		"datasets versus long s datasets": {
+			doc(`{"data` + longS + `ets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets",
+		},
+		"long s datasets via JSON escape": {
+			doc(`{"data` + longSEscape + `ets":[],"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`),
+			"datasets",
+		},
+		"upstreams versus long s upstreams": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","up` + longS + `treams":["A"],"upstreams":["A"]}]}`),
+			"upstreams",
+		},
+		"long s upstreams via JSON escape": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","up` + longSEscape + `treams":["A"],"upstreams":["A"]}]}`),
+			"upstreams",
+		},
+		"null long s upstreams then valid": {
+			doc(`{"datasets":[{"name":"A","upstreams":[]},{"name":"B","up` + longS + `treams":null,"upstreams":["A"]}]}`),
+			"upstreams",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Every "escape" case really must carry ASCII escape bytes.
+			if strings.Contains(name, "escape") && !strings.Contains(tc.data, longSEscape) {
+				t.Fatalf("test case %q does not actually use a JSON escape", name)
+			}
+			_, err := ParseSnapshot([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Errorf("err = %q, want it to name canonical field %q", err, tc.field)
+			}
+		})
+	}
+
+	// The duplicate lives in the second dataset record; the error must locate
+	// that record by its datasets array index even for a Unicode-fold key.
+	indexed := doc(`{"datasets":[{"name":"A","upstreams":[]},{"up` + longS + `treams":["A"],"name":"B","upstreams":["A"]}]}`)
+	if _, err := ParseSnapshot([]byte(indexed)); err == nil || !strings.Contains(err.Error(), "index 1") {
+		t.Errorf("err = %v, want the datasets index of the offending record", err)
+	}
+
+	// A top-level long-s spelling twice also collides at the top level.
+	twice := `{"formatVer` + longS + `ion":1,"formatVer` + longS + `ion":1,"contentId":"` + id + `","graph":` + graph + `}`
+	if _, err := ParseSnapshot([]byte(twice)); err == nil ||
+		!strings.Contains(err.Error(), `"formatVersion"`) ||
+		!strings.Contains(err.Error(), "top level") {
+		t.Errorf("err = %v, want a top-level formatVersion duplicate error", err)
+	}
+}
+
+// TestParseSnapshotUnicodeFoldSpellingDeclaredOnce preserves read
+// compatibility: a known field written exactly once in a Unicode-fold
+// spelling is still recognized, and a key with the same name nested inside an
+// unknown field is independent of the outer object's known-field check.
+func TestParseSnapshotUnicodeFoldSpellingDeclaredOnce(t *testing.T) {
+	const (
+		longS       = "ſ"
+		longSEscape = "\\" + "u017f"
+	)
+	graph := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+	id := snapshotOf(t, graph).ContentID
+
+	cases := map[string]string{
+		"long s version declared once": `{"formatVer` + longS + `ion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"long s datasets declared once": `{"formatVersion":1,"contentId":"` + id +
+			`","graph":{"data` + longS + `ets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}}`,
+		"long s upstreams declared once": `{"formatVersion":1,"contentId":"` + id +
+			`","graph":{"datasets":[{"name":"A","upstreams":[]},{"name":"B","up` + longS + `treams":["A"]}]}}`,
+		"escaped long s version declared once": `{"formatVer` + longSEscape + `ion":1,"contentId":"` + id + `","graph":` + graph + `}`,
+		"same key nested inside unknown field": `{"formatVersion":1,"contentId":"` + id + `","graph":` + graph +
+			`,"meta":{"formatVersion":2,"datasets":null}}`,
+		"fold-spelled key nested inside unknown field": `{"formatVersion":1,"contentId":"` + id + `","graph":` +
+			graph + `,"meta":{"formatVer` + longS + `ion":2,"data` + longS + `ets":[]}}`,
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := ParseSnapshot([]byte(data))
+			if err != nil {
+				t.Fatalf("a field declared once in a fold spelling was rejected: %v", err)
+			}
+			if parsed.ContentID != id {
+				t.Errorf("content id = %s, want %s", parsed.ContentID, id)
+			}
+		})
+	}
+}
+
 // A is a root source of B, C depends on B; repointing B at another root X must
 // report BOTH B and C changing source from A to X.
 func TestCompareHeadlineRootSourceChange(t *testing.T) {

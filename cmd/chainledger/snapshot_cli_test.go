@@ -539,3 +539,156 @@ func TestCLISnapshotRefusesDuplicateFieldTarget(t *testing.T) {
 		t.Errorf("refusal rewrote the target: mtime %s -> %s", infoBefore.ModTime(), infoAfter.ModTime())
 	}
 }
+
+const (
+	// longS is U+017F LATIN SMALL LETTER LONG S, a Unicode simple case fold
+	// of ASCII "s": the JSON reader maps "formatVerſion" to formatVersion.
+	longS = "ſ"
+	// longSEscape spells the same rune as literal JSON escape bytes.
+	longSEscape = "\\" + "u017f"
+)
+
+// unicodeDupFieldSnapshot seeds a valid snapshot of graphJSON, then returns
+// its path together with bytes that declare formatVersion twice — first 2
+// under a long-s fold spelling, then the valid 1 under the canonical spelling.
+// The surviving value still describes the same content, so only the
+// duplicate-field rule stands between the file and acceptance. The caller
+// writes the returned content to the path itself; spelling is either longS
+// (rune written directly) or longSEscape (JSON escape).
+func unicodeDupFieldSnapshot(t *testing.T, graphJSON, spelling string) (path, content string) {
+	t.Helper()
+	target := filepath.Join(t.TempDir(), "snap.json")
+	if _, stderr, exit := snapshotViaCLI(t, graphJSON, target); exit != 0 {
+		t.Fatalf("seed snapshot: %s", stderr)
+	}
+	valid := readFile(t, target)
+	if err := os.Remove(target + ".lock"); err != nil {
+		t.Fatalf("remove seed lock: %v", err)
+	}
+	dup := strings.Replace(valid, `"formatVersion": 1`,
+		`"formatVer`+spelling+`ion": 2, "formatVersion": 1`, 1)
+	if dup == valid {
+		t.Fatalf("could not inject a long-s duplicate field into %s", valid)
+	}
+	return target, dup
+}
+
+func TestCLICompareRejectsUnicodeFoldDuplicates(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spelling string
+	}{
+		{"rune written directly", longS},
+		{"JSON escape spelling", longSEscape},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			good := filepath.Join(dir, "good.json")
+			if _, stderr, exit := snapshotViaCLI(t, abcGraph, good); exit != 0 {
+				t.Fatalf("snapshot good: %s", stderr)
+			}
+			dupPath, dupContent := unicodeDupFieldSnapshot(t, abcGraph, tc.spelling)
+			if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+				t.Fatalf("write dup: %v", err)
+			}
+
+			for _, side := range []struct {
+				name string
+				args []string
+				want string
+			}{
+				{"duplicate in old snapshot", []string{"compare", dupPath, good}, "old snapshot"},
+				{"duplicate in new snapshot", []string{"compare", good, dupPath}, "new snapshot"},
+			} {
+				t.Run(side.name, func(t *testing.T) {
+					stdout, stderr, exit := captureStdout(t, func() int { return run(side.args) })
+					if exit == 0 {
+						t.Fatalf("%v succeeded, want failure", side.args)
+					}
+					if stdout != "" {
+						t.Errorf("stdout = %q, want empty on rejection", stdout)
+					}
+					if !strings.Contains(stderr, side.want) || !strings.Contains(stderr, dupPath) {
+						t.Errorf("stderr = %q, must name the %s file", stderr, side.want)
+					}
+					if !strings.Contains(stderr, "formatVersion") {
+						t.Errorf("stderr = %q, must name the duplicated field", stderr)
+					}
+					if got := readFile(t, dupPath); got != dupContent {
+						t.Errorf("compare modified the snapshot:\n%s", got)
+					}
+					if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+						t.Errorf("compare created a lock file: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCLITraceRejectsUnicodeFoldDuplicates(t *testing.T) {
+	dupPath, dupContent := unicodeDupFieldSnapshot(t, abcGraph, longS)
+	if err := os.WriteFile(dupPath, []byte(dupContent), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"trace", dupPath, "C"})
+	})
+	if exit == 0 {
+		t.Fatalf("trace succeeded on a long-s ambiguous snapshot")
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty on rejection", stdout)
+	}
+	if !strings.Contains(stderr, dupPath) || !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the file and the duplicated field", stderr)
+	}
+	if got := readFile(t, dupPath); got != dupContent {
+		t.Errorf("trace modified the snapshot:\n%s", got)
+	}
+	if _, err := os.Stat(dupPath + ".lock"); !os.IsNotExist(err) {
+		t.Errorf("trace created a lock file: %v", err)
+	}
+}
+
+// TestCLISnapshotRefusesUnicodeFoldDuplicateTarget: an existing target whose
+// values only resolve because a long-s fold spelling and the canonical
+// spelling both set formatVersion counts as corrupt — even though the
+// surviving value is supported and the resolved graph equals what would be
+// saved. The save is refused, the target keeps every byte and its mtime, and
+// no content identifier is printed.
+func TestCLISnapshotRefusesUnicodeFoldDuplicateTarget(t *testing.T) {
+	target, dup := unicodeDupFieldSnapshot(t, abcGraph, longS)
+	if err := os.WriteFile(target, []byte(dup), 0o644); err != nil {
+		t.Fatalf("write dup: %v", err)
+	}
+	infoBefore, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	graphPath := writeFile(t, "graph.json", abcGraph)
+	stdout, stderr, exit := captureStdout(t, func() int {
+		return run([]string{"snapshot", graphPath, target})
+	})
+	if exit == 0 {
+		t.Fatalf("snapshot over a long-s duplicate-field target succeeded")
+	}
+	if !strings.Contains(stderr, "refusing to overwrite") || !strings.Contains(stderr, target) {
+		t.Errorf("stderr = %q, want refusal naming the target", stderr)
+	}
+	if !strings.Contains(stderr, "formatVersion") {
+		t.Errorf("stderr = %q, must name the duplicated field", stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want no content id on refusal", stdout)
+	}
+	if got := readFile(t, target); got != dup {
+		t.Errorf("target changed after refusal:\n got %s\nwant %s", got, dup)
+	}
+	infoAfter, _ := os.Stat(target)
+	if !infoAfter.ModTime().Equal(infoBefore.ModTime()) {
+		t.Errorf("refusal rewrote the target: mtime %s -> %s", infoBefore.ModTime(), infoAfter.ModTime())
+	}
+}
