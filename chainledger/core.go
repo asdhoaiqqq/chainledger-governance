@@ -35,6 +35,16 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 		return errInvalid("dataset name is required")
 	}
 
+	// One reverse reachability scan for the whole request: the set holds every
+	// node that can already reach the dataset through existing parent edges.
+	// Candidate upstreams often share ancestors and merge into each other
+	// repeatedly (diamond lineage), so walking each candidate's upstream tree
+	// separately would re-traverse that shared lineage once per candidate. The
+	// reverse scan follows child edges instead and visits each node at most
+	// once. The scan reads the graph as it stands at the start of this call
+	// only; later registrations run a fresh scan, never a reused conclusion.
+	cyclic := upstreamAncestors(graph, dataset.Name)
+
 	// Validate up front, walking the request in input order so the first problem
 	// encountered is the one reported. No graph mutation happens in this loop.
 	upstreams := make([]string, 0, len(parents))
@@ -48,8 +58,9 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 		}
 		// A new edge dataset -> parent closes a cycle exactly when parent can
 		// already reach dataset through existing parent edges. This covers
-		// transitive paths of any depth, not only direct mutual references.
-		if reaches(graph, parent, dataset.Name) {
+		// transitive paths of any depth, not only direct mutual references;
+		// membership was settled for every candidate by the single scan above.
+		if cyclic[parent] {
 			return errInvalid("cycle through " + parent + " for dataset " + dataset.Name)
 		}
 		if !known[parent] {
@@ -86,31 +97,34 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	return nil
 }
 
-// reaches reports whether target is reachable from node by following parent
-// edges, i.e. whether target is among node's direct or transitive upstreams.
-func reaches(graph map[string]*Lineage, from, target string) bool {
-	seen := map[string]bool{}
-	var walk func(string) bool
-	walk = func(node string) bool {
-		if node == target {
-			return true
-		}
-		if seen[node] {
-			return false
-		}
-		seen[node] = true
+// upstreamAncestors returns every node that can reach dataset by following
+// existing parent edges — its direct and transitive upstreams. Registering
+// dataset with one of those names as a parent would close a cycle.
+//
+// Rather than running one parent-edge walk per candidate parent, this walks the
+// reverse direction once: following child edges from dataset visits each node
+// at most once, even when candidate upstreams share ancestors or their
+// upstream branches merge repeatedly. The equivalence relies on Register's
+// invariant that every parent edge has a mirrored child edge, the same lineage
+// graph Impacts traverses.
+func upstreamAncestors(graph map[string]*Lineage, dataset string) map[string]bool {
+	ancestors := map[string]bool{}
+	var walk func(string)
+	walk = func(node string) {
 		entry, ok := graph[node]
 		if !ok {
-			return false
+			return
 		}
-		for _, parent := range entry.Parents {
-			if walk(parent) {
-				return true
+		for _, child := range entry.Children {
+			if ancestors[child] {
+				continue
 			}
+			ancestors[child] = true
+			walk(child)
 		}
-		return false
 	}
-	return walk(from)
+	walk(dataset)
+	return ancestors
 }
 
 // removeChild drops every occurrence of child from children, preserving the
