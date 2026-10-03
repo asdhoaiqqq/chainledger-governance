@@ -195,79 +195,22 @@ type Impact struct {
 // i.e. every dataset reachable from origin by following child edges. The origin
 // itself is never listed, and datasets with no such connection never appear.
 //
-// Distance is the shortest edge count; each dataset is returned at most once
-// even where several branches merge into it. When several shortest paths exist,
-// the lexicographically smallest full path (name by name, Go string order) is
-// reported. Results are ordered by distance and then by dataset name, never by
-// registration order or the stored parent/child list order.
-//
-// The graph is read only: a successful or failed query changes no node, edge or
-// ordering. The returned Path slices are independent copies, so mutating them
-// cannot affect the graph. An empty origin is rejected as a missing name; an
-// origin absent from the graph (including an empty or nil graph) is rejected
-// with an error naming it and no partial results.
+// Distance, the tie-broken explanation path, result ordering, read-only graph
+// access and error handling all follow the single shared lineage-query rule
+// set implemented by traceLineage; only the direction is specific to Impacts:
+// child edges outward, with paths written from the origin. An empty origin is
+// rejected as a missing name; an origin absent from the graph (including an
+// empty or nil graph) is rejected with an error naming it and no partial
+// results.
 func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
-	if origin == "" {
-		return nil, errInvalid("dataset name is required")
+	hits, err := traceLineage(graph, origin, dirDownstream)
+	if err != nil {
+		return nil, err
 	}
-	if _, ok := graph[origin]; !ok {
-		return nil, errInvalid("dataset not found: " + origin)
+	impacts := make([]Impact, len(hits))
+	for i, hit := range hits {
+		impacts[i] = Impact{Dataset: hit.name, Distance: hit.distance, Path: hit.path}
 	}
-
-	// BFS one distance level at a time. A node commits its distance and best
-	// (lexicographically smallest) shortest path only once the whole level is
-	// known, so candidates reaching the same child through different parents in
-	// the same level can be compared before either wins. Register rejects
-	// cycles, so a committed node is never reached again at an equal level.
-	distance := map[string]int{origin: 0}
-	best := map[string][]string{origin: {origin}}
-	frontier := []string{origin}
-	for d := 0; len(frontier) > 0; d++ {
-		nextDistance := d + 1
-		candidates := map[string][]string{}
-		var next []string
-		for _, node := range frontier {
-			for _, child := range graph[node].Children {
-				if _, seen := distance[child]; seen {
-					continue // reached on an earlier, strictly shorter level
-				}
-				// Fresh backing array per candidate: paths must not alias each
-				// other or any slice stored in the graph.
-				candidate := make([]string, len(best[node])+1)
-				copy(candidate, best[node])
-				candidate[len(candidate)-1] = child
-				if current, ok := candidates[child]; !ok || lessPath(candidate, current) {
-					if !ok {
-						next = append(next, child)
-					}
-					candidates[child] = candidate
-				}
-			}
-		}
-		for _, child := range next {
-			distance[child] = nextDistance
-			best[child] = candidates[child]
-		}
-		frontier = next
-	}
-
-	impacts := make([]Impact, 0, len(distance)-1)
-	for name, d := range distance {
-		if name == origin {
-			continue
-		}
-		impacts = append(impacts, Impact{
-			Dataset:  name,
-			Distance: d,
-			Path:     append([]string(nil), best[name]...),
-		})
-	}
-	sort.Slice(impacts, func(i, j int) bool {
-		if impacts[i].Distance != impacts[j].Distance {
-			return impacts[i].Distance < impacts[j].Distance
-		}
-		return impacts[i].Dataset < impacts[j].Dataset
-	})
 	return impacts, nil
 }
 
@@ -287,85 +230,151 @@ type Upstream struct {
 // target itself is never listed, its downstreams never appear, and datasets
 // with no such connection never appear.
 //
-// Distance is the shortest edge count; each upstream is returned at most once
-// even where it feeds the target through several branches. When several
-// shortest paths exist, the lexicographically smallest full path (name by
-// name from the upstream onward, Go string order) is reported. Results are
-// ordered by distance and then by upstream name, never by registration order
-// or the stored parent/child list order.
-//
-// The graph is read only: a successful or failed query changes no node, edge
-// or ordering. The returned Path slices are independent copies, so mutating
-// them cannot affect the graph, other records, or later queries. An empty
-// target is rejected as a missing name; a target absent from the graph
-// (including an empty or nil graph) is rejected with an error naming it and
-// no partial results.
+// Distance, the tie-broken explanation path, result ordering, read-only graph
+// access and error handling all follow the single shared lineage-query rule
+// set implemented by traceLineage; only the direction is specific to
+// Upstreams: parent edges inward, with paths written from each source toward
+// the target. An empty target is rejected as a missing name; a target absent
+// from the graph (including an empty or nil graph) is rejected with an error
+// naming it and no partial results.
 func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
-	if target == "" {
+	hits, err := traceLineage(graph, target, dirUpstream)
+	if err != nil {
+		return nil, err
+	}
+	upstreams := make([]Upstream, len(hits))
+	for i, hit := range hits {
+		upstreams[i] = Upstream{Dataset: hit.name, Distance: hit.distance, Path: hit.path}
+	}
+	return upstreams, nil
+}
+
+// queryDirection carries the only way the two lineage queries differ: which
+// edges to walk and from which end an explanation path is written.
+type queryDirection int
+
+const (
+	// dirDownstream follows child edges away from the query's origin and grows
+	// explanation paths at the far end (origin -> ... -> dataset).
+	dirDownstream queryDirection = iota
+	// dirUpstream follows parent edges away from the query's target and grows
+	// explanation paths at the near end (source -> ... -> target).
+	dirUpstream
+)
+
+// neighbors lists the datasets one edge beyond node in the query direction.
+func (d queryDirection) neighbors(node *Lineage) []string {
+	if d == dirDownstream {
+		return node.Children
+	}
+	return node.Parents
+}
+
+// extendPath grows a committed shortest path by one hop, placing the new hop
+// where the explanation direction requires: a downstream hop is appended
+// (origin -> node -> hop), an upstream hop is prepended (hop -> node ->
+// target). The result always gets a fresh backing array, so candidates never
+// alias each other, committed paths, or slices stored in the graph.
+func (d queryDirection) extendPath(path []string, hop string) []string {
+	extended := make([]string, len(path)+1)
+	if d == dirDownstream {
+		copy(extended, path)
+		extended[len(extended)-1] = hop
+		return extended
+	}
+	extended[0] = hop
+	copy(extended[1:], path)
+	return extended
+}
+
+// lineageHit is one direction-neutral query result: a reached dataset besides
+// the query's own node, its shortest edge distance, and the lexicographically
+// smallest shortest explanation path held in an independent slice.
+type lineageHit struct {
+	name     string
+	distance int
+	path     []string
+}
+
+// traceLineage runs the one query rule set shared by Impacts and Upstreams and
+// returns every dataset reachable from start besides start itself.
+//
+// The traversal is a BFS that commits a whole distance level at once, so a node
+// reached through several branches within the same level keeps exactly one
+// candidate before the level commits. The rules shared by both directions are:
+//
+//   - Distance is the minimum number of lineage edges; a node committed on an
+//     earlier level can never be re-explained at a longer one (Register
+//     rejects cycles, so equal-length rediscoveries only happen inside one
+//     level's candidate map).
+//   - Each dataset appears at most once, however many branches merge into it.
+//   - Among equal-length shortest paths, the lexicographically smallest full
+//     path wins: names are compared one by one from the path's beginning in Go
+//     string order. Downstream paths begin at the query origin and upstream
+//     paths at the source, so candidates for one upstream share their first
+//     hop and compare directly against the committed tails.
+//   - Hits are ordered by distance ascending and then by dataset name, never
+//     by registration order or the stored parent/child list order.
+//
+// Explanation paths are written in the query direction (see extendPath). The
+// graph is read only and every returned path is an independent copy. An empty
+// start is rejected as a missing name; an unregistered start (also against an
+// empty or nil graph) is rejected with an error naming it, with nil results;
+// a registered start that reaches nothing returns a non-nil empty slice.
+func traceLineage(graph map[string]*Lineage, start string, direction queryDirection) ([]lineageHit, error) {
+	if start == "" {
 		return nil, errInvalid("dataset name is required")
 	}
-	if _, ok := graph[target]; !ok {
-		return nil, errInvalid("dataset not found: " + target)
+	if _, ok := graph[start]; !ok {
+		return nil, errInvalid("dataset not found: " + start)
 	}
 
-	// BFS one distance level at a time along parent edges, mirroring Impacts.
-	// A node commits its distance and best (lexicographically smallest)
-	// shortest path only once the whole level is known, so candidates reaching
-	// the same upstream through different children in the same level can be
-	// compared before either wins. Paths are stored from the upstream toward
-	// the target, so a candidate prepends the parent to the child's committed
-	// path; candidates for one parent share its name as the first hop, which
-	// makes the committed per-child paths directly comparable.
-	distance := map[string]int{target: 0}
-	best := map[string][]string{target: {target}}
-	frontier := []string{target}
-	for d := 0; len(frontier) > 0; d++ {
-		nextDistance := d + 1
+	distance := map[string]int{start: 0}
+	best := map[string][]string{start: {start}}
+	frontier := []string{start}
+	for level := 0; len(frontier) > 0; level++ {
+		nextDistance := level + 1
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
-			for _, parent := range graph[node].Parents {
-				if _, seen := distance[parent]; seen {
+			for _, hop := range direction.neighbors(graph[node]) {
+				if _, seen := distance[hop]; seen {
 					continue // reached on an earlier, strictly shorter level
 				}
-				// Fresh backing array per candidate: paths must not alias each
-				// other or any slice stored in the graph.
-				candidate := make([]string, len(best[node])+1)
-				candidate[0] = parent
-				copy(candidate[1:], best[node])
-				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+				candidate := direction.extendPath(best[node], hop)
+				if current, ok := candidates[hop]; !ok || lessPath(candidate, current) {
 					if !ok {
-						next = append(next, parent)
+						next = append(next, hop)
 					}
-					candidates[parent] = candidate
+					candidates[hop] = candidate
 				}
 			}
 		}
-		for _, parent := range next {
-			distance[parent] = nextDistance
-			best[parent] = candidates[parent]
+		for _, hop := range next {
+			distance[hop] = nextDistance
+			best[hop] = candidates[hop]
 		}
 		frontier = next
 	}
 
-	upstreams := make([]Upstream, 0, len(distance)-1)
+	hits := make([]lineageHit, 0, len(distance)-1)
 	for name, d := range distance {
-		if name == target {
+		if name == start {
 			continue
 		}
-		upstreams = append(upstreams, Upstream{
-			Dataset:  name,
-			Distance: d,
-			Path:     append([]string(nil), best[name]...),
+		hits = append(hits, lineageHit{
+			name:     name,
+			distance: d,
+			path:     append([]string(nil), best[name]...),
 		})
 	}
-	sort.Slice(upstreams, func(i, j int) bool {
-		if upstreams[i].Distance != upstreams[j].Distance {
-			return upstreams[i].Distance < upstreams[j].Distance
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].distance != hits[j].distance {
+			return hits[i].distance < hits[j].distance
 		}
-		return upstreams[i].Dataset < upstreams[j].Dataset
+		return hits[i].name < hits[j].name
 	})
-	return upstreams, nil
+	return hits, nil
 }
 
 // lessPath reports whether path a sorts before path b as a name sequence:
