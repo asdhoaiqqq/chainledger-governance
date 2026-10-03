@@ -39,6 +39,14 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	// encountered is the one reported. No graph mutation happens in this loop.
 	upstreams := make([]string, 0, len(parents))
 	known := map[string]bool{}
+	// All cycle checks in this one request share a single memoized walk over the
+	// graph as it stands now: probe records whether each visited node can reach
+	// dataset.Name through existing parent edges. Candidate upstreams that come
+	// from the same source or merge repeatedly (diamonds) then traverse the
+	// shared lineage once instead of re-walking it per candidate. The recorded
+	// conclusion is a property of the current graph, so it is never reused
+	// across registrations.
+	probe := newAncestorProbe(graph, dataset.Name)
 	for _, parent := range parents {
 		if parent == dataset.Name {
 			return errInvalid("dataset " + dataset.Name + " cannot be its own parent")
@@ -48,8 +56,10 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 		}
 		// A new edge dataset -> parent closes a cycle exactly when parent can
 		// already reach dataset through existing parent edges. This covers
-		// transitive paths of any depth, not only direct mutual references.
-		if reaches(graph, parent, dataset.Name) {
+		// transitive paths of any depth, not only direct mutual references;
+		// shared ancestors and diamond merges read as the benign merges they are
+		// unless a branch genuinely leads back to dataset.
+		if probe.canReach(parent) {
 			return errInvalid("cycle through " + parent + " for dataset " + dataset.Name)
 		}
 		if !known[parent] {
@@ -86,31 +96,55 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	return nil
 }
 
-// reaches reports whether target is reachable from node by following parent
-// edges, i.e. whether target is among node's direct or transitive upstreams.
-func reaches(graph map[string]*Lineage, from, target string) bool {
-	seen := map[string]bool{}
-	var walk func(string) bool
-	walk = func(node string) bool {
-		if node == target {
-			return true
-		}
-		if seen[node] {
-			return false
-		}
-		seen[node] = true
-		entry, ok := graph[node]
-		if !ok {
-			return false
-		}
-		for _, parent := range entry.Parents {
-			if walk(parent) {
-				return true
-			}
-		}
+// ancestorProbe answers "can node reach target by following parent edges?" for
+// many starting nodes against one fixed, read-only snapshot of the graph, i.e.
+// whether target is among each node's direct or transitive upstreams. Each node
+// in the shared ancestry is resolved at most once, so candidate parents that
+// descend from a common source or merge along the way reuse the same findings
+// instead of each paying for a complete traversal.
+type ancestorProbe struct {
+	graph  map[string]*Lineage
+	target string
+	// resolved caches the conclusion for every fully explored node; visiting
+	// marks nodes mid-resolution. Register never accepts cycles, but visiting
+	// doubles as cycle protection regardless.
+	resolved map[string]bool
+	visiting map[string]bool
+}
+
+func newAncestorProbe(graph map[string]*Lineage, target string) *ancestorProbe {
+	return &ancestorProbe{
+		graph:    graph,
+		target:   target,
+		resolved: map[string]bool{},
+		visiting: map[string]bool{},
+	}
+}
+
+func (p *ancestorProbe) canReach(node string) bool {
+	if node == p.target {
+		return true
+	}
+	if hit, ok := p.resolved[node]; ok {
+		return hit
+	}
+	if p.visiting[node] {
 		return false
 	}
-	return walk(from)
+	p.visiting[node] = true
+
+	found := false
+	if entry, ok := p.graph[node]; ok {
+		for _, parent := range entry.Parents {
+			if p.canReach(parent) {
+				found = true
+				break
+			}
+		}
+	}
+	delete(p.visiting, node)
+	p.resolved[node] = found
+	return found
 }
 
 // removeChild drops every occurrence of child from children, preserving the

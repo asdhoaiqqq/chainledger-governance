@@ -134,6 +134,96 @@ func TestCycleAcrossMultipleLevelsRejected(t *testing.T) {
 	assertConsistent(t, graph)
 }
 
+// A derived dataset already has its own downstream; a request mixing an
+// independent, non-cyclic source with that downstream must be refused as a
+// whole, naming the downstream that closes the multi-level loop. Shared
+// ancestry between candidate upstreams must neither hide that loop nor turn a
+// benign merge into one.
+func TestRegisterIndependentSourceMixedWithOwnDownstreamRejected(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "src")
+	mustRegister(t, graph, "extra")
+	mustRegister(t, graph, "mid", "src")
+	mustRegister(t, graph, "leaf", "mid")
+	before := snapshot(graph)
+
+	// Independent source first, cyclic own-downstream second.
+	err := Register(graph, Dataset{Name: "mid"}, []string{"extra", "leaf"})
+	if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "leaf") {
+		t.Fatalf("want cycle error naming leaf, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("rejected registration changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertEntry(t, graph, "mid", []string{"src"}, []string{"leaf"})
+	assertEntry(t, graph, "extra", nil, nil)
+	assertConsistent(t, graph)
+
+	// The same offending downstream listed first reports the same named error;
+	// input order must not swap it for any other complaint.
+	err = Register(graph, Dataset{Name: "mid"}, []string{"leaf", "extra"})
+	if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "leaf") {
+		t.Fatalf("want cycle error naming leaf, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("rejected registration changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+
+	// Without the cyclic upstream the replacement succeeds, keeping mid's own
+	// downstream leaf and gaining no new child for the refused attempts.
+	mustRegister(t, graph, "mid", "extra")
+	assertEntry(t, graph, "mid", []string{"extra"}, []string{"leaf"})
+	assertEntry(t, graph, "extra", nil, []string{"mid"})
+	assertEntry(t, graph, "src", nil, nil)
+	assertConsistent(t, graph)
+
+	// Later registrations judge cycles against the current edges, not any
+	// conclusion cached before mid moved: extra -> mid now closes a loop.
+	if err := Register(graph, Dataset{Name: "extra"}, []string{"mid"}); err == nil ||
+		!strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "mid") {
+		t.Fatalf("want cycle error naming mid under the new edges, got %v", err)
+	}
+}
+
+// The ancestor probe resolves shared lineage once per registration: several
+// candidate starts that come from the same source and merge along the way reuse
+// cached conclusions instead of re-walking the common nodes.
+func TestAncestorProbeSharesWorkAcrossCandidates(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "src")
+	mustRegister(t, graph, "a", "src")
+	mustRegister(t, graph, "b", "src")
+	mustRegister(t, graph, "merge", "a", "b")
+	mustRegister(t, graph, "other")
+
+	probe := newAncestorProbe(graph, "src")
+	if !probe.canReach("merge") {
+		t.Fatal("merge should reach src through either branch")
+	}
+	// merge's walk already resolved a and b; asking about them again must be
+	// answered from the cache, adding no new traversal.
+	if !probe.canReach("a") || !probe.canReach("b") {
+		t.Fatal("memoized answers disagree: a and b both reach src")
+	}
+	if probe.canReach("other") {
+		t.Fatal("other does not reach src")
+	}
+	if got, want := len(probe.resolved), 4; got != want {
+		t.Fatalf("resolved %d nodes %v, want %d (merge,a,b,other); shared ancestry must not be re-walked",
+			got, probe.resolved, want)
+	}
+
+	// A node disconnected from the target probed from two starts that merge on
+	// a common non-reaching ancestor is likewise traversed once.
+	probe = newAncestorProbe(graph, "other")
+	if probe.canReach("merge") || probe.canReach("a") || probe.canReach("b") {
+		t.Fatal("nothing derived from src reaches other")
+	}
+	if got, want := len(probe.resolved), 4; got != want {
+		t.Fatalf("resolved %d nodes %v, want %d (merge,a,b,src)", got, probe.resolved, want)
+	}
+}
+
 // Multiple upstreams plus a diamond shape are legitimate and must not look like
 // a cycle, while a genuinely cyclic multi-parent request is refused.
 func TestMultipleUpstreamsAndDiamond(t *testing.T) {
