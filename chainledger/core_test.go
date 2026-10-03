@@ -1705,3 +1705,168 @@ func TestUpstreamsRejectedCycleRewireLeavesResultsUntouched(t *testing.T) {
 	assertUpstreamOnce(t, after, "a", 3, []string{"a", "z", "middle", "report"})
 	assertUpstreamOnce(t, after, "b", 3, []string{"b", "c", "middle", "report"})
 }
+
+// Regression for clearing ALL of a middle dataset's direct upstreams while a
+// report still depends on it. Passing an empty upstream list to the same-name
+// Register only turns middle into a new root: it is not deleted, and its
+// existing direct downstreams stay. Subsequent Upstreams queries must be
+// recomputed from the remaining relationships and must not trace old sources
+// through the severed dependencies.
+//
+// raw derives a and z; middle's direct upstreams are raw and a; report depends
+// directly on middle and z. Before the clearing, raw reaches report through two
+// equal length-2 routes, raw -> middle -> report and raw -> z -> report; the
+// full-path tie break from the source compares middle against z, so the middle
+// route explains raw. Afterwards middle remains a distance-1 source, a stops
+// being a source of report altogether, and raw survives only via the
+// raw -> z -> report branch: still once, still distance 2, but explained
+// through z. Ordering is by distance then name: middle and z first, then raw.
+func TestUpstreamsAfterClearingAllMiddleUpstreamsSurvivingBranch(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"a", "raw"},
+		{"z", "raw"},
+		{"middle", "raw", "a"},
+		{"report", "middle", "z"},
+	})
+
+	wantBefore := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+	}
+	wantAfter := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "z", "report"}},
+	}
+
+	assertConsistent(t, graph)
+
+	before := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(before, wantBefore) {
+		t.Fatalf("upstreams before clearing = %v, want %v", before, wantBefore)
+	}
+	// raw reaches report over two equal length-2 routes; the explanation picks
+	// raw -> middle -> report (middle < z at the first differing hop).
+	assertUpstreamOnce(t, before, "raw", 2, []string{"raw", "middle", "report"})
+	beforeCopy := make([]Upstream, len(before))
+	for i, up := range before {
+		beforeCopy[i] = Upstream{up.Dataset, up.Distance, append([]string(nil), up.Path...)}
+	}
+
+	// Re-register middle with no upstreams: it becomes a new root but is not
+	// removed, and report's direct dependencies are not part of this request.
+	mustRegister(t, graph, "middle")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"middle", "z"}, nil)
+	assertEntry(t, graph, "raw", nil, []string{"a", "z"})
+	assertEntry(t, graph, "a", []string{"raw"}, nil)
+	assertEntry(t, graph, "z", []string{"raw"}, []string{"report"})
+	// Clearing middle's parents makes it a second root alongside raw; nothing
+	// is deleted.
+	if got, want := Roots(graph), []string{"middle", "raw"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Roots = %v, want %v", got, want)
+	}
+	graphBeforeQuery := snapshot(graph)
+
+	after := mustUpstreams(t, graph, "report")
+	if !reflect.DeepEqual(after, wantAfter) {
+		t.Fatalf("upstreams after clearing = %v, want %v", after, wantAfter)
+	}
+	// Ordered by distance then name: middle and z (distance 1), then raw.
+	if got, want := upstreamNames(after), []string{"middle", "z", "raw"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("upstream order = %v, want %v", got, want)
+	}
+	// middle still explains report directly at distance 1.
+	assertUpstreamOnce(t, after, "middle", 1, []string{"middle", "report"})
+	// a is no longer a source of report through the severed middle edge.
+	if got := upstreamNames(after); slices.Contains(got, "a") {
+		t.Fatalf("a must leave report's sources after middle loses its upstreams, got %v", got)
+	}
+	// raw survives via the other branch raw -> z -> report, exactly once, still
+	// distance 2, with the explanation switched away from the deleted route.
+	assertUpstreamOnce(t, after, "raw", 2, []string{"raw", "z", "report"})
+
+	// The query restores nothing middle dropped and changes no relationship.
+	if !reflect.DeepEqual(snapshot(graph), graphBeforeQuery) {
+		t.Fatalf("query changed graph: before=%v after=%v", graphBeforeQuery, snapshot(graph))
+	}
+
+	// The result obtained before clearing kept its original content.
+	if !reflect.DeepEqual(before, beforeCopy) {
+		t.Fatalf("earlier result changed after clearing/new query: before=%v snapshot=%v", before, beforeCopy)
+	}
+}
+
+// Regression for clearing all of middle's direct upstreams when report depends
+// on middle alone, with no second branch reconnecting the old sources. After
+// clearing, Upstreams(report) contains only middle at distance 1 with path
+// [middle report]; raw and a stay registered in the graph but disappear from
+// report's source list. Querying the now-root middle itself succeeds with a
+// non-nil empty list: it is a registered dataset, not a missing name, and it
+// must not list itself as a source.
+func TestUpstreamsAfterClearingAllMiddleUpstreamsNoSurvivingBranch(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"a", "raw"},
+		{"middle", "raw", "a"},
+		{"report", "middle"},
+	})
+	assertConsistent(t, graph)
+
+	before := mustUpstreams(t, graph, "report")
+	wantBefore := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+		{Dataset: "a", Distance: 2, Path: []string{"a", "middle", "report"}},
+		{Dataset: "raw", Distance: 2, Path: []string{"raw", "middle", "report"}},
+	}
+	if !reflect.DeepEqual(before, wantBefore) {
+		t.Fatalf("upstreams before clearing = %v, want %v", before, wantBefore)
+	}
+
+	// Clear middle's entire direct upstream list; report keeps its edge to it.
+	mustRegister(t, graph, "middle")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "middle", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"middle"}, nil)
+	assertEntry(t, graph, "raw", nil, []string{"a"})
+	assertEntry(t, graph, "a", []string{"raw"}, nil)
+
+	after := mustUpstreams(t, graph, "report")
+	wantAfter := []Upstream{
+		{Dataset: "middle", Distance: 1, Path: []string{"middle", "report"}},
+	}
+	if !reflect.DeepEqual(after, wantAfter) {
+		t.Fatalf("upstreams after clearing = %v, want %v", after, wantAfter)
+	}
+
+	// raw and a are still registered but no longer report's sources.
+	if _, ok := graph["raw"]; !ok {
+		t.Error("raw must remain registered in the graph")
+	}
+	if _, ok := graph["a"]; !ok {
+		t.Error("a must remain registered in the graph")
+	}
+	if got := upstreamNames(after); slices.Contains(got, "raw") || slices.Contains(got, "a") {
+		t.Fatalf("raw and a must leave report's sources, got %v", got)
+	}
+
+	// The new root middle is directly queryable and answers non-nil empty:
+	// not a not-found error, and never its own source.
+	middleUpstreams, err := Upstreams(graph, "middle")
+	if err != nil {
+		t.Fatalf("Upstreams(middle) on the cleared root: %v", err)
+	}
+	if middleUpstreams == nil || len(middleUpstreams) != 0 {
+		t.Fatalf("want non-nil empty upstreams for the new root middle, got %v", middleUpstreams)
+	}
+
+	// raw and a remain independently queryable as registered datasets.
+	if upstreams := mustUpstreams(t, graph, "raw"); upstreams == nil || len(upstreams) != 0 {
+		t.Fatalf("raw is still a root with an empty non-nil upstream list, got %v", upstreams)
+	}
+	assertUpstreamOnce(t, mustUpstreams(t, graph, "a"), "raw", 1, []string{"raw", "a"})
+}
