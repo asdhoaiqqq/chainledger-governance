@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // PlanChange is one record in a lineage adjustment plan: the dataset name and
@@ -63,17 +62,16 @@ type BatchReport struct {
 	AffectedDownstreams []string   `json:"affectedDownstreams"`
 }
 
-// adjacency maps a dataset name to its sorted, duplicate-free parent names.
-type adjacency map[string][]string
-
-// graphAdjacency derives the parent map from the in-memory graph. It rejects
-// nil lineage nodes, empty names, and references to upstreams that are not
-// registered. It does not check for cycles; use validateAcyclic for that.
+// graphAdjacency derives the normalized parent map from the in-memory graph.
+// It rejects nil lineage nodes, empty names, and references to upstreams that
+// are not registered; the name/reference rules are the shared ones from
+// normalizeDatasets and validateAdjacencyReferences, also used by the file and
+// snapshot readers. It does not check for cycles; use validateAcyclic for that.
 func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("%w: create the graph map with make before validating", ErrNotInitialized)
 	}
-	adj := make(adjacency, len(graph))
+	records := make([]GraphDataset, 0, len(graph))
 	for name, entry := range graph {
 		if entry == nil {
 			return nil, fmt.Errorf("%w: dataset %q points to a nil lineage node", ErrInvalidArgument, name)
@@ -81,13 +79,14 @@ func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 		if name == "" {
 			return nil, fmt.Errorf("%w: dataset name is required", ErrInvalidArgument)
 		}
-		parents := uniqueSorted(entry.Parents)
-		for _, parent := range parents {
-			if _, ok := graph[parent]; !ok {
-				return nil, fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
-			}
-		}
-		adj[name] = parents
+		records = append(records, GraphDataset{Name: name, Upstreams: entry.Parents})
+	}
+	adj, err := normalizeDatasets(records)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAdjacencyReferences(adj); err != nil {
+		return nil, err
 	}
 	return adj, nil
 }
@@ -103,63 +102,6 @@ func ValidateGraph(graph map[string]*Lineage) error {
 		return err
 	}
 	return validateAcyclic(adj)
-}
-
-// validateAcyclic reports an error if the parent adjacency contains a cycle
-// (including a dataset that depends on itself). The error message names the
-// datasets involved.
-func validateAcyclic(adj adjacency) error {
-	const (
-		white = 0
-		gray  = 1
-		black = 2
-	)
-	color := make(map[string]int, len(adj))
-	var stack []string
-
-	var dfs func(node string) error
-	dfs = func(node string) error {
-		color[node] = gray
-		stack = append(stack, node)
-		for _, parent := range adj[node] {
-			switch color[parent] {
-			case gray:
-				// parent is an ancestor of node in the current DFS path, so
-				// following parent edges from parent leads back to parent.
-				idx := 0
-				for stack[idx] != parent {
-					idx++
-				}
-				cycle := make([]string, 0, len(stack)-idx+1)
-				cycle = append(cycle, stack[idx:]...)
-				cycle = append(cycle, parent)
-				return fmt.Errorf("%w: dependency cycle %s", ErrCycle, strings.Join(cycle, " -> "))
-			case white:
-				if err := dfs(parent); err != nil {
-					return err
-				}
-			}
-		}
-		color[node] = black
-		stack = stack[:len(stack)-1]
-		return nil
-	}
-
-	// Iterate over a sorted snapshot so the first reported cycle is stable
-	// across runs regardless of map iteration order.
-	names := make([]string, 0, len(adj))
-	for name := range adj {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if color[name] == white {
-			if err := dfs(name); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // computeBatch validates the graph and plan, then computes the final adjacency
@@ -268,7 +210,7 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	report := &BatchReport{
 		FinalGraph:          GraphFile{Datasets: adjacencyToDatasets(final)},
 		NewDatasets:         newNames,
-		ChangedDatasets:      changedNames,
+		ChangedDatasets:     changedNames,
 		RemovedDatasets:     removedNames,
 		AddedRelations:      added,
 		RemovedRelations:    removed,
@@ -502,41 +444,23 @@ func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 	return json.MarshalIndent(gf, "", "  ")
 }
 
-// UnmarshalGraphFile parses the on-disk graph JSON, rebuilds the in-memory
-// graph (parents and children), and validates it. A graph that is structurally
-// invalid (empty names, duplicate datasets, missing upstreams, or cycles) is
-// rejected so it cannot be used as the basis for a batch.
+// UnmarshalGraphFile parses the on-disk graph JSON and rebuilds the in-memory
+// graph (parents and derived children). The graph is checked with the same
+// structural rules a snapshot enforces (empty names, duplicate datasets,
+// missing upstreams, and cycles); a structurally invalid graph is rejected so
+// it cannot be used as the basis for a batch.
 func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	var gf GraphFile
 	if err := json.Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph JSON: %w", err)
 	}
-	graph := make(map[string]*Lineage, len(gf.Datasets))
-	for _, ds := range gf.Datasets {
-		if ds.Name == "" {
-			return nil, fmt.Errorf("%w: graph contains a dataset with an empty name", ErrInvalidArgument)
-		}
-		if _, exists := graph[ds.Name]; exists {
-			return nil, fmt.Errorf("%w: dataset %q is declared more than once in the graph", ErrInvalidArgument, ds.Name)
-		}
-		graph[ds.Name] = &Lineage{Dataset: ds.Name, Parents: uniqueSorted(ds.Upstreams)}
+	adj, err := validateGraphStructureFromFile(gf.Datasets)
+	if err != nil {
+		return nil, err
 	}
 	// Rebuild children from the parent edges so the in-memory graph is
 	// consistent regardless of how the file was produced.
-	for name, entry := range graph {
-		for _, parent := range entry.Parents {
-			if parentNode, ok := graph[parent]; ok {
-				parentNode.Children = append(parentNode.Children, name)
-			}
-		}
-	}
-	for name := range graph {
-		graph[name].Children = uniqueSorted(graph[name].Children)
-	}
-	if err := ValidateGraph(graph); err != nil {
-		return nil, err
-	}
-	return graph, nil
+	return lineageFromAdjacency(adj), nil
 }
 
 // UnmarshalPlan parses the plan JSON. The plan structure (empty names,

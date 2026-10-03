@@ -1,0 +1,170 @@
+// Package chainledger graph structure rules shared by every graph reader.
+//
+// Both on-disk graph files (UnmarshalGraphFile) and the graph embedded in a
+// snapshot (ParseSnapshot) describe the same thing: a set of dataset names and
+// each dataset's direct upstreams. The rules below are the single authority for
+// turning that description into the validated, normalized adjacency both
+// readers build on, so the two file formats can never disagree about whether
+// one graph is legal or about which lineage relations it expresses:
+//
+//   - an empty dataset name is rejected;
+//   - a dataset declared more than once is rejected;
+//   - an upstream that is not itself a declared dataset is rejected, with the
+//     referrer and the referenced name both in the error;
+//   - a direct self-dependency or any indirect dependency cycle is rejected,
+//     with the datasets on the cycle named;
+//   - names are case-sensitive and surrounding whitespace is kept verbatim;
+//   - record order and upstream order are irrelevant, duplicate upstreams count
+//     as one relationship, and an empty upstream list marks a root, so an
+//     empty graph stays legal.
+//
+// The snapshot-only envelope rules (required fields, format version, content
+// identifier, duplicate known fields) live in snapshot.go; this file is only
+// the common graph structure.
+package chainledger
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// adjacency maps a dataset name to its sorted, duplicate-free parent names.
+type adjacency map[string][]string
+
+// normalizeDatasets builds the normalized parent adjacency from parsed dataset
+// records. It rejects empty dataset names and datasets declared more than
+// once; every surviving upstream list is sorted and deduplicated. It does not
+// check that upstreams resolve to a declared dataset; use
+// validateAdjacencyReferences for that.
+func normalizeDatasets(datasets []GraphDataset) (adjacency, error) {
+	adj := make(adjacency, len(datasets))
+	for _, ds := range datasets {
+		if ds.Name == "" {
+			return nil, fmt.Errorf("%w: graph contains a dataset with an empty name", ErrInvalidArgument)
+		}
+		if _, exists := adj[ds.Name]; exists {
+			return nil, fmt.Errorf("%w: dataset %q is declared more than once in the graph", ErrInvalidArgument, ds.Name)
+		}
+		adj[ds.Name] = uniqueSorted(ds.Upstreams)
+	}
+	return adj, nil
+}
+
+// validateAdjacencyReferences rejects an edge whose upstream is not a declared
+// dataset. Referrers are visited in sorted order with their parents sorted, so
+// the first reported (referrer, upstream) pair is stable regardless of map
+// iteration or record order.
+func validateAdjacencyReferences(adj adjacency) error {
+	names := make([]string, 0, len(adj))
+	for name := range adj {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for _, parent := range adj[name] {
+			if _, ok := adj[parent]; !ok {
+				return fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
+			}
+		}
+	}
+	return nil
+}
+
+// validateGraphStructureFromFile runs every graph-structure rule shared by the
+// file readers: it normalizes the records, rejects empty names, duplicate
+// datasets, and unregistered upstreams, then rejects cycles. The returned
+// adjacency is the canonical form of the graph's semantics.
+func validateGraphStructureFromFile(datasets []GraphDataset) (adjacency, error) {
+	adj, err := normalizeDatasets(datasets)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAdjacencyReferences(adj); err != nil {
+		return nil, err
+	}
+	if err := validateAcyclic(adj); err != nil {
+		return nil, err
+	}
+	return adj, nil
+}
+
+// validateAcyclic reports an error if the parent adjacency contains a cycle
+// (including a dataset that depends on itself). The error message names the
+// datasets involved.
+func validateAcyclic(adj adjacency) error {
+	const (
+		white = 0
+		gray  = 1
+		black = 2
+	)
+	color := make(map[string]int, len(adj))
+	var stack []string
+
+	var dfs func(node string) error
+	dfs = func(node string) error {
+		color[node] = gray
+		stack = append(stack, node)
+		for _, parent := range adj[node] {
+			switch color[parent] {
+			case gray:
+				// parent is an ancestor of node in the current DFS path, so
+				// following parent edges from parent leads back to parent.
+				idx := 0
+				for stack[idx] != parent {
+					idx++
+				}
+				cycle := make([]string, 0, len(stack)-idx+1)
+				cycle = append(cycle, stack[idx:]...)
+				cycle = append(cycle, parent)
+				return fmt.Errorf("%w: dependency cycle %s", ErrCycle, strings.Join(cycle, " -> "))
+			case white:
+				if err := dfs(parent); err != nil {
+					return err
+				}
+			}
+		}
+		color[node] = black
+		stack = stack[:len(stack)-1]
+		return nil
+	}
+
+	// Iterate over a sorted snapshot so the first reported cycle is stable
+	// across runs regardless of map iteration order.
+	names := make([]string, 0, len(adj))
+	for name := range adj {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if color[name] == white {
+			if err := dfs(name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// lineageFromAdjacency rebuilds the in-memory graph from validated, normalized
+// parent adjacency: children are derived from the parent edges, so every
+// parent/child pair corresponds and both lists stay sorted and duplicate-free.
+// The result is independent of the caller's record slices.
+func lineageFromAdjacency(adj adjacency) map[string]*Lineage {
+	graph := make(map[string]*Lineage, len(adj))
+	for name, parents := range adj {
+		graph[name] = &Lineage{
+			Dataset: name,
+			Parents: append([]string(nil), parents...),
+		}
+	}
+	for name, parents := range adj {
+		for _, parent := range parents {
+			graph[parent].Children = append(graph[parent].Children, name)
+		}
+	}
+	for name := range graph {
+		graph[name].Children = uniqueSorted(graph[name].Children)
+	}
+	return graph
+}
