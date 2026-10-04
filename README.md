@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -381,6 +381,85 @@ if err := chainledger.Rename(graph, "a", "z"); err != nil {
 // report 的直接上游中原来 a 的位置变为 z；从 source 查询 report 的
 // 最短说明路径按新名称重新计算为 [source b report]（b < z）。
 ```
+
+## 移除数据集登记（Go 库）
+
+`chainledger.Unregister(graph, name)` 从当前内存血缘图中移除一个数据集的登记，成功返回 `nil`，失败返回说明原因的错误。移除作用于调用方传入的这张图，与 `Register`、`Rename`、`Impacts`、`Upstreams` 操作的是同一个普通内存 map。
+
+移除规则：
+
+- **只允许移除没有任何直接下游的数据集。** 只要还有别的数据集直接依赖它（无论它自己有没有上游），就返回错误并保留该登记，错误信息指出待移除名称并说明它仍有下游，如 `dataset detail cannot be unregistered while it still has direct downstreams`。要移除中间数据集，必须先移除它下游链路上的数据集，使它成为叶子。
+- **清理覆盖被移除数据集的全部直接上游。** 每个直接上游的下游列表都会去掉该名称，剩余名称的相对顺序不变；上游本身以及它的其他下游仍然存在。即使被移除数据集同时依赖多个来源，每个来源的反向引用都会被解除。没有直接连接该数据集的节点，其上下游列表保持原样。
+- **既无上游也无下游的独立数据集也能直接移除。**
+- **成功后名称彻底从图中消失。** 用已移除名称调用 `Impacts` 或 `Upstreams` 都按未登记处理（`dataset not found: <名称>`），图中不会留下仍可查询的空节点；再次 `Unregister` 同一名称同样按未登记报错。
+- **失败是原子的。** 被拒绝后图中所有节点、关系和列表顺序与调用前完全一致，不会出现上游反向边已断开而节点仍在的部分修改。
+- **名称为空**返回缺少名称的错误（`dataset name is required`）；**非空名称未登记**时错误中指出该名称（`dataset not found: ghost`），对空图或 nil 图调用也按未登记处理。名称按登记值精确匹配，区分大小写。
+- 移除不影响其余数据集的可达性：从剩余节点查询影响范围和来源时，最短距离和说明路径按移除后的现存关系重新计算，含义与原来一致。
+
+例如 `raw` 派生 `detail`，`detail` 再派生 `report` 和 `view`，且 `report` 还依赖独立来源 `extra`。移除叶子 `report` 后：`report` 的登记从图中消失，`detail` 的下游列表从 `[report view]` 变为 `[view]`（`view` 的位置和依赖关系保留），`extra` 也解除对 `report` 的反向引用但保留自己的其他下游。从 `raw` 查询影响范围仍能得到 `detail` 和 `view`，但不再包含 `report`；从 `view` 追查来源仍能到达 `detail` 和 `raw`，最短距离和说明路径保持原有含义。
+
+下面的程序与 [`examples/unregister`](examples/unregister/main.go) 一致，可在仓库根目录执行 `go run ./examples/unregister` 复现：
+
+```go
+graph := map[string]*chainledger.Lineage{}
+// raw -> detail -> report/view；report 还依赖 extra，extra 另有下游 otherchild。
+register("raw")
+register("detail", "raw")
+register("report", "detail")
+register("view", "detail")
+register("extra")
+register("otherchild", "extra")
+register("report", "detail", "extra")
+
+// detail 仍有直接下游 report 和 view：拒绝，图保持原样。
+if err := chainledger.Unregister(graph, "detail"); err != nil {
+	fmt.Println(err) // dataset detail cannot be unregistered while it still has direct downstreams
+}
+
+// report 是叶子，即使有两个上游也可以移除。
+if err := chainledger.Unregister(graph, "report"); err != nil {
+	fmt.Println(err)
+	return
+}
+// detail 的下游只剩 view；extra 不再有 report 这个下游，但 otherchild 仍在。
+```
+
+实际输出（错误与血缘边都是程序真实打印，不是示意）：
+
+```text
+Unregister(detail) refused: dataset detail cannot be unregistered while it still has direct downstreams
+after the refused request:
+  raw     parents=[] children=[detail]
+  detail  parents=[raw] children=[report view]
+  report  parents=[detail extra] children=[]
+  view    parents=[detail] children=[]
+  extra   parents=[] children=[otherchild report]
+  otherchild parents=[extra] children=[]
+Unregister(report) ok
+after removing report:
+  raw     parents=[] children=[detail]
+  detail  parents=[raw] children=[view]
+  report  <unregistered>
+  view    parents=[detail] children=[]
+  extra   parents=[] children=[otherchild]
+  otherchild parents=[extra] children=[]
+Impacts("raw") -> [detail view]
+Upstreams("view") -> [detail raw]
+Unregister(report) refused: dataset not found: report
+Impacts("report") error: dataset not found: report
+Unregister(otherchild) ok
+Unregister() refused: dataset name is required
+Unregister(ghost) refused: dataset not found: ghost
+Unregister(view) ok
+Unregister(detail) ok
+```
+
+要点：
+
+- 被拒绝的那次调用之后，`detail`、`report`、`view` 的关系原封不动，`extra` 仍有 `[otherchild report]` 两个下游——失败不会断开任何反向边。
+- 成功移除 `report` 后，`detail` 的下游列表保留剩余名称的相对顺序（`[view]`），两个直接上游 `detail` 和 `extra` 都解除了对 `report` 的引用；`view` 的位置、对 `detail` 的依赖，以及 `raw -> detail -> view` 的最短距离与说明路径都不受影响。
+- 已移除的名称在所有查询和再次移除中一律按未登记处理；空名称报缺少名称，空图或 nil 图上的任何非空名称都报未登记。
+- 移除只提供 Go 库入口；命令行继续只有 `demo`、`version`、`help`。
 
 ## 技术方向
 
