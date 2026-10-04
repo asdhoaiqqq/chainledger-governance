@@ -199,25 +199,65 @@ func validateAcyclic(adj adjacency) error {
 	return nil
 }
 
-// lineageFromAdjacency rebuilds the in-memory graph from validated, normalized
-// parent adjacency: children are derived from the parent edges, so every
-// parent/child pair corresponds and both lists stay sorted and duplicate-free.
-// The result is independent of the caller's record slices.
-func lineageFromAdjacency(adj adjacency) map[string]*Lineage {
-	graph := make(map[string]*Lineage, len(adj))
-	for name, parents := range adj {
-		graph[name] = &Lineage{
-			Dataset: name,
-			Parents: append([]string(nil), parents...),
+// materializeLineage turns validated, normalized parent adjacency into the
+// in-memory lineage structure every graph reader and every successful batch
+// leave behind, so both operations follow exactly one relationship rule:
+//
+//   - one node exists per adjacency key, carrying an independent copy of its
+//     sorted, duplicate-free parent list;
+//   - children are derived in a second pass from the parent edges, so every
+//     dataset's direct upstreams correspond to those upstreams' direct
+//     downstreams, with each downstream registered once.
+//
+// into is optional: when nil a fresh graph map is allocated and returned
+// (graph reads); when an existing graph is given (batch applies), nodes absent
+// from adjacency are deleted and the surviving *Lineage records are reused in
+// place, so Go callers that already hold the map or a node pointer keep reading
+// the updated relationships through their own records. Replacing a node's
+// lists with fresh copies keeps the result independent of adjacency: editing
+// the plan's final graph or a previously returned report cannot move the
+// materialized graph.
+func materializeLineage(into map[string]*Lineage, adj adjacency) map[string]*Lineage {
+	if into == nil {
+		into = make(map[string]*Lineage, len(adj))
+	}
+	// Nodes absent from the adjacency no longer exist; delete them before any
+	// edge is rebuilt, so a removed dataset cannot leave its relationships in
+	// a retained node's lists.
+	for name := range into {
+		if _, ok := adj[name]; !ok {
+			delete(into, name)
 		}
+	}
+	// Install the parent lists first, clearing children. A full rebuild below
+	// derives every child from the parent edges; that wholesale derivation is
+	// what guarantees replaced edges vanish from the old upstream, new
+	// upstreams list the downstream once, and untouched relations survive.
+	for name, parents := range adj {
+		entry := into[name]
+		if entry == nil {
+			entry = &Lineage{}
+			into[name] = entry
+		}
+		entry.Dataset = name
+		entry.Parents = append([]string(nil), parents...)
+		entry.Children = nil
 	}
 	for name, parents := range adj {
 		for _, parent := range parents {
-			graph[parent].Children = append(graph[parent].Children, name)
+			into[parent].Children = append(into[parent].Children, name)
 		}
 	}
-	for name := range graph {
-		graph[name].Children = uniqueSorted(graph[name].Children)
+	for name := range into {
+		into[name].Children = uniqueSorted(into[name].Children)
 	}
-	return graph
+	return into
+}
+
+// lineageFromAdjacency rebuilds a fresh in-memory graph from validated,
+// normalized parent adjacency. It is the read path of the shared relationship
+// rule in materializeLineage; the result is independent of the caller's record
+// slices.
+func lineageFromAdjacency(adj adjacency) map[string]*Lineage {
+	return materializeLineage(nil, adj)
 }

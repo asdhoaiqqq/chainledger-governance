@@ -335,33 +335,15 @@ func ApplyBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, error) {
 	return report, nil
 }
 
-// applyAdjacency rewrites the in-memory graph to match the final adjacency:
-// nodes absent from final are removed, parents are replaced, and children are
-// rebuilt from the parent edges.
+// applyAdjacency rewrites the in-memory graph to match the final adjacency. It
+// is the apply path of the shared relationship rule in materializeLineage, the
+// same rule a graph reader follows: nodes absent from final are removed,
+// parents are replaced wholesale with independent copies, and children are
+// rebuilt from the parent edges. Surviving *Lineage records are updated in
+// place, so node pointers a Go caller already holds expose the new
+// relationships after the batch returns.
 func applyAdjacency(graph map[string]*Lineage, final adjacency) {
-	for name := range graph {
-		if _, ok := final[name]; !ok {
-			delete(graph, name)
-		}
-	}
-	for name, parents := range final {
-		entry := graph[name]
-		if entry == nil {
-			entry = &Lineage{}
-			graph[name] = entry
-		}
-		entry.Dataset = name
-		entry.Parents = append([]string(nil), parents...)
-		entry.Children = nil
-	}
-	for name, parents := range final {
-		for _, parent := range parents {
-			graph[parent].Children = append(graph[parent].Children, name)
-		}
-	}
-	for name := range graph {
-		graph[name].Children = uniqueSorted(graph[name].Children)
-	}
+	materializeLineage(graph, final)
 }
 
 // diffRelations returns the directed edges present in final but not original
