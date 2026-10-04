@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 )
 
 // PlanChange is one record in a lineage adjustment plan: the dataset name and
@@ -63,21 +64,45 @@ type BatchReport struct {
 }
 
 // graphAdjacency derives the normalized parent map from the in-memory graph.
-// It rejects nil lineage nodes, empty names, and references to upstreams that
-// are not registered; the name/reference rules are the shared ones from
+// It rejects nil lineage nodes, empty names, names and upstream references
+// that are not valid UTF-8, and references to upstreams that are not
+// registered; the name/reference rules are the shared ones from
 // normalizeDatasets and validateAdjacencyReferences, also used by the file and
 // snapshot readers. It does not check for cycles; use validateAcyclic for that.
+//
+// The UTF-8 rule exists because only the in-memory graph can carry invalid
+// bytes: JSON readers never produce them (encoding/json replaces invalid
+// bytes while decoding). Exporting such a name would silently rewrite it to
+// U+FFFD, so two distinct names could collapse into identical records and a
+// re-read graph would not match the original. Names are reported with %q so
+// the offending bytes stay visible in the error.
 func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("%w: create the graph map with make before validating", ErrNotInitialized)
 	}
+	// Visit names in sorted order so the first reported problem is stable
+	// regardless of map iteration order.
+	names := make([]string, 0, len(graph))
+	for name := range graph {
+		names = append(names, name)
+	}
+	sort.Strings(names)
 	records := make([]GraphDataset, 0, len(graph))
-	for name, entry := range graph {
+	for _, name := range names {
+		entry := graph[name]
 		if entry == nil {
 			return nil, fmt.Errorf("%w: dataset %q points to a nil lineage node", ErrInvalidArgument, name)
 		}
 		if name == "" {
 			return nil, fmt.Errorf("%w: dataset name is required", ErrInvalidArgument)
+		}
+		if !utf8.ValidString(name) {
+			return nil, fmt.Errorf("%w: dataset name %q is not valid UTF-8 and cannot be exported", ErrInvalidArgument, name)
+		}
+		for _, parent := range entry.Parents {
+			if !utf8.ValidString(parent) {
+				return nil, fmt.Errorf("%w: dataset %q references upstream %q which is not valid UTF-8 and cannot be exported", ErrInvalidArgument, name, parent)
+			}
 		}
 		records = append(records, GraphDataset{Name: name, Upstreams: entry.Parents})
 	}
@@ -92,7 +117,8 @@ func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 }
 
 // ValidateGraph checks the in-memory graph for structural problems: nil nodes,
-// empty names, missing upstreams, and cycles. It does not mutate the graph.
+// empty names, names or upstream references that are not valid UTF-8, missing
+// upstreams, and cycles. It does not mutate the graph.
 //
 // A graph that fails validation cannot be used as the basis for a batch: an
 // adjustment plan must not be allowed to paper over pre-existing corruption.
@@ -435,10 +461,13 @@ func stringSliceEqual(a, b []string) bool {
 
 // MarshalGraphFile serializes the in-memory graph to the on-disk JSON format.
 // The graph must satisfy every structure rule a reader enforces; nil nodes,
-// empty names, missing upstreams, and dependency cycles (including a dataset
-// that lists itself) reject the export with no bytes returned, so a successful
-// result can always be read back with UnmarshalGraphFile. The check is
-// read-only: the in-memory graph is never modified.
+// empty names, names or upstream references that are not valid UTF-8, missing
+// upstreams, and dependency cycles (including a dataset that lists itself)
+// reject the export with no bytes returned, so a successful result can always
+// be read back with UnmarshalGraphFile. An invalid-UTF-8 name is rejected
+// rather than silently rewritten to U+FFFD, which would make the exported
+// records differ from the graph the caller holds. The check is read-only: the
+// in-memory graph is never modified.
 func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 	adj, err := graphAdjacency(graph)
 	if err != nil {

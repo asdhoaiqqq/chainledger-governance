@@ -80,6 +80,10 @@ func computeContentID(canonical []byte) string {
 // BuildSnapshot validates graph and freezes it into a SnapshotFile with format
 // version 1 and the matching content identifier. It does not mutate graph. The
 // returned document and its serialized bytes depend only on graph semantics.
+// A graph whose dataset names or upstream references are not valid UTF-8 is
+// rejected with no snapshot produced: exporting them would silently rewrite
+// the names to U+FFFD, so the frozen bytes (and the content identifier) would
+// no longer describe the graph the caller holds.
 func BuildSnapshot(graph map[string]*Lineage) (*SnapshotFile, error) {
 	if err := ValidateGraph(graph); err != nil {
 		return nil, err
