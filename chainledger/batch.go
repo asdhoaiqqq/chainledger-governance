@@ -470,6 +470,19 @@ func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 // declared twice within the same object — datasets in the graph object, name
 // or upstreams in a dataset record — is ambiguous and rejects the whole file,
 // even when the duplicates carry identical values.
+//
+// Every graph name — each record's name and every upstreams entry — must also
+// survive decoding exactly as written: a raw string literal carrying bytes
+// that are not valid UTF-8, or a \u escape forming an unpaired surrogate,
+// would be silently rewritten to U+FFFD by the decoder, and the corrupted
+// reference could then resolve to a dataset the file never named (an
+// upstream "源" plus a broken escape would read as the root genuinely named
+// "源�"). The whole file is refused instead, naming name versus upstreams and
+// the zero-based record and array positions, even when no name exists for the
+// corruption to collide with. A genuine "�", correctly paired surrogate
+// escapes, and names that merely look like escapes stay legal; unknown
+// fields and their nested strings are not checked. See
+// graph_name_encoding.go.
 func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	if err := checkGraphFileDuplicateFields(data); err != nil {
 		return nil, err
@@ -477,6 +490,9 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	var gf GraphFile
 	if err := json.Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph JSON: %w", err)
+	}
+	if err := checkStandaloneGraphNameEncoding(data); err != nil {
+		return nil, err
 	}
 	adj, err := validateGraphStructureFromFile(gf.Datasets)
 	if err != nil {
