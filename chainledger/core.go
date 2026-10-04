@@ -96,6 +96,64 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	return nil
 }
 
+// Rename changes the registered name of the dataset oldName to newName while
+// keeping the dataset's exact position in the lineage graph: the node keeps
+// its own direct upstream and downstream lists untouched, and every neighbor
+// that referenced oldName now references newName in the same list position.
+// No edge is added, removed, merged or reordered, and the total number of
+// datasets in the graph is unchanged. Roots, leaves and intermediate datasets
+// can all be renamed.
+//
+// The request is validated before the graph is touched, so a rejected rename
+// leaves every node, edge and list order untouched. Names match by exact
+// registered value (case-sensitive). An empty old or new name is rejected as
+// a missing name; an oldName absent from the graph is rejected with an error
+// naming it; a newName already registered to a different dataset is rejected
+// with an error naming it. Renaming a dataset to its own current name is a
+// successful no-op.
+func Rename(graph map[string]*Lineage, oldName, newName string) error {
+	if oldName == "" {
+		return errInvalid("dataset name is required")
+	}
+	if newName == "" {
+		return errInvalid("new dataset name is required")
+	}
+	entry, ok := graph[oldName]
+	if !ok {
+		return errInvalid("dataset not found: " + oldName)
+	}
+	if oldName == newName {
+		return nil
+	}
+	if _, taken := graph[newName]; taken {
+		return errInvalid("dataset name already in use: " + newName)
+	}
+
+	delete(graph, oldName)
+	entry.Dataset = newName
+	graph[newName] = entry
+
+	// Rewire the reverse references in place: the renamed node keeps its slot
+	// in every neighbor's list, so each neighbor's ordering is preserved.
+	for _, parent := range entry.Parents {
+		children := graph[parent].Children
+		for i, child := range children {
+			if child == oldName {
+				children[i] = newName
+			}
+		}
+	}
+	for _, child := range entry.Children {
+		parents := graph[child].Parents
+		for i, parent := range parents {
+			if parent == oldName {
+				parents[i] = newName
+			}
+		}
+	}
+	return nil
+}
+
 // ancestorProbe answers "can node reach target by following parent edges?" for
 // many starting nodes against one fixed, read-only snapshot of the graph, i.e.
 // whether target is among each node's direct or transitive upstreams. Each node
