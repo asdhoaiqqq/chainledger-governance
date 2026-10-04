@@ -187,6 +187,16 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 	}
 
 	var gf GraphFile
+	// The embedded graph obeys exactly the same name-encoding rule as a
+	// standalone graph file: a raw name literal with invalid UTF-8 bytes or an
+	// unpaired surrogate escape would be silently rewritten to U+FFFD, and a
+	// corrupted upstream could then resolve to a genuinely different dataset.
+	// The check runs on the graph's raw bytes and rejects the whole snapshot
+	// even when the declared content identifier happens to match the
+	// rewritten graph's digest. See graph_name_encoding.go.
+	if err := checkGraphNameEncoding(raw.Graph); err != nil {
+		return nil, err
+	}
 	if err := json.Unmarshal(raw.Graph, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph in snapshot: %w", err)
 	}

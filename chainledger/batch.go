@@ -474,6 +474,15 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	if err := checkGraphFileDuplicateFields(data); err != nil {
 		return nil, err
 	}
+	// Every name the graph carries must survive decoding exactly as written:
+	// a raw literal with invalid UTF-8 bytes or an unpaired surrogate escape
+	// would be silently rewritten to U+FFFD by json.Unmarshal, and a corrupted
+	// upstream could then resolve to a genuinely different dataset (an edge
+	// written as "源" plus a lone \uD800 would point at the real dataset
+	// "源�"). See graph_name_encoding.go.
+	if err := checkGraphNameEncoding(data); err != nil {
+		return nil, err
+	}
 	var gf GraphFile
 	if err := json.Unmarshal(data, &gf); err != nil {
 		return nil, fmt.Errorf("invalid graph JSON: %w", err)

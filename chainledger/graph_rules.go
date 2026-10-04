@@ -14,6 +14,14 @@
 //   - a direct self-dependency or any indirect dependency cycle is rejected,
 //     with the datasets on the cycle named;
 //   - names are case-sensitive and surrounding whitespace is kept verbatim;
+//   - every name's RAW string literal must decode faithfully: bytes that are
+//     not valid UTF-8, or a \u escape forming an unpaired surrogate (a lone
+//     high or low surrogate, or a low surrogate before its high surrogate),
+//     reject the whole document — the decoder's U+FFFD rewrite is never kept
+//     and the offending node or edge is never skipped, even when the rewrite
+//     would collide with a real dataset or match the snapshot's declared
+//     content identifier; that raw scan is shared by both graph readers and
+//     lives in graph_name_encoding.go;
 //   - record order and upstream order are irrelevant, duplicate upstreams count
 //     as one relationship, and an empty upstream list marks a root, so an
 //     empty graph stays legal;

@@ -60,7 +60,7 @@ func checkPlanNameEncoding(data []byte) error {
 			switch {
 			case strings.EqualFold(key, "changes"):
 				err := checkArrayElements(dec, func(dec *json.Decoder, index int) error {
-					return checkChangeRecordNameEncoding(dec, index)
+					return checkNameUpstreamsRecordEncoding(dec, index, "changes", "change record")
 				})
 				if err != nil {
 					return err
@@ -85,11 +85,16 @@ func checkPlanNameEncoding(data []byte) error {
 	})
 }
 
-// checkChangeRecordNameEncoding scans one change record of the "changes"
-// array: the raw literals of its "name" value and of every element of its
-// "upstreams" array are checked; every other field is skipped. index is the
-// record's zero-based position, used in error locations.
-func checkChangeRecordNameEncoding(dec *json.Decoder, index int) error {
+// checkNameUpstreamsRecordEncoding scans one record that carries a checked
+// "name" string and a checked "upstreams" string array — a change record in a
+// plan (arrayField "changes", recordKind "change record") or a dataset record
+// in a graph (arrayField "datasets", recordKind "dataset record"). The raw
+// literals of the name and of every upstream element are validated; every
+// other field is skipped. index is the record's zero-based position in its
+// array, used together with the array field and record kind in error
+// locations, so the plan and graph readers can never judge one record shape
+// differently.
+func checkNameUpstreamsRecordEncoding(dec *json.Decoder, index int, arrayField, recordKind string) error {
 	tok, err := scanToken(dec)
 	if err != nil {
 		return err
@@ -104,13 +109,13 @@ func checkChangeRecordNameEncoding(dec *json.Decoder, index int) error {
 		}
 		switch {
 		case strings.EqualFold(key, "name"):
-			location := fmt.Sprintf("field %q in the change record at index %d of %q", "name", index, "changes")
+			location := fmt.Sprintf("field %q in the %s at index %d of %q", "name", recordKind, index, arrayField)
 			if err := checkNameStringEncoding(dec, location); err != nil {
 				return err
 			}
 		case strings.EqualFold(key, "upstreams"):
 			err := checkArrayElements(dec, func(dec *json.Decoder, item int) error {
-				location := fmt.Sprintf("field %q at index %d in the change record at index %d of %q", "upstreams", item, index, "changes")
+				location := fmt.Sprintf("field %q at index %d in the %s at index %d of %q", "upstreams", item, recordKind, index, arrayField)
 				return checkNameStringEncoding(dec, location)
 			})
 			if err != nil {
