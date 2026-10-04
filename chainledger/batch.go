@@ -63,13 +63,22 @@ type BatchReport struct {
 }
 
 // graphAdjacency derives the normalized parent map from the in-memory graph.
-// It rejects nil lineage nodes, empty names, and references to upstreams that
-// are not registered; the name/reference rules are the shared ones from
+// It rejects nil lineage nodes, empty names, names that are not valid UTF-8
+// (dataset names or direct upstream references), and references to upstreams
+// that are not registered; the name/reference rules are the shared ones from
 // normalizeDatasets and validateAdjacencyReferences, also used by the file and
 // snapshot readers. It does not check for cycles; use validateAcyclic for that.
 func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 	if graph == nil {
 		return nil, fmt.Errorf("%w: create the graph map with make before validating", ErrNotInitialized)
+	}
+	// Check encoding before anything that would quote these names or turn them
+	// into JSON: a missing-upstream check must not label an unregistered,
+	// non-UTF-8 upstream as ErrNotFound when the name itself is unusable, and
+	// json.Marshal would silently rewrite an invalid byte into U+FFFD. The
+	// check is read-only and reports the offending raw bytes.
+	if err := validateInMemoryNamesUTF8(graph); err != nil {
+		return nil, err
 	}
 	records := make([]GraphDataset, 0, len(graph))
 	for name, entry := range graph {
@@ -92,7 +101,8 @@ func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 }
 
 // ValidateGraph checks the in-memory graph for structural problems: nil nodes,
-// empty names, missing upstreams, and cycles. It does not mutate the graph.
+// empty names, names that are not valid UTF-8 (dataset names or direct upstream
+// references), missing upstreams, and cycles. It does not mutate the graph.
 //
 // A graph that fails validation cannot be used as the basis for a batch: an
 // adjustment plan must not be allowed to paper over pre-existing corruption.
@@ -435,7 +445,8 @@ func stringSliceEqual(a, b []string) bool {
 
 // MarshalGraphFile serializes the in-memory graph to the on-disk JSON format.
 // The graph must satisfy every structure rule a reader enforces; nil nodes,
-// empty names, missing upstreams, and dependency cycles (including a dataset
+// empty names, names that are not valid UTF-8 (dataset names or direct upstream
+// references), missing upstreams, and dependency cycles (including a dataset
 // that lists itself) reject the export with no bytes returned, so a successful
 // result can always be read back with UnmarshalGraphFile. The check is
 // read-only: the in-memory graph is never modified.

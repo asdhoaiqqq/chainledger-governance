@@ -31,10 +31,50 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // adjacency maps a dataset name to its sorted, duplicate-free parent names.
 type adjacency map[string][]string
+
+// validateInMemoryNamesUTF8 rejects an in-memory graph whose dataset name or
+// direct upstream reference is not valid UTF-8.
+//
+// Such names cannot exist in a file read by the JSON readers (json.Unmarshal
+// replaces invalid bytes with U+FFFD), but they can exist in a graph built
+// through Register or by hand. They must never reach an exporter: encoding/json
+// would silently replace every invalid byte with U+FFFD, so two different
+// names ("p\xff" and "p\xfe") could serialize identically and a re-read graph
+// would no longer be a faithful copy. The whole graph is rejected instead.
+//
+// Nodes are visited in name byte order and each node's parents in their stored
+// order, so the first reported name is stable regardless of map iteration.
+// The offending name is quoted with %q, which keeps the raw bytes readable
+// ("p\xff" differs from "p\xfe", and a genuinely valid "p�" is shown as
+// the replacement character itself). The graph is only read, never modified.
+// Nil lineage nodes are skipped here; the caller rejects those separately.
+func validateInMemoryNamesUTF8(graph map[string]*Lineage) error {
+	names := make([]string, 0, len(graph))
+	for name := range graph {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if !utf8.ValidString(name) {
+			return fmt.Errorf("%w: dataset name %q is not valid UTF-8, so the graph cannot be exported faithfully", ErrInvalidArgument, name)
+		}
+		entry := graph[name]
+		if entry == nil {
+			continue
+		}
+		for _, parent := range entry.Parents {
+			if !utf8.ValidString(parent) {
+				return fmt.Errorf("%w: dataset %q references upstream %q whose name is not valid UTF-8", ErrInvalidArgument, name, parent)
+			}
+		}
+	}
+	return nil
+}
 
 // normalizeDatasets builds the normalized parent adjacency from parsed dataset
 // records. It rejects empty dataset names and datasets declared more than
