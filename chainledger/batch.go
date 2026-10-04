@@ -501,6 +501,20 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 // second declaration spelled "Changes" or "changes" still collides;
 // dataset names themselves stay case-sensitive. Unknown fields keep their
 // ignore-everything behavior and may repeat freely.
+//
+// Every name that takes part in the adjustment — each change record's name,
+// every upstreams entry, and every removals entry — must also survive
+// decoding exactly as written: a raw string literal carrying bytes that are
+// not valid UTF-8, or a \u escape forming an unpaired surrogate, would be
+// silently rewritten to U+FFFD by the decoder, and the corrupted name could
+// then collide with a genuinely different dataset (a removals entry meant
+// for no one could delete the dataset really named "�"). The whole plan is
+// refused instead, naming the field and the zero-based record or array
+// position, even when the corrupted name would only have matched a dataset
+// that does not exist. A genuine "�", correctly paired surrogate escapes,
+// and names that merely look like escapes (a backslash before an ordinary
+// letter) stay legal; unknown fields and their nested strings are not
+// checked. See plan_name_encoding.go.
 func UnmarshalPlan(data []byte) (Plan, error) {
 	var p Plan
 	if err := checkPlanDuplicateFields(data); err != nil {
@@ -508,6 +522,9 @@ func UnmarshalPlan(data []byte) (Plan, error) {
 	}
 	if err := json.Unmarshal(data, &p); err != nil {
 		return p, fmt.Errorf("invalid plan JSON: %w", err)
+	}
+	if err := checkPlanNameEncoding(data); err != nil {
+		return Plan{}, err
 	}
 	return p, nil
 }
