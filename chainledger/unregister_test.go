@@ -385,6 +385,225 @@ func TestUnregisterExactNameMatch(t *testing.T) {
 	assertEntry(t, graph, "raw", nil, nil)
 }
 
+// Product regression for a real migration sequence: the downstream datasets stay
+// registered but switch to another source through same-name re-registration, and
+// removal eligibility must always follow the CURRENT direct dependency set.
+// detail draws from two sources, source-a and source-b, and has two direct
+// downstreams summary and view; replacement is an already registered alternate
+// source. summary derives report (an indirect downstream of detail), and each
+// original source has another downstream unrelated to detail (a-other,
+// b-other). Removing detail must be refused while either direct downstream is
+// still on it, even after one downstream has moved; once both have moved it
+// must succeed although detail itself still has both upstreams. A refusal must
+// neither undo a successful source replacement nor clean detail's edges to its
+// original sources.
+func TestUnregisterEligibilityFollowsCurrentDirectDownstreams(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "source-a")
+	mustRegister(t, graph, "source-b")
+	mustRegister(t, graph, "replacement")
+	// source-a's unrelated downstream is registered before detail, so detail
+	// lands after it in source-a's child list.
+	mustRegister(t, graph, "a-other", "source-a")
+	mustRegister(t, graph, "detail", "source-a", "source-b")
+	// source-b's unrelated downstream is registered after detail, so detail
+	// lands before it in source-b's child list.
+	mustRegister(t, graph, "b-other", "source-b")
+	mustRegister(t, graph, "summary", "detail")
+	mustRegister(t, graph, "report", "summary")
+	mustRegister(t, graph, "view", "detail")
+	assertConsistent(t, graph)
+
+	// Initial lineage, edge by edge: detail has two sources and two direct
+	// downstreams, summary itself feeds report, the alternate source is idle,
+	// and both original sources keep a branch unrelated to detail.
+	assertEntry(t, graph, "source-a", nil, []string{"a-other", "detail"})
+	assertEntry(t, graph, "source-b", nil, []string{"detail", "b-other"})
+	assertEntry(t, graph, "replacement", nil, nil)
+	assertEntry(t, graph, "a-other", []string{"source-a"}, nil)
+	assertEntry(t, graph, "b-other", []string{"source-b"}, nil)
+	assertEntry(t, graph, "detail", []string{"source-a", "source-b"}, []string{"summary", "view"})
+	assertEntry(t, graph, "summary", []string{"detail"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"summary"}, nil)
+	assertEntry(t, graph, "view", []string{"detail"}, nil)
+
+	// Initially detail reaches summary and view directly and report indirectly.
+	initialImpacts := []Impact{
+		{Dataset: "summary", Distance: 1, Path: []string{"detail", "summary"}},
+		{Dataset: "view", Distance: 1, Path: []string{"detail", "view"}},
+		{Dataset: "report", Distance: 2, Path: []string{"detail", "summary", "report"}},
+	}
+	if got := mustImpacts(t, graph, "detail"); !reflect.DeepEqual(got, initialImpacts) {
+		t.Fatalf("initial Impacts(detail) = %v, want %v", got, initialImpacts)
+	}
+
+	// First removal attempt: detail has direct downstreams, so it is refused
+	// with an error naming it and its remaining downstreams; every node, edge
+	// and list order is preserved.
+	before := snapshot(graph)
+	err := Unregister(graph, "detail")
+	if err == nil {
+		t.Fatal("first Unregister(detail): expected rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "detail") || !strings.Contains(err.Error(), "downstream") {
+		t.Fatalf("first Unregister(detail): want error naming detail and its downstream, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("first refusal changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	if got, want := len(graph), 9; got != want {
+		t.Fatalf("dataset count = %d, want %d; graph=%v", got, want, graph)
+	}
+	assertEntry(t, graph, "detail", []string{"source-a", "source-b"}, []string{"summary", "view"})
+	assertConsistent(t, graph)
+
+	// Move ONLY summary: replace its whole direct-upstream list with the
+	// alternate source. summary and report survive; view still depends on
+	// detail.
+	mustRegister(t, graph, "summary", "replacement")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "summary", []string{"replacement"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"summary"}, nil)
+	assertEntry(t, graph, "replacement", nil, []string{"summary"})
+	assertEntry(t, graph, "view", []string{"detail"}, nil)
+	assertEntry(t, graph, "detail", []string{"source-a", "source-b"}, []string{"view"})
+	assertEntry(t, graph, "source-a", nil, []string{"a-other", "detail"})
+	assertEntry(t, graph, "source-b", nil, []string{"detail", "b-other"})
+
+	// After moving summary, detail's impact scope contains only view; report
+	// is no longer reached through detail.
+	afterSummaryMoved := mustImpacts(t, graph, "detail")
+	if got, want := impactNames(afterSummaryMoved), []string{"view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("Impacts(detail) after moving summary = %v, want %v", got, want)
+	}
+	assertImpact(t, afterSummaryMoved, "view", 1, []string{"detail", "view"})
+	// The alternate source now feeds summary and, through it, report.
+	movedSummaryImpacts := mustImpacts(t, graph, "replacement")
+	wantMovedSummaryImpacts := []Impact{
+		{Dataset: "summary", Distance: 1, Path: []string{"replacement", "summary"}},
+		{Dataset: "report", Distance: 2, Path: []string{"replacement", "summary", "report"}},
+	}
+	if !reflect.DeepEqual(movedSummaryImpacts, wantMovedSummaryImpacts) {
+		t.Fatalf("Impacts(replacement) after moving summary = %v, want %v",
+			movedSummaryImpacts, wantMovedSummaryImpacts)
+	}
+
+	// Moving just one downstream must not make removal legal early: detail
+	// still has view as a direct downstream.
+	afterSummarySnapshot := snapshot(graph)
+	err = Unregister(graph, "detail")
+	if err == nil || !strings.Contains(err.Error(), "detail") || !strings.Contains(err.Error(), "downstream") {
+		t.Fatalf("second Unregister(detail): want downstream error naming detail, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), afterSummarySnapshot) {
+		t.Fatalf("second refusal changed graph: before=%v after=%v",
+			afterSummarySnapshot, snapshot(graph))
+	}
+
+	// The refusal must not undo the successful replacement ...
+	assertEntry(t, graph, "summary", []string{"replacement"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"summary"}, nil)
+	assertEntry(t, graph, "replacement", nil, []string{"summary"})
+	// ... nor clean any edge between detail and the two original sources.
+	assertEntry(t, graph, "detail", []string{"source-a", "source-b"}, []string{"view"})
+	assertEntry(t, graph, "source-a", nil, []string{"a-other", "detail"})
+	assertEntry(t, graph, "source-b", nil, []string{"detail", "b-other"})
+	assertEntry(t, graph, "view", []string{"detail"}, nil)
+	assertConsistent(t, graph)
+
+	// Move view to the alternate source the same way. detail now has no direct
+	// downstream, although it still has both direct upstreams.
+	mustRegister(t, graph, "view", "replacement")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "view", []string{"replacement"}, nil)
+	assertEntry(t, graph, "replacement", nil, []string{"summary", "view"})
+	assertEntry(t, graph, "detail", []string{"source-a", "source-b"}, nil)
+
+	// Removal now succeeds despite detail's own two upstreams.
+	mustUnregister(t, graph, "detail")
+	if _, ok := graph["detail"]; ok {
+		t.Fatal("detail registration still present after Unregister")
+	}
+	if got, want := len(graph), 8; got != want {
+		t.Fatalf("dataset count = %d, want %d; graph=%v", got, want, graph)
+	}
+
+	// Both original sources lose detail from their downstream lists, and the
+	// surviving names keep their original relative order (detail sat at the end
+	// of source-a's list and at the start of source-b's).
+	assertEntry(t, graph, "source-a", nil, []string{"a-other"})
+	assertEntry(t, graph, "source-b", nil, []string{"b-other"})
+	assertEntry(t, graph, "a-other", []string{"source-a"}, nil)
+	assertEntry(t, graph, "b-other", []string{"source-b"}, nil)
+
+	// summary, view, report and the alternate source all survive, and the new
+	// dependencies are exactly as established; the unrelated branches are not
+	// deleted or rewritten.
+	assertEntry(t, graph, "summary", []string{"replacement"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"summary"}, nil)
+	assertEntry(t, graph, "view", []string{"replacement"}, nil)
+	assertEntry(t, graph, "replacement", nil, []string{"summary", "view"})
+	assertConsistent(t, graph)
+
+	// Lineage queries describe the new graph. The two original sources no
+	// longer reach any of these datasets through detail; each shows only its
+	// own unrelated branch.
+	if got := mustImpacts(t, graph, "source-a"); !reflect.DeepEqual(got, []Impact{
+		{Dataset: "a-other", Distance: 1, Path: []string{"source-a", "a-other"}},
+	}) {
+		t.Fatalf("Impacts(source-a) after removal = %v, want only a-other", got)
+	}
+	if got := mustImpacts(t, graph, "source-b"); !reflect.DeepEqual(got, []Impact{
+		{Dataset: "b-other", Distance: 1, Path: []string{"source-b", "b-other"}},
+	}) {
+		t.Fatalf("Impacts(source-b) after removal = %v, want only b-other", got)
+	}
+
+	// The alternate source affects summary and view at distance 1 and report
+	// at distance 2 through summary, ordered by distance then name.
+	finalImpacts := mustImpacts(t, graph, "replacement")
+	wantFinalImpacts := []Impact{
+		{Dataset: "summary", Distance: 1, Path: []string{"replacement", "summary"}},
+		{Dataset: "view", Distance: 1, Path: []string{"replacement", "view"}},
+		{Dataset: "report", Distance: 2, Path: []string{"replacement", "summary", "report"}},
+	}
+	if !reflect.DeepEqual(finalImpacts, wantFinalImpacts) {
+		t.Fatalf("Impacts(replacement) after removal = %v, want %v", finalImpacts, wantFinalImpacts)
+	}
+
+	// report's provenance still traces through summary to the alternate
+	// source, with the established distances and explanation paths.
+	finalUpstreams := mustUpstreams(t, graph, "report")
+	wantFinalUpstreams := []Upstream{
+		{Dataset: "summary", Distance: 1, Path: []string{"summary", "report"}},
+		{Dataset: "replacement", Distance: 2, Path: []string{"replacement", "summary", "report"}},
+	}
+	if !reflect.DeepEqual(finalUpstreams, wantFinalUpstreams) {
+		t.Fatalf("Upstreams(report) after removal = %v, want %v", finalUpstreams, wantFinalUpstreams)
+	}
+
+	// Querying the removed name is an unregistered error, never a successful
+	// empty result, in either query direction; removing it again fails the
+	// same way.
+	if impacts, err := Impacts(graph, "detail"); err == nil {
+		t.Fatalf("Impacts(detail) after removal: want not-found error, got %v", impacts)
+	} else if !strings.Contains(err.Error(), "detail") {
+		t.Fatalf("Impacts(detail) after removal: want error naming detail, got %v", err)
+	} else if impacts != nil {
+		t.Fatalf("Impacts(detail) after removal: want nil results, got %v", impacts)
+	}
+	if upstreams, err := Upstreams(graph, "detail"); err == nil {
+		t.Fatalf("Upstreams(detail) after removal: want not-found error, got %v", upstreams)
+	} else if !strings.Contains(err.Error(), "detail") {
+		t.Fatalf("Upstreams(detail) after removal: want error naming detail, got %v", err)
+	} else if upstreams != nil {
+		t.Fatalf("Upstreams(detail) after removal: want nil results, got %v", upstreams)
+	}
+	if err := Unregister(graph, "detail"); err == nil || !strings.Contains(err.Error(), "detail") {
+		t.Fatalf("second Unregister(detail): want not-found error naming detail, got %v", err)
+	}
+}
+
 // After a successful removal, registration under the freed name starts a
 // completely fresh dataset, and the rest of the lineage keeps working.
 func TestUnregisterThenRegisterFresh(t *testing.T) {
