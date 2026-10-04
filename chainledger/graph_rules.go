@@ -23,7 +23,8 @@
 //
 // The snapshot-only envelope rules (required fields, format version, content
 // identifier, and duplicates of the snapshot's own fields) live in
-// snapshot.go; this file is only the common graph structure.
+// snapshot.go; the repeated-known-field scan itself lives in
+// duplicate_fields.go; this file is only the common graph structure.
 package chainledger
 
 import (

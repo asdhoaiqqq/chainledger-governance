@@ -13,7 +13,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -210,186 +209,32 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 	}, nil
 }
 
-// errAbortScan stops the duplicate-field scan when the document is too
-// malformed to keep walking; the regular parse then reports the syntax or
-// type error instead.
-var errAbortScan = errors.New("chainledger: abort duplicate field scan")
-
 // checkDuplicateFields rejects a snapshot in which a known field is declared
 // more than once within the same object: formatVersion, contentId, and graph
 // at the top level, datasets inside graph, and name and upstreams inside each
-// dataset record. A repeated field is ambiguous — the reader would silently
-// keep only one declaration — so the whole snapshot is refused even when the
-// duplicates carry identical values, the first is null, or the surviving value
-// would pass every other check.
-//
-// The decoder uses UseNumber so numbers are kept verbatim instead of being
-// converted to float64: a perfectly legal JSON number outside the float64
-// range (such as 1e400), even one buried in an ignored unknown field's value,
-// must not make the decoder error out and abort the whole scan — otherwise an
-// unrelated large number placed before a repeated known field would hide that
-// duplication. Malformed number syntax still fails and is left to the regular
-// parse to report.
-//
-// Field names are compared after JSON string unescaping and with the same
-// Unicode simple case-folding the decoder applies to its case-insensitive
-// field lookup (equivalent to strings.EqualFold), so "name", "Name", and
-// "name" all collide, and so do spellings that only differ in a fold
-// equivalent rune such as "formatVerſion" (long s) and "formatVersion".
-// Unknown fields keep their ignore-everything behavior and may repeat freely.
-// Documents that are not shaped like a snapshot at all are left to the
-// regular parse, which reports the structural problem.
+// dataset record. The scan itself — UseNumber decoding, case-folded key
+// matching, abort-on-malformed — is the shared one from duplicate_fields.go,
+// so a snapshot is judged by exactly the same repeated-field rule as a graph
+// file or a plan, and an oversized number buried in an ignored unknown field
+// cannot hide a later duplicate. Documents that are not shaped like a
+// snapshot at all are left to the regular parse, which reports the structural
+// problem.
 func checkDuplicateFields(data []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	err := checkTopLevelObject(dec)
-	if errors.Is(err, errAbortScan) {
-		return nil
-	}
-	return err
-}
-
-// checkGraphFileDuplicateFields applies the same repeated-known-field rule to
-// a standalone graph file: datasets may be declared only once in the
-// top-level graph object, and name and upstreams only once in each dataset
-// record. This keeps UnmarshalGraphFile in lockstep with ParseSnapshot, which
-// runs the identical scan on the embedded graph, so preview, apply, and
-// snapshot can never disagree about a graph file that repeats a known field.
-func checkGraphFileDuplicateFields(data []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	err := checkGraphValue(dec, "at the top level of the graph")
-	if errors.Is(err, errAbortScan) {
-		return nil
-	}
-	return err
+	return scanForDuplicateFields(data, checkTopLevelObject)
 }
 
 // checkTopLevelObject scans the top-level snapshot object for repeated
 // formatVersion/contentId/graph declarations, descending into graph values.
 func checkTopLevelObject(dec *json.Decoder) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil // not an object: the regular parse reports the type error
-	}
-	seen := make(map[string]bool, 3)
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		field, known := snapshotField(key)
-		if known {
-			if seen[field] {
-				return duplicateFieldError(field, "at the top level of the snapshot")
-			}
-			seen[field] = true
-		}
-		if field == "graph" {
-			if err := checkGraphValue(dec, `in "graph"`); err != nil {
-				return err
-			}
-		} else if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
-}
-
-// checkGraphValue scans one graph value for a repeated datasets declaration,
-// descending into each dataset record of the datasets array. location names
-// the graph object itself in the duplicate error ("in \"graph\"" when the
-// graph is embedded in a snapshot, the top-level description for a standalone
-// graph file).
-func checkGraphValue(dec *json.Decoder, location string) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		// Not an object (null, array, scalar): consume any remainder and let
-		// the regular parse report the type problem.
-		return skipRest(dec, tok)
-	}
-	seen := false
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		if strings.EqualFold(key, "datasets") {
-			if seen {
-				return duplicateFieldError("datasets", location)
-			}
-			seen = true
-			if err := checkDatasetsValue(dec); err != nil {
-				return err
-			}
-		} else if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
-}
-
-// checkDatasetsValue scans one datasets array, checking every record that is
-// an object for repeated name/upstreams declarations.
-func checkDatasetsValue(dec *json.Decoder) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-		return skipRest(dec, tok) // not an array: the regular parse reports it
-	}
-	for index := 0; dec.More(); index++ {
-		if err := checkDatasetRecord(dec, index); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing ']'
-	return err
-}
-
-// checkDatasetRecord scans one element of the datasets array. If it is an
-// object, name and upstreams must each be declared at most once.
-func checkDatasetRecord(dec *json.Decoder, index int) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return skipRest(dec, tok) // not an object: the regular parse reports it
-	}
-	seen := make(map[string]bool, 2)
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		if field, known := datasetField(key); known {
-			if seen[field] {
-				return duplicateFieldError(field, fmt.Sprintf("in the dataset record at index %d of \"datasets\"", index))
-			}
-			seen[field] = true
-		}
-		if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
-}
-
-// duplicateFieldError reports a known field declared twice, naming the field
-// and where in the document the repetition occurred.
-func duplicateFieldError(field, location string) error {
-	return fmt.Errorf("%w: field %q is declared more than once %s", ErrInvalidArgument, field, location)
+	return checkObjectValue(dec, objectSpec{
+		field:    snapshotField,
+		location: "at the top level of the snapshot",
+		descend: map[string]func(dec *json.Decoder) error{
+			"graph": func(dec *json.Decoder) error {
+				return checkGraphValue(dec, `in "graph"`)
+			},
+		},
+	})
 }
 
 // snapshotField maps a top-level key to the canonical name of the snapshot
@@ -404,88 +249,6 @@ func snapshotField(key string) (string, bool) {
 		return "graph", true
 	}
 	return "", false
-}
-
-// datasetField maps a dataset-record key to the canonical name of the record
-// field it selects, matching the decoder's case-insensitive field lookup.
-func datasetField(key string) (string, bool) {
-	switch {
-	case strings.EqualFold(key, "name"):
-		return "name", true
-	case strings.EqualFold(key, "upstreams"):
-		return "upstreams", true
-	}
-	return "", false
-}
-
-// scanToken reads one token; any decode failure aborts the scan so the
-// regular parse can report the malformed document.
-func scanToken(dec *json.Decoder) (json.Token, error) {
-	tok, err := dec.Token()
-	if err != nil {
-		return nil, errAbortScan
-	}
-	return tok, nil
-}
-
-// scanKey reads the next key of the object currently being walked.
-func scanKey(dec *json.Decoder) (string, error) {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return "", err
-	}
-	key, ok := tok.(string)
-	if !ok {
-		return "", errAbortScan
-	}
-	return key, nil
-}
-
-// skipValue consumes one complete JSON value.
-func skipValue(dec *json.Decoder) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	return skipRest(dec, tok)
-}
-
-// skipRest consumes the remainder of a value whose first token is tok.
-func skipRest(dec *json.Decoder, tok json.Token) error {
-	delim, ok := tok.(json.Delim)
-	if !ok {
-		return nil // scalar, fully consumed already
-	}
-	var closer json.Delim
-	switch delim {
-	case '{':
-		closer = '}'
-		for dec.More() {
-			if _, err := scanKey(dec); err != nil {
-				return err
-			}
-			if err := skipValue(dec); err != nil {
-				return err
-			}
-		}
-	case '[':
-		closer = ']'
-		for dec.More() {
-			if err := skipValue(dec); err != nil {
-				return err
-			}
-		}
-	default:
-		return errAbortScan
-	}
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if end, ok := tok.(json.Delim); !ok || end != closer {
-		return errAbortScan
-	}
-	return nil
 }
 
 // CompareSnapshots returns the fixed-direction diff from old to new. Both
