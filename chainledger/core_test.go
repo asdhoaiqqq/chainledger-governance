@@ -2618,3 +2618,300 @@ func TestRenameThenRegister(t *testing.T) {
 		t.Fatalf("dataset count = %d, want %d", got, want)
 	}
 }
+
+func mustUnregister(t *testing.T, graph map[string]*Lineage, name string) {
+	t.Helper()
+	if err := Unregister(graph, name); err != nil {
+		t.Fatalf("Unregister(%s): %v", name, err)
+	}
+}
+
+// The worked example from the spec: raw derives detail, detail derives report
+// and view. Removing report deletes its registration, drops it from detail's
+// children, and leaves view's position and dependencies intact. From raw the
+// impact scope still reaches detail and view but no longer report; from view the
+// sources still trace back to detail and raw with unchanged distances and
+// explanation paths.
+func TestUnregisterSpecExample(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"detail", "raw"},
+		{"report", "detail"},
+		{"view", "detail"},
+	})
+	assertConsistent(t, graph)
+
+	mustUnregister(t, graph, "report")
+
+	if _, ok := graph["report"]; ok {
+		t.Fatal("report registration still present after unregister")
+	}
+	assertEntry(t, graph, "detail", []string{"raw"}, []string{"view"})
+	assertEntry(t, graph, "raw", nil, []string{"detail"})
+	assertEntry(t, graph, "view", []string{"detail"}, nil)
+	assertConsistent(t, graph)
+	if got, want := len(graph), 3; got != want {
+		t.Fatalf("dataset count = %d, want %d", got, want)
+	}
+
+	// From raw, detail and view are still downstream; report is gone.
+	impacts := mustImpacts(t, graph, "raw")
+	if got, want := impactNames(impacts), []string{"detail", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impacts from raw = %v, want %v", got, want)
+	}
+	assertImpact(t, impacts, "detail", 1, []string{"raw", "detail"})
+	assertImpact(t, impacts, "view", 2, []string{"raw", "detail", "view"})
+
+	// From view, detail and raw are still reachable with the same distances
+	// and explanation paths as before the removal.
+	upstreams := mustUpstreams(t, graph, "view")
+	if got, want := upstreamNames(upstreams), []string{"detail", "raw"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("upstreams of view = %v, want %v", got, want)
+	}
+	assertUpstream(t, upstreams, "detail", 1, []string{"detail", "view"})
+	assertUpstream(t, upstreams, "raw", 2, []string{"raw", "detail", "view"})
+
+	// The removed name is answered as unregistered by both lineage queries.
+	if _, err := Impacts(graph, "report"); err == nil || !strings.Contains(err.Error(), "report") {
+		t.Fatalf("Impacts(report) after removal: want not-found error naming report, got %v", err)
+	}
+	if _, err := Upstreams(graph, "report"); err == nil || !strings.Contains(err.Error(), "report") {
+		t.Fatalf("Upstreams(report) after removal: want not-found error naming report, got %v", err)
+	}
+}
+
+// When the removed dataset depends on several direct upstreams, every one of
+// them loses the reverse reference; the upstreams themselves and their other
+// downstreams survive, and the remaining entries keep their relative order.
+func TestUnregisterCleansAllDirectUpstreams(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"srcA"},
+		{"srcB"},
+		{"srcC"},
+		// srcA also feeds a sibling of the removed dataset.
+		{"sibling", "srcA"},
+		// report depends on all three sources.
+		{"report", "srcA", "srcB", "srcC"},
+	})
+	assertConsistent(t, graph)
+
+	mustUnregister(t, graph, "report")
+
+	if _, ok := graph["report"]; ok {
+		t.Fatal("report still present after unregister")
+	}
+	// srcA keeps sibling; report is gone from its children, with sibling's
+	// relative position untouched.
+	assertEntry(t, graph, "srcA", nil, []string{"sibling"})
+	assertEntry(t, graph, "srcB", nil, nil)
+	assertEntry(t, graph, "srcC", nil, nil)
+	assertEntry(t, graph, "sibling", []string{"srcA"}, nil)
+	assertConsistent(t, graph)
+}
+
+// Removing a leaf must preserve the relative order of the names left in each
+// upstream's children list and must leave unrelated nodes' lists exactly as
+// they were.
+func TestUnregisterPreservesListOrderAndUnrelatedLists(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"side"},
+		{"keep1", "raw"},
+		{"gone", "raw", "side"},
+		{"keep2", "raw"},
+		{"s1", "side"},
+	})
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "raw", nil, []string{"keep1", "gone", "keep2"})
+	assertEntry(t, graph, "side", nil, []string{"gone", "s1"})
+	before := snapshot(graph)
+
+	mustUnregister(t, graph, "gone")
+	if reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatal("removal changed nothing; expected gone to be deleted")
+	}
+
+	// raw's children keep their relative order with gone dropped.
+	assertEntry(t, graph, "raw", nil, []string{"keep1", "keep2"})
+	// side's list loses gone while s1 stays in place; side itself survives.
+	assertEntry(t, graph, "side", nil, []string{"s1"})
+	assertEntry(t, graph, "s1", []string{"side"}, nil)
+	assertEntry(t, graph, "keep1", []string{"raw"}, nil)
+	assertEntry(t, graph, "keep2", []string{"raw"}, nil)
+	assertConsistent(t, graph)
+
+	// Nodes not directly connected to gone are byte-for-byte unchanged.
+	for _, name := range []string{"keep1", "keep2", "s1"} {
+		if !sameStrings(graph[name].Parents, before.parents[name]) ||
+			!sameStrings(graph[name].Children, before.children[name]) {
+			t.Errorf("%s lists changed: parents %v->%v children %v->%v",
+				name, before.parents[name], graph[name].Parents,
+				before.children[name], graph[name].Children)
+		}
+	}
+}
+
+// An isolated dataset with neither upstreams nor downstreams is removed
+// successfully.
+func TestUnregisterIsolatedDataset(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "lonely")
+	mustRegister(t, graph, "other")
+
+	mustUnregister(t, graph, "lonely")
+	if _, ok := graph["lonely"]; ok {
+		t.Fatal("isolated dataset still present after unregister")
+	}
+	assertEntry(t, graph, "other", nil, nil)
+	if got, want := len(graph), 1; got != want {
+		t.Fatalf("dataset count = %d, want %d", got, want)
+	}
+	if _, err := Impacts(graph, "lonely"); err == nil || !strings.Contains(err.Error(), "lonely") {
+		t.Fatalf("removed isolated dataset must query as unregistered, got %v", err)
+	}
+}
+
+// A dataset that still has a direct downstream cannot be removed, regardless of
+// its own upstreams. The error names it and states that downstreams remain, and
+// the refusal is atomic: every node, edge and list order is preserved.
+func TestUnregisterRejectedWithDownstreamIsAtomic(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"detail", "raw"},
+		{"report", "detail"},
+		{"view", "report"},
+	})
+	before := snapshot(graph)
+
+	// detail has report as a direct downstream and cannot be removed.
+	err := Unregister(graph, "detail")
+	if err == nil {
+		t.Fatal("expected rejection for dataset with downstreams, got nil")
+	}
+	if !strings.Contains(err.Error(), "detail") {
+		t.Errorf("error %q should name the dataset detail", err.Error())
+	}
+	if !strings.Contains(err.Error(), "downstream") {
+		t.Errorf("error %q should state that direct downstreams remain", err.Error())
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("rejected unregister changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	assertEntry(t, graph, "raw", nil, []string{"detail"})
+	assertEntry(t, graph, "detail", []string{"raw"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"detail"}, []string{"view"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertConsistent(t, graph)
+
+	// A root that feeds someone is likewise refused.
+	if err := Unregister(graph, "raw"); err == nil ||
+		!strings.Contains(err.Error(), "raw") || !strings.Contains(err.Error(), "downstream") {
+		t.Fatalf("root with downstream: want naming error, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("second rejection changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+
+	// After the downstream itself is removed first, the formerly refused
+	// dataset can now be removed; the refusal left no partial detachment behind.
+	mustUnregister(t, graph, "view")
+	assertEntry(t, graph, "report", []string{"detail"}, nil)
+	mustUnregister(t, graph, "report")
+	mustUnregister(t, graph, "detail")
+	assertEntry(t, graph, "raw", nil, nil)
+	if _, ok := graph["detail"]; ok {
+		t.Fatal("detail should be removable once its downstream is gone")
+	}
+}
+
+// Validation errors: empty name reports a missing name; a non-empty
+// unregistered name is named in the error; empty and nil graphs behave the same
+// as unregistered.
+func TestUnregisterErrors(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "a")
+
+	if err := Unregister(graph, ""); err == nil ||
+		!strings.Contains(err.Error(), "name is required") {
+		t.Fatalf("empty name: want required-name error, got %v", err)
+	}
+	if err := Unregister(graph, "ghost"); err == nil ||
+		!strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("unknown name: want error naming ghost, got %v", err)
+	}
+	if err := Unregister(map[string]*Lineage{}, "ghost"); err == nil ||
+		!strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("empty graph: want not-found error naming ghost, got %v", err)
+	}
+	if err := Unregister(nil, "ghost"); err == nil ||
+		!strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("nil graph: want not-found error naming ghost, got %v", err)
+	}
+
+	// Nothing registered was affected by the failed requests.
+	assertEntry(t, graph, "a", nil, nil)
+	assertConsistent(t, graph)
+}
+
+// Names match by exact registered value and are case-sensitive.
+func TestUnregisterExactNameMatch(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "raw")
+	mustRegister(t, graph, "RAW")
+
+	if err := Unregister(graph, "RaW"); err == nil ||
+		!strings.Contains(err.Error(), "RaW") {
+		t.Fatalf("case-insensitive match: want error naming RaW, got %v", err)
+	}
+	assertEntry(t, graph, "raw", nil, nil)
+	assertEntry(t, graph, "RAW", nil, nil)
+
+	mustUnregister(t, graph, "RAW")
+	if _, ok := graph["RAW"]; ok {
+		t.Fatal("RAW should be gone")
+	}
+	if _, ok := graph["raw"]; !ok {
+		t.Fatal("raw, differing only by case, must remain registered")
+	}
+	assertConsistent(t, graph)
+}
+
+// After removing a leaf, the remaining lineage queries describe exactly the
+// surviving graph, including a multi-source leaf whose sources keep their other
+// downstreams and whose sibling leaf stays fully connected.
+func TestUnregisterLeafQueriesReflectSurvivingGraph(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"raw"},
+		{"other"},
+		{"detail", "raw"},
+		{"report", "detail", "other"},
+		{"view", "detail"},
+	})
+	assertConsistent(t, graph)
+
+	mustUnregister(t, graph, "report")
+
+	// raw still reaches detail and view; report is gone.
+	fromRaw := mustImpacts(t, graph, "raw")
+	if got, want := impactNames(fromRaw), []string{"detail", "view"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("impacts from raw = %v, want %v", got, want)
+	}
+	assertImpact(t, fromRaw, "view", 2, []string{"raw", "detail", "view"})
+
+	// other loses report and answers with an empty (non-nil) downstream list.
+	fromOther, err := Impacts(graph, "other")
+	if err != nil {
+		t.Fatalf("Impacts(other): %v", err)
+	}
+	if fromOther == nil || len(fromOther) != 0 {
+		t.Fatalf("want empty non-nil list from other, got %v", fromOther)
+	}
+
+	// view still traces both hops back to raw.
+	upstreams := mustUpstreams(t, graph, "view")
+	assertUpstreamOnce(t, upstreams, "raw", 2, []string{"raw", "detail", "view"})
+	if names := upstreamNames(upstreams); slices.Contains(names, "report") || slices.Contains(names, "other") {
+		t.Fatalf("removed node or its unrelated source leaked into view's upstreams: %v", names)
+	}
+	assertConsistent(t, graph)
+}

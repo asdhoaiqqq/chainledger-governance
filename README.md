@@ -382,6 +382,34 @@ if err := chainledger.Rename(graph, "a", "z"); err != nil {
 // 最短说明路径按新名称重新计算为 [source b report]（b < z）。
 ```
 
+## 注销数据集（Go 库）
+
+`chainledger.Unregister(graph, name)` 从调用方传入的当前内存血缘图中移除数据集 `name` 的登记。成功返回 `nil`；不满足条件时返回说明原因的错误，图保持原样。
+
+注销规则：
+
+- **只允许移除没有任何直接下游的数据集，无论它有没有上游。** 仍被其他数据集直接依赖的登记必须保留：此时返回错误并在信息中指出待移除名称、说明它仍有下游（如 `dataset detail cannot be unregistered: it still has direct downstream datasets`）。要移除中间数据集，先移除（或重新登记）依赖它的下游。
+- **清理覆盖被移除数据集的全部直接上游。** 节点删除的同时，它的每个直接上游都会从自己的下游列表中去掉该名称；上游节点本身及其其他下游继续存在。各列表中剩余名称的相对顺序不变，未直接连接该数据集的节点，其上下游列表原样保留。
+- **既无上游也无下游的独立数据集也能成功移除。**
+- **成功后不留空节点。** 用已移除名称调用 `Impacts`、`Upstreams` 都按未登记处理（`dataset not found: <名称>`），之后也可以用该名称重新 `Register`。
+- **拒绝是原子的。** 仍有下游时不会出现“上游反向边已断开而节点仍在”的部分修改：图中所有节点、关系和列表顺序与调用前完全一致。
+- 名称为空时返回缺少名称的错误（`dataset name is required`）；非空名称未登记时错误中指出该名称（`dataset not found: ghost`），空图或 nil 图同样按未登记处理。名称按登记值精确匹配，区分大小写。
+
+```go
+graph := map[string]*chainledger.Lineage{}
+// raw -> detail；detail 再派生 report 和 view；report 还依赖另一个来源 other
+// （登记顺序略）。
+if err := chainledger.Unregister(graph, "report"); err != nil {
+	fmt.Println(err) // 仍有下游时才会走到这里
+	return
+}
+// report 的登记消失；detail 的下游只剩 view，other 解除对 report 的反向引用，
+// other 本身及其其他下游仍在。从 raw 查询仍能得到 detail 和 view，但不再有 report；
+// 从 view 追查来源仍能到达 detail 和 raw，最短距离与说明路径含义不变。
+```
+
+注销只通过 Go 库使用，命令行继续只提供 `demo`、`version`、`help` 三个固定入口。
+
 ## 技术方向
 
 blockchain-indexer, data-lineage, onchain-data, data-pipeline, data-indexer, analytics

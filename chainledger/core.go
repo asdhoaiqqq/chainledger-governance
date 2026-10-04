@@ -154,6 +154,52 @@ func Rename(graph map[string]*Lineage, oldName, newName string) error {
 	return nil
 }
 
+// Unregister removes a dataset's registration from the in-memory lineage graph
+// passed by the caller.
+//
+// Only a dataset with no direct downstreams can be removed, whether or not it
+// has upstreams: the node is deleted and every one of its direct upstreams
+// drops it from that upstream's children list, preserving the remaining
+// entries' relative order. An isolated dataset with neither upstreams nor
+// downstreams can be removed as well, and an upstream that fed the removed
+// dataset alongside other downstreams loses just this one reverse reference —
+// the upstream itself and its other downstreams stay.
+//
+// A registration still depended on by another dataset is kept: the request is
+// rejected with an error naming the dataset and stating that it still has
+// downstreams. The check runs before the graph is touched, so a refusal leaves
+// every node, edge and list order exactly as it was — no upstream can end up
+// disconnected while the node survives.
+//
+// Names match by exact registered value (case-sensitive). An empty name is
+// rejected as a missing name; a name absent from the graph — including against
+// an empty or nil graph — is rejected with an error naming it. After a
+// successful removal, Impacts and Upstreams called with the removed name are
+// answered as unregistered; no empty node remains queryable.
+func Unregister(graph map[string]*Lineage, name string) error {
+	if name == "" {
+		return errInvalid("dataset name is required")
+	}
+	entry, ok := graph[name]
+	if !ok {
+		return errInvalid("dataset not found: " + name)
+	}
+	if len(entry.Children) > 0 {
+		return errInvalid("dataset " + name + " cannot be unregistered: it still has direct downstream datasets")
+	}
+
+	// The child check above guarantees no downstream references this node, so
+	// the only edges touching it are the reverse edges held by its upstreams.
+	// Drop those first (in place, order preserved), then delete the node.
+	for _, parent := range entry.Parents {
+		if p, ok := graph[parent]; ok {
+			p.Children = removeChild(p.Children, name)
+		}
+	}
+	delete(graph, name)
+	return nil
+}
+
 // ancestorProbe answers "can node reach target by following parent edges?" for
 // many starting nodes against one fixed, read-only snapshot of the graph, i.e.
 // whether target is among each node's direct or transitive upstreams. Each node
