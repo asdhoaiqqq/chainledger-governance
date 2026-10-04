@@ -469,10 +469,17 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	return lineageFromAdjacency(adj), nil
 }
 
-// UnmarshalPlan parses the plan JSON. The plan structure (empty names,
-// duplicate declarations) is validated later by computeBatch so that preview
-// and apply share identical rejection behavior.
+// UnmarshalPlan parses the plan JSON. A known field declared twice within the
+// same object — changes or removals at the top level, name or upstreams in a
+// change record — is ambiguous (the decode would silently keep only one
+// declaration), so the whole plan is rejected here, before any adjustment is
+// computed; the check is shared by preview and apply. The remaining plan
+// structure (empty names, duplicate declarations) is validated later by
+// computeBatch so that preview and apply share identical rejection behavior.
 func UnmarshalPlan(data []byte) (Plan, error) {
+	if err := checkPlanFileDuplicateFields(data); err != nil {
+		return Plan{}, err
+	}
 	var p Plan
 	if err := json.Unmarshal(data, &p); err != nil {
 		return p, fmt.Errorf("invalid plan JSON: %w", err)
