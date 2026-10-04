@@ -298,15 +298,56 @@ type Impact struct {
 // i.e. every dataset reachable from origin by following child edges. The origin
 // itself is never listed, and datasets with no such connection never appear.
 //
-// Distance, the tie-broken explanation path, result ordering, read-only graph
-// access and error handling all follow the single shared lineage-query rule
-// set implemented by traceLineage; only the direction is specific to Impacts:
+// Impacts is exactly the no-cutoff form of ImpactsWithCutoffs: it behaves as if
+// every registered dataset were allowed to propagate. Distance, the
+// tie-broken explanation path, result ordering, read-only graph access and
+// error handling all follow the single shared lineage-query rule set
+// implemented by traceLineage; only the direction is specific to Impacts:
 // child edges outward, with paths written from the origin. An empty origin is
 // rejected as a missing name; an origin absent from the graph (including an
 // empty or nil graph) is rejected with an error naming it and no partial
 // results.
 func Impacts(graph map[string]*Lineage, origin string) ([]Impact, error) {
-	hits, err := traceLineage(graph, origin, dirDownstream)
+	return ImpactsWithCutoffs(graph, origin, nil)
+}
+
+// ImpactsWithCutoffs returns every dataset downstream of origin that is still
+// reachable when propagation is stopped at the registered datasets named in
+// cutoffs. It answers "how far does a change to origin spread if the change is
+// not allowed to travel past these datasets?"
+//
+// A cutoff dataset that is itself reachable from origin IS included in the
+// results at its own shortest distance, but the traversal never continues to
+// its downstreams through it. A dataset lying past a cutoff is still listed as
+// long as some other route from origin reaches it without passing any cutoff;
+// only when every route runs through a cutoff does the dataset (and whatever is
+// reachable through it alone) leave the result. Distances and explanation
+// paths are computed solely over routes that pass no cutoff — they never reuse
+// a path that the full query could take once that path has been truncated —
+// with the same two-level choice as Impacts: fewest edges first, and among
+// equal-length routes the lexicographically smallest full path, compared name
+// by name from the origin in Go string order. Each dataset appears at most
+// once, and records stay ordered by distance ascending and then by dataset
+// name.
+//
+// With an empty (or nil) cutoff list the result is identical to Impacts. A
+// repeated cutoff name acts only once; a cutoff that is registered but not
+// reachable from origin changes nothing; a cutoff named after the origin
+// itself is a successful query that returns a non-nil empty list, and the
+// origin is still never listed as affected. Names match by exact registered
+// value (case-sensitive).
+//
+// Like Impacts, the query is read-only: it changes no node, edge or stored
+// list order, and every returned Path is an independent copy. An empty origin
+// is rejected as a missing name; an origin absent from the graph (including an
+// empty or nil graph) is rejected with an error naming it and nil results.
+// The whole request fails (with nil results) when the cutoff list names an
+// empty dataset (cutoff dataset name is required) or an unregistered one; the
+// error names the offending dataset, e.g. "cutoff dataset not found: ghost".
+// The origin is validated first, and cutoff problems otherwise surface in the
+// cutoff list's input order.
+func ImpactsWithCutoffs(graph map[string]*Lineage, origin string, cutoffs []string) ([]Impact, error) {
+	hits, err := traceLineage(graph, origin, dirDownstream, cutoffs)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +382,7 @@ type Upstream struct {
 // from the graph (including an empty or nil graph) is rejected with an error
 // naming it and no partial results.
 func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
-	hits, err := traceLineage(graph, target, dirUpstream)
+	hits, err := traceLineage(graph, target, dirUpstream, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +441,10 @@ type lineageHit struct {
 }
 
 // traceLineage runs the one query rule set shared by Impacts and Upstreams and
-// returns every dataset reachable from start besides start itself.
+// returns every dataset reachable from start besides start itself. When
+// cutoffs is non-empty, a reachable cutoff node is still returned but its
+// neighbors are never expanded, so paths that would pass through it disappear;
+// a nil cutoffs list means propagation is unrestricted.
 //
 // The traversal is a BFS that commits a whole distance level at once, so a node
 // reached through several branches within the same level keeps exactly one
@@ -419,17 +463,41 @@ type lineageHit struct {
 //   - Hits are ordered by distance ascending and then by dataset name, never
 //     by registration order or the stored parent/child list order.
 //
+// With cutoffs set, every distance, candidate path and ordering decision is
+// taken over edges that leave no cutoff behind: a committed cutoff stays in
+// the result but its frontier is dropped, and a node reached around a cutoff
+// is explained by the route that avoided it rather than by any truncated
+// route from the unrestricted graph.
+//
 // Explanation paths are written in the query direction (see extendPath). The
 // graph is read only and every returned path is an independent copy. An empty
 // start is rejected as a missing name; an unregistered start (also against an
 // empty or nil graph) is rejected with an error naming it, with nil results;
 // a registered start that reaches nothing returns a non-nil empty slice.
-func traceLineage(graph map[string]*Lineage, start string, direction queryDirection) ([]lineageHit, error) {
+// Cutoffs are validated after start, in input order (duplicates acting once):
+// an empty cutoff name is a missing-name error and an unregistered cutoff name
+// is an error naming it; either failure yields nil results without touching
+// the graph.
+func traceLineage(graph map[string]*Lineage, start string, direction queryDirection, cutoffs []string) ([]lineageHit, error) {
 	if start == "" {
 		return nil, errInvalid("dataset name is required")
 	}
 	if _, ok := graph[start]; !ok {
 		return nil, errInvalid("dataset not found: " + start)
+	}
+
+	// Resolve the cutoff set only after the start has been validated, walking
+	// the list in input order so the first bad name is the one reported. A name
+	// that repeats acts once: validation sees it once and the set holds it once.
+	blocked := make(map[string]bool, len(cutoffs))
+	for _, cutoff := range cutoffs {
+		if cutoff == "" {
+			return nil, errInvalid("cutoff dataset name is required")
+		}
+		if _, ok := graph[cutoff]; !ok {
+			return nil, errInvalid("cutoff dataset not found: " + cutoff)
+		}
+		blocked[cutoff] = true
 	}
 
 	distance := map[string]int{start: 0}
@@ -440,6 +508,12 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
+			// A reached cutoff stays a result itself but is a dead end: nothing
+			// propagates through it, even though a parallel route may still
+			// reach the same downstream independently.
+			if blocked[node] {
+				continue
+			}
 			for _, hop := range direction.neighbors(graph[node]) {
 				if _, seen := distance[hop]; seen {
 					continue // reached on an earlier, strictly shorter level
