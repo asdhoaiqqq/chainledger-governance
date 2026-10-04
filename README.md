@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。如果分析变化影响时需要让传播在指定数据集处停止，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带截止名单的下游影响查询（Go 库）」一节，示例位于 [`examples/impacts_cutoff`](examples/impacts_cutoff/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -299,6 +299,79 @@ fmt.Printf("downstream=%d err=%v\n", len(impacts), err) // downstream=0 err=<nil
 ### 查询是只读的
 
 `Impacts` 不会修改血缘关系：成功或失败的查询都不改变任何节点、边或内部列表顺序。返回的每个 `Path` 都是独立拷贝，调用方可以随意修改返回的切片，不会影响图中记录，也不会影响之后的查询。反过来，图被新的 `Register` 调用改写后，需要再次调用 `Impacts` 才能得到与当前关系一致的结果。
+
+## 带截止名单的下游影响查询（Go 库）
+
+`chainledger.ImpactsWithCutoffs(graph, origin, cutoffs)` 是带**传播截止名单**的下游影响查询：影响仍从 `origin` 沿下游方向传播，但不再越过 `cutoffs` 中列出的任何已登记数据集继续向下游扩散。结果仍是 `[]chainledger.Impact`，包含数据集名称、最短依赖距离和说明路径，含义与 `Impacts` 完全一致。
+
+传播规则：
+
+- **截止点本身仍在结果中。** 只要截止点能从起点到达，它就照常作为受影响数据集出现，距离和说明路径按允许传播的路线计算；被截断的只是它的下游方向——没有任何影响会“穿过”它继续传播。
+- **截止点之后的数据集不一定退出结果。** 只要还存在一条不经过任何截止点的路线，该数据集就仍然出现；它的距离和说明路径只由这些允许传播的路线决定，完整查询中已被截断的更短路线不会被沿用——距离可能因此变大，路径也会换成现存路线。
+- **路径选择规则不变。** 在允许传播的路线中先取边数最少的；同样短时仍从起点开始逐跳比较整条路径上的名称，按 Go 字符串顺序取较小的一条。每个数据集只返回一次，记录按距离升序、同距离按名称排序。
+- **空截止名单等价于 `Impacts`。** `cutoffs` 为 `nil` 或空切片时，查询结果与完整下游查询逐项相同。
+
+截止名单的校验与边界：
+
+- 名单中的重复名称只起一次作用；已登记但从起点不可达的截止点不会改变结果。
+- 起点自己被列为截止点是合法的：查询成功并返回**非 nil 的空列表**，起点仍不列为受影响数据集。
+- 名称按登记值精确匹配（区分大小写）。起点为空或不存在的错误行为与 `Impacts` 相同；截止名单包含空名称（`cutoff dataset name is required`）或未登记名称（错误中指出该名称，如 `cutoff dataset not found: ghost`）时，整次查询失败并返回 nil 结果。
+- 查询是只读的：不改变图中的任何关系或列表顺序；返回的每条 `Path` 都是独立拷贝，修改结果不影响图或后续查询。
+
+下面的示例与 [`examples/impacts_cutoff`](examples/impacts_cutoff/main.go) 中的可独立运行程序一致，可在仓库根目录执行 `go run ./examples/impacts_cutoff` 复现。`source` 分别派生 `a` 和 `b`，`a` 直接派生 `report`，`b` 经过 `mid` 派生 `report`，`report` 再派生 `view`：
+
+```
+source ──> a ────────┐
+  │                  ├──> report ──> view
+  └──> b ──> mid ────┘
+```
+
+```go
+graph := map[string]*chainledger.Lineage{}
+register("source")
+register("a", "source")
+register("b", "source")
+register("mid", "b")
+register("report", "a", "mid")
+register("view", "report")
+
+// 完整查询：report 经 a 到达，距离为 2。
+impacts, err := chainledger.ImpactsWithCutoffs(graph, "source", nil)
+// 把 a 设为截止点：a 仍在结果中（距离 1），但 report 改经 b、mid 到达（距离 3）。
+impacts, err = chainledger.ImpactsWithCutoffs(graph, "source", []string{"a"})
+// a、b 都是截止点：两者仍在结果中，mid、report、view 不再出现。
+impacts, err = chainledger.ImpactsWithCutoffs(graph, "source", []string{"a", "b"})
+```
+
+实际输出（错误与查询结果都是程序真实打印，不是示意）：
+
+```text
+ImpactsWithCutoffs("source", []) -> 5 downstream dataset(s):
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  mid      distance=2 path=[source b mid]
+  report   distance=2 path=[source a report]
+  view     distance=3 path=[source a report view]
+ImpactsWithCutoffs("source", [a]) -> 5 downstream dataset(s):
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  mid      distance=2 path=[source b mid]
+  report   distance=3 path=[source b mid report]
+  view     distance=4 path=[source b mid report view]
+ImpactsWithCutoffs("source", [a b]) -> 2 downstream dataset(s):
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+ImpactsWithCutoffs("source", [source]) -> 0 downstream dataset(s):
+ImpactsWithCutoffs("source", []) error: cutoff dataset name is required
+ImpactsWithCutoffs("source", [ghost]) error: cutoff dataset not found: ghost
+ImpactsWithCutoffs("ghost", [a]) error: dataset not found: ghost
+```
+
+要点：
+
+- 把 `a` 设为截止点后，`report` 的距离从 2 变为 3：完整查询里那条经过 `a` 的更短路线已被截断，距离和说明路径只按现存的 `source -> b -> mid -> report` 路线计算，`view` 在这条路线上再延伸一跳。
+- 空截止名单（`nil`）的结果与 `Impacts` 完全一致；把起点 `source` 自己列为截止点时查询成功并返回空列表。
+- 登记、更名、移除和上游查询的行为不受此功能影响；原有 `Impacts` 的调用方式和完整查询行为保持兼容。
 
 ## 查询上游来源（Go 库）
 
