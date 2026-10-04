@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"unicode/utf8"
 )
 
 // PlanChange is one record in a lineage adjustment plan: the dataset name and
@@ -114,6 +115,51 @@ func ValidateGraph(graph map[string]*Lineage) error {
 	return validateAcyclic(adj)
 }
 
+// validatePlanNamesUTF8 rejects a plan in which any name that takes part in
+// the adjustment — a change record's name, one of its direct upstream names,
+// or a removals entry — is not valid UTF-8. It is the in-memory counterpart
+// of the raw-literal scan the plan reader runs (checkPlanNameEncoding): a
+// Plan built directly in Go never passed through that reader, so without
+// this gate PreviewBatch and ApplyBatch could register datasets the graph
+// exporter must refuse and produce reports whose JSON silently rewrites the
+// bad bytes to U+FFFD (two distinct corrupted names would then print as one).
+//
+// Plan order is checked as given: the name of record i comes before its
+// upstreams, and removals follow all changes, so the first reported position
+// is the earliest offending name the caller submitted. The error names the
+// field ("name", "upstreams", or "removals"), the zero-based record or array
+// position, and — for an upstream — its zero-based position inside that
+// record. The offending name is quoted with %q, which renders the original
+// bytes as \x escapes rather than replacing them with U+FFFD, so "p\xff" and
+// "p\xfe" stay distinguishable. The plan is only read, never normalized or
+// mutated. Register keeps accepting raw Go strings; this gate belongs only
+// to the batch boundary, where an unusable name would enter a graph and a
+// report that are promised exportable.
+func validatePlanNamesUTF8(plan Plan) error {
+	for i, change := range plan.Changes {
+		if !utf8.ValidString(change.Name) {
+			return fmt.Errorf("%w: field %q in the change record at index %d of %q contains invalid UTF-8 bytes: %q",
+				ErrInvalidArgument, "name", i, "changes", change.Name)
+		}
+		for j, upstream := range change.Upstreams {
+			if !utf8.ValidString(upstream) {
+				// Report the unusable name itself, never a missing-upstream
+				// error: the encoding defect takes precedence over whether
+				// the referenced dataset exists in the final graph.
+				return fmt.Errorf("%w: field %q at index %d in the change record at index %d of %q contains invalid UTF-8 bytes: %q",
+					ErrInvalidArgument, "upstreams", j, i, "changes", upstream)
+			}
+		}
+	}
+	for i, name := range plan.Removals {
+		if !utf8.ValidString(name) {
+			return fmt.Errorf("%w: field %q at index %d contains invalid UTF-8 bytes: %q",
+				ErrInvalidArgument, "removals", i, name)
+		}
+	}
+	return nil
+}
+
 // computeBatch validates the graph and plan, then computes the final adjacency
 // and the diff report. It does not mutate graph. The returned adjacency is the
 // graph as it will be after the batch; callers that want to commit it should
@@ -124,6 +170,18 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	}
 	original, err := graphAdjacency(graph)
 	if err != nil {
+		return nil, nil, err
+	}
+
+	// Check every name the plan carries before anything that would quote it,
+	// hash it, or turn the report into JSON: the file reader already rejects
+	// these at the raw-literal level, but a plan constructed directly through
+	// the Go API bypasses that reader, and without this gate it could register
+	// a dataset whose name cannot be exported — two names differing only in an
+	// invalid byte ("p\xff" vs "p\xfe") would even render identically once the
+	// report is marshaled. This is the in-memory counterpart of
+	// checkPlanNameEncoding; see plan_name_encoding.go.
+	if err := validatePlanNamesUTF8(plan); err != nil {
 		return nil, nil, err
 	}
 
@@ -251,13 +309,23 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 // PreviewBatch validates the graph and plan and returns the report WITHOUT
 // mutating graph. Preview and apply for the same graph and plan produce
 // identical reports.
+//
+// As well as the structural plan rules (empty names, duplicate declarations,
+// unresolvable upstreams, cycles), every name the plan carries — a change
+// record's name, any of its direct upstreams, and every removals entry — must
+// be valid UTF-8 even when the plan was constructed directly in Go instead of
+// read by UnmarshalPlan. A name that is not valid UTF-8 rejects the whole
+// batch with ErrInvalidArgument before any dataset could be registered or any
+// report produced, so a success report can always be marshaled to JSON and an
+// applied graph can always be exported. See validatePlanNamesUTF8.
 func PreviewBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, error) {
 	report, _, err := computeBatch(graph, plan)
 	return report, err
 }
 
 // ApplyBatch validates the plan, applies it to graph, and returns the report.
-// On rejection, graph is left completely unchanged.
+// On rejection — including a plan that names a dataset, upstream, or removal
+// with bytes that are not valid UTF-8 — graph is left completely unchanged.
 func ApplyBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, error) {
 	report, final, err := computeBatch(graph, plan)
 	if err != nil {
