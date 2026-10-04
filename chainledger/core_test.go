@@ -2124,3 +2124,259 @@ func TestReturnedPathEditsStayWithinOneResultBatch(t *testing.T) {
 		t.Fatalf("editing the second batch changed graph: before=%v after=%v", before, snapshot(graph))
 	}
 }
+
+// Regression for re-judging a previously cyclic upstream replacement against
+// the current lineage after dependencies are torn down one route at a time.
+// source is the root; left and right each derive from it; report derives from
+// both; view derives from report; standalone is unrelated. Replacing source's
+// direct upstreams with report must be refused while report still reaches
+// source through either branch, naming report as the cycle cause. One refusal
+// must not poison later (now-legal) registrations, and removing one route must
+// not hide the other still-closing route: the identical replacement keeps
+// failing until BOTH branches are detached, and only then succeeds. Detaching a
+// dataset's own upstreams is distinct from deleting its downstream edges, so a
+// refusal neither adds source as report's child nor restores a previously
+// detached edge. Public queries after each refusal read exactly the pre-request
+// lineage (never the refused new edge); after success they explain the new
+// edges, and a dataset that became downstream-only answers with a successful
+// non-nil empty list.
+func TestRegisterRejudgesCycleAfterDependencyTeardown(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"left", "source"},
+		{"right", "source"},
+		{"report", "left", "right"},
+		{"view", "report"},
+		{"standalone"},
+	})
+	assertConsistent(t, graph)
+	// Every dataset the feature built is present, including the unrelated one.
+	for _, name := range []string{"source", "left", "right", "report", "view", "standalone"} {
+		if _, ok := graph[name]; !ok {
+			t.Fatalf("dataset %q missing from initial graph", name)
+		}
+	}
+
+	// Public queries describing the initial lineage; captured before any
+	// replacement attempt so every refusal can be checked against the exact
+	// pre-request answers.
+	sourceDownInitial := []Impact{
+		{Dataset: "left", Distance: 1, Path: []string{"source", "left"}},
+		{Dataset: "right", Distance: 1, Path: []string{"source", "right"}},
+		{Dataset: "report", Distance: 2, Path: []string{"source", "left", "report"}},
+		{Dataset: "view", Distance: 3, Path: []string{"source", "left", "report", "view"}},
+	}
+	if got := mustImpacts(t, graph, "source"); !reflect.DeepEqual(got, sourceDownInitial) {
+		t.Fatalf("initial Impacts(source) = %v, want %v", got, sourceDownInitial)
+	}
+	reportDownInitial := []Impact{
+		{Dataset: "view", Distance: 1, Path: []string{"report", "view"}},
+	}
+	if got := mustImpacts(t, graph, "report"); !reflect.DeepEqual(got, reportDownInitial) {
+		t.Fatalf("initial Impacts(report) = %v, want %v", got, reportDownInitial)
+	}
+	sourceUpInitial := []Upstream{}
+	if got := mustUpstreams(t, graph, "source"); !reflect.DeepEqual(got, sourceUpInitial) {
+		t.Fatalf("initial Upstreams(source) = %v, want empty non-nil", got)
+	}
+
+	// Attempt 1: source -> report closes source -> left/right -> report ->
+	// source (report still indirectly depends on source through both
+	// branches). The error must name report as the cycle cause.
+	before1 := snapshot(graph)
+	err := Register(graph, Dataset{Name: "source"}, []string{"report"})
+	if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "report") {
+		t.Fatalf("attempt 1: want cycle error naming report, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before1) {
+		t.Fatalf("attempt 1 changed graph: before=%v after=%v", before1, snapshot(graph))
+	}
+	// source is still a root and every original relationship stands.
+	assertEntry(t, graph, "source", nil, []string{"left", "right"})
+	assertEntry(t, graph, "left", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "right", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"left", "right"}, []string{"view"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertEntry(t, graph, "standalone", nil, nil)
+	// The refused edge must not leave source as report's downstream.
+	if got := graph["report"].Children; !sameStrings(got, []string{"view"}) {
+		t.Fatalf("attempt 1 left report children %v, want [view] (no refused source edge)", got)
+	}
+	assertConsistent(t, graph)
+	// Queries after the refusal equal the pre-request answers: no new edge.
+	if got := mustImpacts(t, graph, "source"); !reflect.DeepEqual(got, sourceDownInitial) {
+		t.Fatalf("after attempt 1 Impacts(source) = %v, want %v", got, sourceDownInitial)
+	}
+	if got := mustImpacts(t, graph, "report"); !reflect.DeepEqual(got, reportDownInitial) {
+		t.Fatalf("after attempt 1 Impacts(report) = %v, want %v", got, reportDownInitial)
+	}
+	if got := mustUpstreams(t, graph, "source"); !reflect.DeepEqual(got, sourceUpInitial) {
+		t.Fatalf("after attempt 1 Upstreams(source) = %v, want %v", got, sourceUpInitial)
+	}
+
+	// Detach left's OWN upstreams (left becomes a root); this removes only the
+	// source -> left edge. It must not delete left's downstream relationship:
+	// report still lists left as a direct upstream.
+	mustRegister(t, graph, "left")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "left", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"left", "right"}, []string{"view"})
+	assertEntry(t, graph, "source", nil, []string{"right"})
+	assertEntry(t, graph, "right", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "standalone", nil, nil)
+
+	// Queries on the current (legally changed) lineage before attempt 2.
+	sourceDownAfterLeftDetach := []Impact{
+		{Dataset: "right", Distance: 1, Path: []string{"source", "right"}},
+		{Dataset: "report", Distance: 2, Path: []string{"source", "right", "report"}},
+		{Dataset: "view", Distance: 3, Path: []string{"source", "right", "report", "view"}},
+	}
+	if got := mustImpacts(t, graph, "source"); !reflect.DeepEqual(got, sourceDownAfterLeftDetach) {
+		t.Fatalf("after left detach Impacts(source) = %v, want %v", got, sourceDownAfterLeftDetach)
+	}
+	if got := mustImpacts(t, graph, "report"); !reflect.DeepEqual(got, reportDownInitial) {
+		t.Fatalf("after left detach Impacts(report) = %v, want %v", got, reportDownInitial)
+	}
+	sourceUpAfterLeftDetach := []Upstream{}
+	if got := mustUpstreams(t, graph, "source"); !reflect.DeepEqual(got, sourceUpAfterLeftDetach) {
+		t.Fatalf("after left detach Upstreams(source) = %v, want empty non-nil", got)
+	}
+
+	// Attempt 2: the identical replacement must STILL fail. The route through
+	// right (source -> right -> report) keeps report reaching source, so one
+	// branch being detached must not make the cyclic request look legal.
+	before2 := snapshot(graph)
+	err = Register(graph, Dataset{Name: "source"}, []string{"report"})
+	if err == nil || !strings.Contains(err.Error(), "cycle") || !strings.Contains(err.Error(), "report") {
+		t.Fatalf("attempt 2: want cycle error naming report via the surviving right route, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before2) {
+		t.Fatalf("attempt 2 changed graph: before=%v after=%v", before2, snapshot(graph))
+	}
+	// Neither the refused source edge nor left's detached edge may appear;
+	// detaching left once is not undone by the refusal.
+	assertEntry(t, graph, "source", nil, []string{"right"})
+	assertEntry(t, graph, "left", nil, []string{"report"})
+	assertEntry(t, graph, "right", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "report", []string{"left", "right"}, []string{"view"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertEntry(t, graph, "standalone", nil, nil)
+	if got := graph["report"].Children; !sameStrings(got, []string{"view"}) {
+		t.Fatalf("attempt 2 left report children %v, want [view] (no refused source edge)", got)
+	}
+	assertConsistent(t, graph)
+	// Post-refusal queries equal the pre-request lineage of this attempt.
+	if got := mustImpacts(t, graph, "source"); !reflect.DeepEqual(got, sourceDownAfterLeftDetach) {
+		t.Fatalf("after attempt 2 Impacts(source) = %v, want %v", got, sourceDownAfterLeftDetach)
+	}
+	if got := mustImpacts(t, graph, "report"); !reflect.DeepEqual(got, reportDownInitial) {
+		t.Fatalf("after attempt 2 Impacts(report) = %v, want %v", got, reportDownInitial)
+	}
+	if got := mustUpstreams(t, graph, "source"); !reflect.DeepEqual(got, sourceUpAfterLeftDetach) {
+		t.Fatalf("after attempt 2 Upstreams(source) = %v, want %v", got, sourceUpAfterLeftDetach)
+	}
+
+	// Detach right's own upstreams too: the last route from source to report is
+	// gone. report keeps both left and right as direct upstreams and keeps view
+	// downstream; source now has no downstream at all.
+	mustRegister(t, graph, "right")
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "right", nil, []string{"report"})
+	assertEntry(t, graph, "left", nil, []string{"report"})
+	assertEntry(t, graph, "report", []string{"left", "right"}, []string{"view"})
+	assertEntry(t, graph, "source", nil, nil)
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertEntry(t, graph, "standalone", nil, nil)
+
+	// Attempt 3: report no longer reaches source, so the once-refused
+	// replacement now succeeds — an earlier refusal does not block a currently
+	// legal registration.
+	if err := Register(graph, Dataset{Name: "source"}, []string{"report"}); err != nil {
+		t.Fatalf("attempt 3: want success once no route closes the loop, got %v", err)
+	}
+	assertConsistent(t, graph)
+	// source's direct upstream is report; report keeps its old downstream view
+	// and gains source at the end; left and right remain report's direct
+	// upstreams; the independent dataset and every node survive.
+	assertEntry(t, graph, "source", []string{"report"}, nil)
+	assertEntry(t, graph, "report", []string{"left", "right"}, []string{"view", "source"})
+	assertEntry(t, graph, "left", nil, []string{"report"})
+	assertEntry(t, graph, "right", nil, []string{"report"})
+	assertEntry(t, graph, "view", []string{"report"}, nil)
+	assertEntry(t, graph, "standalone", nil, nil)
+	for _, name := range []string{"source", "left", "right", "report", "view", "standalone"} {
+		if _, ok := graph[name]; !ok {
+			t.Fatalf("dataset %q missing after successful replacement", name)
+		}
+	}
+	// source is no longer a root; the detached branches and the independent
+	// dataset are the remaining roots.
+	if got, want := Roots(graph), []string{"left", "right", "standalone"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Roots after success = %v, want %v", got, want)
+	}
+
+	// Public queries explain the new lineage. Downstream of report: view and
+	// source, distance then name; the path to source is the new direct edge.
+	reportDownAfter := []Impact{
+		{Dataset: "source", Distance: 1, Path: []string{"report", "source"}},
+		{Dataset: "view", Distance: 1, Path: []string{"report", "view"}},
+	}
+	if got := mustImpacts(t, graph, "report"); !reflect.DeepEqual(got, reportDownAfter) {
+		t.Fatalf("after success Impacts(report) = %v, want %v", got, reportDownAfter)
+	}
+	assertImpact(t, mustImpacts(t, graph, "report"), "source", 1, []string{"report", "source"})
+	assertImpact(t, mustImpacts(t, graph, "report"), "view", 1, []string{"report", "view"})
+
+	// Upstream of source traces report, then left and right (both at distance
+	// 2, name-sorted); no route returns to source.
+	sourceUpAfter := []Upstream{
+		{Dataset: "report", Distance: 1, Path: []string{"report", "source"}},
+		{Dataset: "left", Distance: 2, Path: []string{"left", "report", "source"}},
+		{Dataset: "right", Distance: 2, Path: []string{"right", "report", "source"}},
+	}
+	if got := mustUpstreams(t, graph, "source"); !reflect.DeepEqual(got, sourceUpAfter) {
+		t.Fatalf("after success Upstreams(source) = %v, want %v", got, sourceUpAfter)
+	}
+	assertUpstreamOnce(t, mustUpstreams(t, graph, "source"), "report", 1, []string{"report", "source"})
+	assertUpstreamOnce(t, mustUpstreams(t, graph, "source"), "left", 2, []string{"left", "report", "source"})
+	assertUpstreamOnce(t, mustUpstreams(t, graph, "source"), "right", 2, []string{"right", "report", "source"})
+
+	// source is now a leaf: its downstream query succeeds with a non-nil empty
+	// list (it exists in the graph, it merely has no children).
+	sourceDownAfter, err := Impacts(graph, "source")
+	if err != nil {
+		t.Fatalf("after success Impacts(source): %v", err)
+	}
+	if sourceDownAfter == nil || len(sourceDownAfter) != 0 {
+		t.Fatalf("after success Impacts(source) = %v, want non-nil empty list", sourceDownAfter)
+	}
+
+	// The unrelated dataset stays a valid empty-scope query origin in both
+	// directions and is absent from every lineage result above.
+	standaloneDown, err := Impacts(graph, "standalone")
+	if err != nil {
+		t.Fatalf("Impacts(standalone): %v", err)
+	}
+	if standaloneDown == nil || len(standaloneDown) != 0 {
+		t.Fatalf("Impacts(standalone) = %v, want non-nil empty list", standaloneDown)
+	}
+	standaloneUp, err := Upstreams(graph, "standalone")
+	if err != nil {
+		t.Fatalf("Upstreams(standalone): %v", err)
+	}
+	if standaloneUp == nil || len(standaloneUp) != 0 {
+		t.Fatalf("Upstreams(standalone) = %v, want non-nil empty list", standaloneUp)
+	}
+	assertConsistent(t, graph)
+
+	// The accepted rewrite itself must stay legal: a follow-up identical
+	// registration succeeds and changes nothing.
+	idempotentBefore := snapshot(graph)
+	if err := Register(graph, Dataset{Name: "source"}, []string{"report"}); err != nil {
+		t.Fatalf("identical re-registration after success: %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), idempotentBefore) {
+		t.Fatalf("identical re-registration after success changed graph: before=%v after=%v",
+			idempotentBefore, snapshot(graph))
+	}
+}
