@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记、更名与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)；已登记数据集如何更名而不改变它在血缘图中的位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -150,6 +150,81 @@ Impacts("detail") -> 1 downstream dataset(s)
 - 被拒绝的那次调用之后，`detail` 的直接上游仍是 `raw`、`summary` 仍依赖 `detail`（输出里的 `parents=`/`children=` 直接读自图这个 map），`Impacts("raw")` 照常到达二者；`other` 的下游列表为空，**没有**因为这次失败请求得到 `detail` 这个下游。
 - 修正请求成功体现的是**整体替换**而不是追加：`raw` 不再影响 `detail` 和 `summary`（`Impacts("raw")` 查询成功但返回空列表），`other` 可以影响二者，距离分别为 1、2；`detail` 原有的下游 `summary` 仍然保留。
 - 这里血缘查询的方向（只沿下游）、距离（最短依赖边数）和结果顺序（先距离后名称）与下一节文档化的 `Impacts` 公开行为完全一致。
+
+## 数据集更名（Go 库）
+
+`chainledger.Rename(graph, oldName, newName)` 把一个**已登记**数据集换名，同时保留它在血缘图中的位置：边一条不增、不减、不合并，只是把名称换掉。调用通过返回的 `error` 判断成败，更名直接作用于传入的当前图（同一个 map）。
+
+更名成功后：
+
+- 原名称从图中消失，新名称成为该节点的键，节点的 `Lineage` 记录沿用同一个（`Dataset` 字段同步更新为新名称），图中数据集数量不变。
+- 每个**直接上游**的下游列表、每个**直接下游**的上游列表中，原名称在**原位置**被替换为新名称——列表顺序、相邻元素都不变，不会重复增加边。
+- 该节点自己的 `Parents`/`Children` 列表内容与顺序完全不变（里面是别的数据集的名称），其余节点和连接一律不动。
+- 没有上游的根、没有下游的叶子以及中间数据集都一样可以更名。
+
+因为图的连接关系没有变，**最短距离不会变**；但名称变化可能改变同距离结果的排序和等长路径的选择——这些结果按 `Impacts`/`Upstreams` 的现有公开规则（先距离后名称、等长路径取词典序最小者）以**新名称重新计算**。旧名称再查询按未登记处理（`dataset not found: oldName`），新名称查询具有更名前该节点的全部可达范围。更名前已经返回给调用方的查询结果仍是独立拷贝，继续保留当时内容。
+
+更名规则（全部在改动图之前校验，被拒绝时图与调用前完全一致）：
+
+- 原名称或新名称为空：返回缺少名称的错误（`dataset name is required` / `new dataset name is required`）。
+- 原名称未登记：错误信息指出原名称（`dataset not found: ghost`），不会创建任何节点。
+- 新名称已被**另一个**数据集占用：错误信息指出该名称（`dataset name already in use: b`），不会合并节点。
+- 名称按登记值精确匹配、区分大小写。
+- 原名称与新名称相同且该数据集确实存在：成功返回、图保持不变；同名请求但名称不存在时仍按未登记报错。
+
+下面的示例与 [`examples/rename`](examples/rename/main.go) 一致，可在仓库根目录执行 `go run ./examples/rename` 复现。建立 `source` 分别派生 `a`、`b`，`report` 同时依赖两者，然后把 `a` 更名为 `z`：
+
+```go
+register("source")
+register("a", "source")
+register("b", "source")
+register("report", "a", "b")
+
+if err := chainledger.Rename(graph, "a", "z"); err != nil {
+    fmt.Printf("Rename(a, z) refused: %v\n", err)
+    return
+}
+```
+
+实际输出（边与错误均为程序真实打印）：
+
+```text
+before the rename:
+  source  parents=[] children=[a b]
+  a       parents=[source] children=[report]
+  b       parents=[source] children=[report]
+  report  parents=[a b] children=[]
+Impacts("source") -> 3 downstream dataset(s)
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  report   distance=2 path=[source a report]
+Rename(a, z) ok
+after the rename:
+  source  parents=[] children=[z b]
+  z       parents=[source] children=[report]
+  b       parents=[source] children=[report]
+  report  parents=[z b] children=[]
+Impacts("source") -> 3 downstream dataset(s)
+  b        distance=1 path=[source b]
+  z        distance=1 path=[source z]
+  report   distance=2 path=[source b report]
+Upstreams("report") -> 3 upstream dataset(s)
+  b        distance=1 path=[b report]
+  z        distance=1 path=[z report]
+  source   distance=2 path=[source b report]
+Impacts("a") after rename: dataset not found: a
+Rename(ghost, z): dataset not found: ghost
+Rename(z, b):     dataset name already in use: b
+Rename(z, z):     <nil>
+datasets=4
+```
+
+要点：
+
+- `report` 的直接上游中原来 `a` 的位置变成 `z`（`parents=[z b]`，顺序不变），`source` 的下游列表同样是 `[z b]`，替换仍在原位。
+- 更名前从 `source` 到 `report` 的说明路径走词典序较小的 `a` 侧（`[source a report]`）；`a` 变成 `z` 后两侧名称变为 `z` 与 `b`，等长路径改为走 `b` 侧（`[source b report]`），距离仍是 2。查询 `report` 的上游时，`source` 对应的说明路径同样改为 `[source b report]`。
+- `Impacts("a")` 按未登记报错，而 `Impacts("z")`、`Upstreams("z")` 具有更名前 `a` 的可达范围。
+- 未登记的原名称、被占用的新名称都会在错误中点名且图不变；数据集始终是 4 个，没有删除依赖或合并节点。
 
 ## 查询下游影响（Go 库）
 

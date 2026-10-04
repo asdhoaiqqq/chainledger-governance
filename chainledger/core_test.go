@@ -2370,3 +2370,461 @@ func TestRegisterRejectedUpstreamReplaceRejudgedAfterDetach(t *testing.T) {
 		t.Fatalf("Impacts(source) after success = %v, want non-nil empty list", sourceImpacts)
 	}
 }
+
+// The worked scenario from the rename spec: source derives a and b, report
+// depends on both. Renaming a to z keeps the node in place: report's direct
+// upstream list shows z where a was, and source's shortest explanation to
+// report switches to the surviving b route (names changed, distances did not).
+func TestRenameDiamondScenarioFromSpec(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"},
+		{"b", "source"},
+		{"report", "a", "b"},
+	})
+	assertConsistent(t, graph)
+
+	// Before the rename, the lexicographically smaller a route explains report.
+	before := mustImpacts(t, graph, "source")
+	assertImpactOnce(t, before, "report", 2, []string{"source", "a", "report"})
+	if got, want := impactNames(before), []string{"a", "b", "report"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("before rename impact order = %v, want %v", got, want)
+	}
+
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+	assertConsistent(t, graph)
+	if len(graph) != 4 {
+		t.Fatalf("dataset count = %d, want 4", len(graph))
+	}
+
+	// The old name is gone, the record lives under the new name with updated
+	// Dataset field and unchanged edge sets/list orders.
+	if _, ok := graph["a"]; ok {
+		t.Fatal("old name a must disappear from the graph")
+	}
+	assertEntry(t, graph, "z", []string{"source"}, []string{"report"})
+	if graph["z"].Dataset != "z" {
+		t.Fatalf("record Dataset = %q, want z", graph["z"].Dataset)
+	}
+	// z stays exactly where a sat in the neighbors' lists.
+	assertEntry(t, graph, "source", nil, []string{"z", "b"})
+	assertEntry(t, graph, "report", []string{"z", "b"}, nil)
+
+	// Impacts(source): same distances, names/order and tie-broken path
+	// recomputed under the new names.
+	after := mustImpacts(t, graph, "source")
+	if got, want := impactNames(after), []string{"b", "z", "report"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after rename impact order = %v, want %v", got, want)
+	}
+	assertImpact(t, after, "b", 1, []string{"source", "b"})
+	assertImpact(t, after, "z", 1, []string{"source", "z"})
+	assertImpactOnce(t, after, "report", 2, []string{"source", "b", "report"})
+
+	// Upstreams(report): the source explanation likewise runs through b now.
+	up := mustUpstreams(t, graph, "report")
+	if got, want := upstreamNames(up), []string{"b", "z", "source"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("after rename upstream order = %v, want %v", got, want)
+	}
+	assertUpstream(t, up, "z", 1, []string{"z", "report"})
+	assertUpstream(t, up, "b", 1, []string{"b", "report"})
+	assertUpstreamOnce(t, up, "source", 2, []string{"source", "b", "report"})
+
+	// The old name is treated as unregistered; the new name owns the old
+	// node's reach in both query directions.
+	if _, err := Impacts(graph, "a"); err == nil || !strings.Contains(err.Error(), "a") {
+		t.Fatalf("Impacts(a) after rename: want not-found error naming a, got %v", err)
+	}
+	if _, err := Upstreams(graph, "a"); err == nil || !strings.Contains(err.Error(), "a") {
+		t.Fatalf("Upstreams(a) after rename: want not-found error naming a, got %v", err)
+	}
+	zImpacts := mustImpacts(t, graph, "z")
+	assertImpact(t, zImpacts, "report", 1, []string{"z", "report"})
+	zUpstreams := mustUpstreams(t, graph, "z")
+	assertUpstream(t, zUpstreams, "source", 1, []string{"source", "z"})
+}
+
+// The replacement lands in the old name's exact slot on every neighbor list;
+// the renamed node's own parent/child lists keep their order, and lists on
+// unrelated nodes are untouched.
+func TestRenameReplacesInPlacePreservingOrder(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"}, // source's children become [a x y] in registration order
+		{"x", "source"},
+		{"y", "source"},
+		{"report", "x", "a", "y"}, // a deliberately in the middle
+		{"lonely"},
+		{"other", "lonely"},
+	})
+	before := snapshot(graph)
+
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+	assertConsistent(t, graph)
+
+	assertEntry(t, graph, "source", nil, []string{"z", "x", "y"})
+	assertEntry(t, graph, "report", []string{"x", "z", "y"}, nil)
+	assertEntry(t, graph, "z", []string{"source"}, []string{"report"})
+	// Unrelated neighbors keep their lists byte-for-byte.
+	assertEntry(t, graph, "x", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "y", []string{"source"}, []string{"report"})
+	assertEntry(t, graph, "lonely", nil, []string{"other"})
+	assertEntry(t, graph, "other", []string{"lonely"}, nil)
+
+	// Only the four lists naming a may change; every other stored list is
+	// identical to before the rename.
+	for name, entry := range graph {
+		if name == "z" || name == "source" || name == "report" {
+			continue
+		}
+		if !sameStrings(entry.Parents, before.parents[name]) {
+			t.Errorf("unrelated node %s parents changed: %v, want %v", name, entry.Parents, before.parents[name])
+		}
+		if !sameStrings(entry.Children, before.children[name]) {
+			t.Errorf("unrelated node %s children changed: %v, want %v", name, entry.Children, before.children[name])
+		}
+	}
+
+	// Renaming again (z -> q) rewires the same edges from the new name.
+	if err := Rename(graph, "z", "q"); err != nil {
+		t.Fatalf("Rename(z, q): %v", err)
+	}
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "source", nil, []string{"q", "x", "y"})
+	assertEntry(t, graph, "report", []string{"x", "q", "y"}, nil)
+	assertEntry(t, graph, "q", []string{"source"}, []string{"report"})
+	if len(graph) != 7 {
+		t.Fatalf("dataset count = %d, want 7", len(graph))
+	}
+}
+
+// Roots, leaves and interior datasets all rename without changing the dataset
+// count or any edge.
+func TestRenameRootMiddleAndLeaf(t *testing.T) {
+	build := func() map[string]*Lineage {
+		return buildRegisteredGraph(t, [][]string{
+			{"source"},
+			{"a", "source"},
+			{"b", "source"},
+			{"report", "a", "b"},
+			{"view", "report"},
+			{"lonely"},
+		})
+	}
+
+	// Root with children.
+	graph := build()
+	if err := Rename(graph, "source", "spring"); err != nil {
+		t.Fatalf("Rename root: %v", err)
+	}
+	assertConsistent(t, graph)
+	if len(graph) != 6 {
+		t.Fatalf("dataset count = %d, want 6", len(graph))
+	}
+	assertEntry(t, graph, "spring", nil, []string{"a", "b"})
+	assertEntry(t, graph, "a", []string{"spring"}, []string{"report"})
+	assertEntry(t, graph, "b", []string{"spring"}, []string{"report"})
+	if got, want := Roots(graph), []string{"lonely", "spring"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("Roots = %v, want %v", got, want)
+	}
+	if _, err := Impacts(graph, "spring"); err != nil {
+		t.Errorf("renamed root not queryable: %v", err)
+	}
+
+	// Interior merge node with both parents and a child.
+	graph = build()
+	if err := Rename(graph, "report", "digest"); err != nil {
+		t.Fatalf("Rename middle: %v", err)
+	}
+	assertConsistent(t, graph)
+	if len(graph) != 6 {
+		t.Fatalf("dataset count = %d, want 6", len(graph))
+	}
+	assertEntry(t, graph, "digest", []string{"a", "b"}, []string{"view"})
+	assertEntry(t, graph, "a", []string{"source"}, []string{"digest"})
+	assertEntry(t, graph, "b", []string{"source"}, []string{"digest"})
+	assertEntry(t, graph, "view", []string{"digest"}, nil)
+
+	// Leaf.
+	graph = build()
+	if err := Rename(graph, "view", "screen"); err != nil {
+		t.Fatalf("Rename leaf: %v", err)
+	}
+	assertConsistent(t, graph)
+	if len(graph) != 6 {
+		t.Fatalf("dataset count = %d, want 6", len(graph))
+	}
+	assertEntry(t, graph, "screen", []string{"report"}, nil)
+	assertEntry(t, graph, "report", []string{"a", "b"}, []string{"screen"})
+
+	// Completely isolated node is simultaneously root and leaf.
+	graph = build()
+	if err := Rename(graph, "lonely", "solo"); err != nil {
+		t.Fatalf("Rename isolated: %v", err)
+	}
+	assertConsistent(t, graph)
+	assertEntry(t, graph, "solo", nil, nil)
+	if len(graph) != 6 {
+		t.Fatalf("dataset count = %d, want 6", len(graph))
+	}
+}
+
+// All rejection cases name the problem and leave the graph completely intact.
+func TestRenameErrorsAndAtomicity(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"},
+		{"b", "source"},
+		{"report", "a", "b"},
+	})
+
+	cases := []struct {
+		name    string
+		oldName string
+		newName string
+		want    string
+	}{
+		{"both empty", "", "", "name is required"},
+		{"empty old", "", "z", "name is required"},
+		{"empty new", "a", "", "new dataset name is required"},
+		{"missing old", "ghost", "z", "ghost"},
+		{"missing old same name", "ghost", "ghost", "ghost"},
+		{"new name taken", "a", "b", "b"},
+		{"new name taken case variant", "a", "source", "source"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := snapshot(graph)
+			err := Rename(graph, tc.oldName, tc.newName)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Rename(%q, %q): want error containing %q, got %v",
+					tc.oldName, tc.newName, tc.want, err)
+			}
+			if !reflect.DeepEqual(snapshot(graph), before) {
+				t.Fatalf("failed rename changed graph: before=%v after=%v", before, snapshot(graph))
+			}
+			assertConsistent(t, graph)
+		})
+	}
+
+	// A rejected rename after an earlier successful one leaves the renamed
+	// graph intact.
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+	before := snapshot(graph)
+	if err := Rename(graph, "z", "b"); err == nil || !strings.Contains(err.Error(), "b") {
+		t.Fatalf("Rename onto occupied b: want error naming b, got %v", err)
+	}
+	assertEntry(t, graph, "z", []string{"source"}, []string{"report"})
+	if _, ok := graph["a"]; ok {
+		t.Fatal("failed conflict rename resurrected the old name a")
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("failed rename after success changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+}
+
+// Renaming a registered dataset to its own current name succeeds and changes
+// nothing; the same request against a missing name still reports it missing.
+func TestRenameSameNameIsNoopSuccess(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"},
+		{"report", "a"},
+	})
+	before := snapshot(graph)
+	record := graph["a"]
+
+	if err := Rename(graph, "a", "a"); err != nil {
+		t.Fatalf("Rename(a, a): %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("same-name rename changed graph: before=%v after=%v", before, snapshot(graph))
+	}
+	if graph["a"] != record || graph["a"].Dataset != "a" {
+		t.Fatal("same-name rename must keep the same record")
+	}
+	assertConsistent(t, graph)
+
+	if err := Rename(graph, "ghost", "ghost"); err == nil ||
+		!strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("Rename(ghost, ghost): want not-found error, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("missing same-name rename changed graph")
+	}
+}
+
+// Names match by exact registered value, case-sensitively: "a" and "A" are
+// different datasets, and neither can take the other's occupied name.
+func TestRenameCaseSensitiveExactMatch(t *testing.T) {
+	graph := map[string]*Lineage{}
+	mustRegister(t, graph, "a")
+	mustRegister(t, graph, "A", "a")
+
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+	assertEntry(t, graph, "z", nil, []string{"A"})
+	assertEntry(t, graph, "A", []string{"z"}, nil)
+
+	if err := Rename(graph, "A", "z"); err == nil || !strings.Contains(err.Error(), "z") {
+		t.Fatalf("case-insensitive collision: want error naming z, got %v", err)
+	}
+	if err := Rename(graph, "A", "Z"); err != nil {
+		t.Fatalf("Rename(A, Z) must be distinct from z: %v", err)
+	}
+	assertEntry(t, graph, "Z", []string{"z"}, nil)
+	assertEntry(t, graph, "z", nil, []string{"Z"})
+	assertConsistent(t, graph)
+
+	// Differently-cased spellings of the old names are simply unregistered
+	// now, even though z and Z are present.
+	if err := Rename(graph, "a", "q"); err == nil || !strings.Contains(err.Error(), "a") {
+		t.Fatalf("old name a after rename: want not-found naming a, got %v", err)
+	}
+	if _, err := Upstreams(graph, "A"); err == nil || !strings.Contains(err.Error(), "A") {
+		t.Fatalf("old name A after rename: want not-found naming A, got %v", err)
+	}
+	if got := mustUpstreams(t, graph, "Z"); !reflect.DeepEqual(
+		got, []Upstream{{Dataset: "z", Distance: 1, Path: []string{"z", "Z"}}}) {
+		t.Fatalf("Upstreams(Z) = %v, want [z]", got)
+	}
+	assertConsistent(t, graph)
+}
+
+// Distances and reach are unchanged by a rename; the returned batches just use
+// new names, and batches handed out earlier keep their fetched content because
+// every path is an independent copy.
+func TestRenameQueriesRecomputedAndOldResultsStable(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"},
+		{"b", "source"},
+		{"report", "a", "b"},
+		{"view", "report"},
+	})
+
+	oldImpacts := mustImpacts(t, graph, "source")
+	oldUpstreams := mustUpstreams(t, graph, "report")
+	impactCopy := make([]Impact, len(oldImpacts))
+	for i, im := range oldImpacts {
+		impactCopy[i] = Impact{im.Dataset, im.Distance, append([]string(nil), im.Path...)}
+	}
+	upstreamCopy := make([]Upstream, len(oldUpstreams))
+	for i, up := range oldUpstreams {
+		upstreamCopy[i] = Upstream{up.Dataset, up.Distance, append([]string(nil), up.Path...)}
+	}
+
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+	assertConsistent(t, graph)
+
+	// Previously returned batches keep the content they were fetched with.
+	if !reflect.DeepEqual(oldImpacts, impactCopy) {
+		t.Fatalf("earlier impacts changed after rename: got=%v snapshot=%v", oldImpacts, impactCopy)
+	}
+	if !reflect.DeepEqual(oldUpstreams, upstreamCopy) {
+		t.Fatalf("earlier upstreams changed after rename: got=%v snapshot=%v", oldUpstreams, upstreamCopy)
+	}
+
+	// New batches: same node count and distances, names and paths recomputed.
+	newImpacts := mustImpacts(t, graph, "source")
+	if len(newImpacts) != len(oldImpacts) {
+		t.Fatalf("impact count changed: %d, want %d", len(newImpacts), len(oldImpacts))
+	}
+	wantImpacts := []Impact{
+		{Dataset: "b", Distance: 1, Path: []string{"source", "b"}},
+		{Dataset: "z", Distance: 1, Path: []string{"source", "z"}},
+		{Dataset: "report", Distance: 2, Path: []string{"source", "b", "report"}},
+		{Dataset: "view", Distance: 3, Path: []string{"source", "b", "report", "view"}},
+	}
+	if !reflect.DeepEqual(newImpacts, wantImpacts) {
+		t.Fatalf("impacts after rename = %v, want %v", newImpacts, wantImpacts)
+	}
+
+	wantUpstreams := []Upstream{
+		{Dataset: "b", Distance: 1, Path: []string{"b", "report"}},
+		{Dataset: "z", Distance: 1, Path: []string{"z", "report"}},
+		{Dataset: "source", Distance: 2, Path: []string{"source", "b", "report"}},
+	}
+	if got := mustUpstreams(t, graph, "report"); !reflect.DeepEqual(got, wantUpstreams) {
+		t.Fatalf("upstreams after rename = %v, want %v", got, wantUpstreams)
+	}
+}
+
+// Register keeps working against a renamed graph: the new name is the node for
+// edge purposes, the old name reads as unknown, and re-registering the renamed
+// node preserves renamed reverse edges.
+func TestRenameThenRegisterAndQueryInteroperate(t *testing.T) {
+	graph := buildRegisteredGraph(t, [][]string{
+		{"source"},
+		{"a", "source"},
+		{"b", "source"},
+		{"report", "a", "b"},
+	})
+	if err := Rename(graph, "a", "z"); err != nil {
+		t.Fatalf("Rename(a, z): %v", err)
+	}
+
+	// The old name cannot be used as an upstream: Register treats it as
+	// unknown and the failed request stays atomic.
+	before := snapshot(graph)
+	err := Register(graph, Dataset{Name: "newkid"}, []string{"a"})
+	if err == nil || !strings.Contains(err.Error(), "unknown parent a") {
+		t.Fatalf("Register under old name: want unknown-parent a, got %v", err)
+	}
+	if !reflect.DeepEqual(snapshot(graph), before) {
+		t.Fatalf("failed registration after rename changed graph")
+	}
+
+	// A new child under the new name lands at the end of z's child list.
+	mustRegister(t, graph, "newkid", "z")
+	assertEntry(t, graph, "z", []string{"source"}, []string{"report", "newkid"})
+	assertEntry(t, graph, "newkid", []string{"z"}, nil)
+	assertConsistent(t, graph)
+
+	// Re-registering z with a replaced upstream list rewires reverse edges
+	// under the new name only; source loses the z child only if dropped.
+	mustRegister(t, graph, "z", "b")
+	assertEntry(t, graph, "z", []string{"b"}, []string{"report", "newkid"})
+	assertEntry(t, graph, "b", []string{"source"}, []string{"report", "z"})
+	assertEntry(t, graph, "source", nil, []string{"b"})
+	assertConsistent(t, graph)
+
+	// Re-registering the new name fresh would just create it if missing, but
+	// here it exists, so graph size stays stable through the re-register.
+	if len(graph) != 5 {
+		t.Fatalf("dataset count = %d, want 5", len(graph))
+	}
+}
+
+// Empty and nil graphs reject every non-empty old name without panicking, and
+// empty names are reported as missing names first.
+func TestRenameOnEmptyAndNilGraph(t *testing.T) {
+	if err := Rename(nil, "", "z"); err == nil ||
+		!strings.Contains(err.Error(), "name is required") {
+		t.Fatalf("nil graph empty old: %v", err)
+	}
+	if err := Rename(nil, "x", ""); err == nil ||
+		!strings.Contains(err.Error(), "new dataset name is required") {
+		t.Fatalf("nil graph empty new: %v", err)
+	}
+	if err := Rename(nil, "x", "z"); err == nil ||
+		!strings.Contains(err.Error(), "x") {
+		t.Fatalf("nil graph missing old: want error naming x, got %v", err)
+	}
+	empty := map[string]*Lineage{}
+	if err := Rename(empty, "x", "z"); err == nil ||
+		!strings.Contains(err.Error(), "x") {
+		t.Fatalf("empty graph missing old: want error naming x, got %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("failed rename populated the empty graph: %v", empty)
+	}
+}

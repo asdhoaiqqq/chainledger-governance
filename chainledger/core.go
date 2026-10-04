@@ -96,6 +96,63 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	return nil
 }
 
+// Rename changes a registered dataset's name while keeping it in exactly the
+// same place in the lineage graph: its set of upstream and downstream edges,
+// their directions and every stored list order are preserved, only the name
+// changes. The old name disappears from the graph; the node keeps its Lineage
+// record (its Dataset field updated to newName) under the new key. Each direct
+// upstream's child list and each direct downstream's parent list has the old
+// name replaced by the new one in its original position: no edge is added,
+// removed or duplicated, and neither side of an unrelated edge is touched.
+//
+// Roots, leaves and interior datasets rename identically. Distances cannot
+// change because the graph's edges are the same; Impacts and Upstreams simply
+// recompute their ordering and tie-broken explanation paths under the new
+// names. Results returned to callers before the rename keep the content they
+// were fetched with, like after any other graph change.
+//
+// The request is validated before the graph is touched, so an empty old or new
+// name, an unregistered old name, or a new name already held by another
+// dataset is rejected with an error naming the offending name and leaves every
+// node, edge and ordering untouched. Names match by exact registered value,
+// case-sensitively. Renaming a registered dataset to the very same name
+// succeeds and changes nothing; the same request for a missing name still
+// reports it as unregistered.
+func Rename(graph map[string]*Lineage, oldName, newName string) error {
+	if oldName == "" {
+		return errInvalid("dataset name is required")
+	}
+	if newName == "" {
+		return errInvalid("new dataset name is required")
+	}
+	entry, ok := graph[oldName]
+	if !ok {
+		return errInvalid("dataset not found: " + oldName)
+	}
+	if oldName == newName {
+		return nil
+	}
+	if _, taken := graph[newName]; taken {
+		return errInvalid("dataset name already in use: " + newName)
+	}
+
+	// Rewrite the name at its existing position on both sides of every
+	// incident edge. The graph invariant maintained by Register (each parent
+	// edge mirrored by exactly one child edge) makes a rename purely local:
+	// the node's own Parents/Children list other datasets, and exactly those
+	// records list the node back.
+	for _, parent := range entry.Parents {
+		graph[parent].Children = replaceName(graph[parent].Children, oldName, newName)
+	}
+	for _, child := range entry.Children {
+		graph[child].Parents = replaceName(graph[child].Parents, oldName, newName)
+	}
+	entry.Dataset = newName
+	delete(graph, oldName)
+	graph[newName] = entry
+	return nil
+}
+
 // ancestorProbe answers "can node reach target by following parent edges?" for
 // many starting nodes against one fixed, read-only snapshot of the graph, i.e.
 // whether target is among each node's direct or transitive upstreams. Each node
@@ -178,6 +235,20 @@ func addChildOnce(children []string, child string) []string {
 		out = append(out, child)
 	}
 	return out
+}
+
+// replaceName rewrites every occurrence of oldName to newName in names without
+// moving any element, reusing the slice's own backing array. In a Register-built
+// graph each incident neighbor list holds the renamed node exactly once;
+// rewriting every match rather than stopping early stays consistent for graphs
+// that happen to carry duplicates as well.
+func replaceName(names []string, oldName, newName string) []string {
+	for i := range names {
+		if names[i] == oldName {
+			names[i] = newName
+		}
+	}
+	return names
 }
 
 // Impact names one dataset directly or indirectly downstream of an impact
