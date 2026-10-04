@@ -193,7 +193,8 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 	// corrupted upstream could then resolve to a genuinely different dataset.
 	// The check runs on the graph's raw bytes and rejects the whole snapshot
 	// even when the declared content identifier happens to match the
-	// rewritten graph's digest. See graph_name_encoding.go.
+	// rewritten graph's digest. The raw scan is the shared one in
+	// name_encoding.go applied to the graph document scope.
 	if err := checkGraphNameEncoding(raw.Graph); err != nil {
 		return nil, err
 	}

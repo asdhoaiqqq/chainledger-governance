@@ -141,6 +141,45 @@ func checkArrayElements(dec *json.Decoder, check func(dec *json.Decoder, index i
 	return err
 }
 
+// scanObjectFields walks the object the decoder is positioned at using exactly
+// the same key recognition and value skipping as checkObjectFields — keys
+// matched after JSON unescaping with Unicode case folding, known fields with a
+// nested checker descended into, every other value skipped with whatever it
+// nests — but WITHOUT the once-only rule: a recognized field is checked on
+// every occurrence instead of rejecting the second one. The raw name-encoding
+// scan (name_encoding.go) uses this walker; it runs only after the
+// duplicate-field scan has already rejected repeated known fields, while it
+// must still validate the literals of every known value the document carries.
+// A value that is not an object is consumed and left for the regular parse.
+func scanObjectFields(dec *json.Decoder, fields []knownField) error {
+	tok, err := scanToken(dec)
+	if err != nil {
+		return err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return skipRest(dec, tok) // not an object: the regular parse reports it
+	}
+	for dec.More() {
+		key, err := scanKey(dec)
+		if err != nil {
+			return err
+		}
+		if field := matchKnownField(key, fields); field != nil && field.nested != nil {
+			if err := field.nested(dec); err != nil {
+				return err
+			}
+			continue
+		}
+		// Unknown field, or a known field without a value checker: ignored
+		// with everything nested inside it.
+		if err := skipValue(dec); err != nil {
+			return err
+		}
+	}
+	_, err = scanToken(dec) // closing '}'
+	return err
+}
+
 // datasetRecordFields is the field scope of one dataset record — the same
 // shape whether the record sits in a graph's "datasets" array or in a plan's
 // "changes" array — so both readers judge one record identically.

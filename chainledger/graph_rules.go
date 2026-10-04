@@ -20,8 +20,9 @@
 //     reject the whole document — the decoder's U+FFFD rewrite is never kept
 //     and the offending node or edge is never skipped, even when the rewrite
 //     would collide with a real dataset or match the snapshot's declared
-//     content identifier; that raw scan is shared by both graph readers and
-//     lives in graph_name_encoding.go;
+//     content identifier; that raw scan is shared by every graph and plan
+//     reader and lives in name_encoding.go (the graph document scope is in
+//     graph_name_encoding.go);
 //   - record order and upstream order are irrelevant, duplicate upstreams count
 //     as one relationship, and an empty upstream list marks a root, so an
 //     empty graph stays legal;
