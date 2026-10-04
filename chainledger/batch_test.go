@@ -601,3 +601,167 @@ func TestBatchUnmarshalRejectsInvalidGraphJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestUnmarshalPlanRejectsDuplicateFields: a known field declared twice within
+// the same object makes the whole plan ambiguous and must be rejected, even
+// when the duplicates carry identical values, one is null, or the surviving
+// value is a legal empty list. Field names are recognized after JSON
+// unescaping and with the decoder's Unicode case folding, so escaped or
+// fold-equivalent spellings of a second declaration still collide.
+func TestUnmarshalPlanRejectsDuplicateFields(t *testing.T) {
+	const (
+		longS       = "ſ" // U+017F LATIN SMALL LETTER LONG S, folds to ASCII "s"
+		longSEscape = "\\" + "u017f"
+	)
+
+	cases := map[string]struct {
+		data     string
+		field    string
+		location string
+	}{
+		"changes twice identical": {
+			`{"changes":[{"name":"A","upstreams":[]}],"changes":[{"name":"A","upstreams":[]}]}`,
+			"changes", "top level",
+		},
+		"real changes then empty replacement": {
+			`{"changes":[{"name":"A","upstreams":[]}],"changes":[]}`,
+			"changes", "top level",
+		},
+		"null changes then real": {
+			`{"changes":null,"changes":[{"name":"A","upstreams":[]}]}`,
+			"changes", "top level",
+		},
+		"removals twice": {
+			`{"removals":["A"],"removals":["B"]}`,
+			"removals", "top level",
+		},
+		"removals then empty replacement": {
+			`{"removals":["A"],"removals":[]}`,
+			"removals", "top level",
+		},
+		"null removals then real": {
+			`{"removals":null,"removals":["A"]}`,
+			"removals", "top level",
+		},
+		"name twice same value": {
+			`{"changes":[{"name":"A","name":"A","upstreams":[]}]}`,
+			"name", `index 0 of "changes"`,
+		},
+		"name twice would swap target": {
+			`{"changes":[{"name":"A","name":"B","upstreams":[]}]}`,
+			"name", `index 0 of "changes"`,
+		},
+		"null name then valid": {
+			`{"changes":[{"name":null,"name":"A","upstreams":[]}]}`,
+			"name", `index 0 of "changes"`,
+		},
+		"upstreams then empty would silently clear": {
+			`{"changes":[{"name":"A","upstreams":["B"],"upstreams":[]}]}`,
+			"upstreams", `index 0 of "changes"`,
+		},
+		"null upstreams then valid in second record": {
+			`{"changes":[{"name":"A","upstreams":[]},{"name":"B","upstreams":null,"upstreams":["A"]}]}`,
+			"upstreams", `index 1 of "changes"`,
+		},
+		"escaped name key": {
+			`{"changes":[{"name":"A","na\u006de":"A","upstreams":[]}]}`,
+			"name", `index 0 of "changes"`,
+		},
+		"case variant name": {
+			`{"changes":[{"Name":"A","name":"A","upstreams":[]}]}`,
+			"name", `index 0 of "changes"`,
+		},
+		"case variant changes": {
+			`{"Changes":[],"changes":[{"name":"A","upstreams":[]}]}`,
+			"changes", "top level",
+		},
+		"case variant removals": {
+			`{"Removals":[],"removals":["A"]}`,
+			"removals", "top level",
+		},
+		"case variant upstreams": {
+			`{"changes":[{"name":"A","UPSTREAMS":[],"upstreams":[]}]}`,
+			"upstreams", `index 0 of "changes"`,
+		},
+		"long s changes": {
+			`{"change` + longS + `":[],"changes":[{"name":"A","upstreams":[]}]}`,
+			"changes", "top level",
+		},
+		"long s upstreams via JSON escape": {
+			`{"changes":[{"name":"A","up` + longSEscape + `treams":[],"upstreams":[]}]}`,
+			"upstreams", `index 0 of "changes"`,
+		},
+		"big number in unknown field before duplicated changes": {
+			`{"note":1e400,"changes":[],"changes":[{"name":"A","upstreams":[]}]}`,
+			"changes", "top level",
+		},
+		"big number nested in record before duplicated upstreams": {
+			`{"changes":[{"name":"A","vals":{"deep":[1e999]},"upstreams":[],"upstreams":[]}]}`,
+			"upstreams", `index 0 of "changes"`,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			// Every "escape" case really must carry ASCII escape bytes.
+			if strings.Contains(name, "escape") && !strings.Contains(tc.data, longSEscape) && !strings.Contains(tc.data, `\u006d`) {
+				t.Fatalf("test case %q does not actually use a JSON escape", name)
+			}
+			_, err := UnmarshalPlan([]byte(tc.data))
+			if !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("err = %v, want ErrInvalidArgument", err)
+			}
+			if !strings.Contains(err.Error(), `"`+tc.field+`"`) {
+				t.Errorf("err = %q, want it to name duplicated field %q", err, tc.field)
+			}
+			if !strings.Contains(err.Error(), tc.location) {
+				t.Errorf("err = %q, want it to locate the duplicate %q", err, tc.location)
+			}
+		})
+	}
+}
+
+// TestUnmarshalPlanDuplicateTolerances: repetitions that do NOT create
+// ambiguity stay legal — unknown fields may repeat anywhere (even holding
+// duplicate keys or oversized numbers inside), each change record declares
+// its own name, and duplicate names inside one upstreams array still count
+// as one relationship. A known field written once in a case-variant or
+// fold-equivalent spelling is still recognized.
+func TestUnmarshalPlanDuplicateTolerances(t *testing.T) {
+	cases := map[string]string{
+		"empty plan":                        `{}`,
+		"empty changes and removals":        `{"changes":[],"removals":[]}`,
+		"removals only":                     `{"removals":["A"]}`,
+		"unknown top-level field repeats":   `{"meta":"x","meta":"y","changes":[{"name":"A","upstreams":[]}]}`,
+		"unknown record field repeats":      `{"changes":[{"name":"A","note":1,"note":2,"upstreams":[]}]}`,
+		"known keys nested inside unknown field": `{"meta":{"changes":[],"changes":[],"name":"A","upstreams":null},` +
+			`"changes":[{"name":"A","upstreams":[]}]}`,
+		"big numbers in unknown fields":          `{"note":1e400,"changes":[{"name":"A","upstreams":[],"extra":[1e999,{"z":-1e400}]}]}`,
+		"case variant spellings declared once":   `{"Changes":[{"Name":"A","Upstreams":[]}],"Removals":["B"]}`,
+		"duplicate names inside upstreams array": `{"changes":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A","A"]}]}`,
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			plan, err := UnmarshalPlan([]byte(data))
+			if err != nil {
+				t.Fatalf("UnmarshalPlan rejected a legal document: %v", err)
+			}
+			if name == "duplicate names inside upstreams array" {
+				// The duplicate upstream still counts once downstream: the
+				// plan parses, and normalization happens in computeBatch.
+				if len(plan.Changes) != 2 {
+					t.Fatalf("plan.Changes = %v, want 2 records", plan.Changes)
+				}
+			}
+		})
+	}
+
+	// Dataset names stay case-sensitive and keep their spaces; only field
+	// names fold. Two records named " A " and "a" are distinct declarations.
+	plan, err := UnmarshalPlan([]byte(`{"changes":[{"name":" A ","upstreams":[]},{"name":"a","upstreams":[" A "]}]}`))
+	if err != nil {
+		t.Fatalf("case/space-sensitive dataset names rejected: %v", err)
+	}
+	if len(plan.Changes) != 2 || plan.Changes[0].Name != " A " || plan.Changes[1].Name != "a" {
+		t.Errorf("plan.Changes = %+v, want names %q and %q preserved verbatim", plan.Changes, " A ", "a")
+	}
+}

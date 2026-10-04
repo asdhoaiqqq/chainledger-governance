@@ -379,3 +379,81 @@ func TestCLIGraphFileDuplicateFieldsRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestCLIPlanDuplicateFieldsRejected: a plan that declares a known field
+// twice (changes or removals at the top level, name or upstreams inside a
+// change record) is ambiguous — preview and apply would silently keep only
+// the last declaration — so both must refuse it: non-zero exit, empty
+// stdout, stderr naming the plan file, the repeated field, and where it
+// occurred. The graph and plan files must stay byte-for-byte untouched.
+func TestCLIPlanDuplicateFieldsRejected(t *testing.T) {
+	plans := map[string]struct {
+		data     string
+		field    string
+		location string
+	}{
+		"changes twice": {
+			`{"changes":[{"name":"A","upstreams":["B"]}],"changes":[]}`,
+			`"changes"`, "top level",
+		},
+		"removals twice": {
+			`{"removals":["A"],"removals":[]}`,
+			`"removals"`, "top level",
+		},
+		"name twice in record": {
+			`{"changes":[{"name":"A","name":"B","upstreams":[]}]}`,
+			`"name"`, `index 0 of "changes"`,
+		},
+		"upstreams twice in record": {
+			`{"changes":[{"name":"B","upstreams":["A"],"upstreams":[]}]}`,
+			`"upstreams"`, `index 0 of "changes"`,
+		},
+		"case variant changes": {
+			`{"Changes":[],"changes":[{"name":"A","upstreams":[]}]}`,
+			`"changes"`, "top level",
+		},
+	}
+	graphData := `{"datasets":[{"name":"A","upstreams":[]},{"name":"B","upstreams":["A"]}]}`
+
+	for name, tc := range plans {
+		t.Run(name, func(t *testing.T) {
+			graphPath := writeFile(t, "graph.json", graphData)
+			planPath := writeFile(t, "plan.json", tc.data)
+			graphBefore := readFile(t, graphPath)
+			planBefore := readFile(t, planPath)
+
+			stdout, stderr, exit := captureStdout(t, func() int {
+				return run([]string{"preview", graphPath, planPath})
+			})
+			if exit == 0 {
+				t.Fatalf("preview succeeded on duplicate-field plan, stdout = %s", stdout)
+			}
+			if stdout != "" {
+				t.Errorf("preview stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, planPath) || !strings.Contains(stderr, tc.field) || !strings.Contains(stderr, tc.location) {
+				t.Errorf("preview stderr = %q, want it to name %q, field %s, and location %q", stderr, planPath, tc.field, tc.location)
+			}
+
+			stdout, stderr, exit = captureStdout(t, func() int {
+				return run([]string{"apply", graphPath, planPath})
+			})
+			if exit == 0 {
+				t.Fatalf("apply succeeded on duplicate-field plan, stdout = %s", stdout)
+			}
+			if stdout != "" {
+				t.Errorf("apply stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, planPath) || !strings.Contains(stderr, tc.field) || !strings.Contains(stderr, tc.location) {
+				t.Errorf("apply stderr = %q, want it to name %q, field %s, and location %q", stderr, planPath, tc.field, tc.location)
+			}
+
+			if got := readFile(t, graphPath); got != graphBefore {
+				t.Errorf("graph file changed after rejected plan:\n got %s\nwant %s", got, graphBefore)
+			}
+			if got := readFile(t, planPath); got != planBefore {
+				t.Errorf("plan file changed after rejection:\n got %s\nwant %s", got, planBefore)
+			}
+		})
+	}
+}
