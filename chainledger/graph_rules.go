@@ -26,6 +26,13 @@
 //   - record order and upstream order are irrelevant, duplicate upstreams count
 //     as one relationship, and an empty upstream list marks a root, so an
 //     empty graph stays legal;
+//   - the reverse direction is derived, never stored: each dataset's direct
+//     downstreams are reconstructed from the parent edges by the one shared
+//     rule childrenFromParents, used alike by the graph/snapshot readers
+//     (lineageFromAdjacency), the batch commit (applyAdjacency), and the
+//     batch impact walk, so every direct-upstream/direct-downstream pair
+//     corresponds and both lists stay sorted by name byte order and
+//     duplicate-free wherever a graph is built or rewritten;
 //   - a known field declared twice within the same object (datasets in the
 //     graph object, name or upstreams in a dataset record) is rejected,
 //     however the two declarations are spelled; that JSON-level scan is
@@ -211,13 +218,38 @@ func lineageFromAdjacency(adj adjacency) map[string]*Lineage {
 			Parents: append([]string(nil), parents...),
 		}
 	}
-	for name, parents := range adj {
-		for _, parent := range parents {
-			graph[parent].Children = append(graph[parent].Children, name)
-		}
-	}
+	// Derive the reverse direction with the single shared rule the batch
+	// commit uses, so reading a graph and applying a batch can never maintain
+	// parent/child correspondence differently.
+	children := childrenFromParents(adj)
 	for name := range graph {
-		graph[name].Children = uniqueSorted(graph[name].Children)
+		graph[name].Children = children[name]
 	}
 	return graph
+}
+
+// childrenFromParents is the single authority for deriving each dataset's
+// direct downstreams (children) from the parent adjacency: for every edge
+// downstream -> parent, downstream is appended to parent's child list, and
+// every resulting list is sorted by name byte order and deduplicated. It is
+// pure: the adjacency is only read, and the returned lists are freshly
+// allocated.
+//
+// Both ways a Lineage graph comes to exist route through this rule: reading a
+// graph file or snapshot (lineageFromAdjacency) and committing a batch
+// (applyAdjacency). The batch impact walk derives its original/final reverse
+// views with the same rule rather than maintaining its own inversion, so a
+// replacement that drops an old upstream or registers a new one updates, and
+// never duplicates, the reverse relationship exactly as a fresh read would.
+func childrenFromParents(adj adjacency) map[string][]string {
+	children := make(map[string][]string, len(adj))
+	for downstream, parents := range adj {
+		for _, parent := range parents {
+			children[parent] = append(children[parent], downstream)
+		}
+	}
+	for name := range children {
+		children[name] = uniqueSorted(children[name])
+	}
+	return children
 }

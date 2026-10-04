@@ -337,7 +337,11 @@ func ApplyBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, error) {
 
 // applyAdjacency rewrites the in-memory graph to match the final adjacency:
 // nodes absent from final are removed, parents are replaced, and children are
-// rebuilt from the parent edges.
+// rebuilt from the parent edges. The reverse direction is derived by the same
+// shared rule a graph reader uses (childrenFromParents), so an applied graph
+// and a freshly read one keep parent/child correspondence identically: a
+// replaced edge leaves the old upstream's child list, a new upstream lists the
+// downstream exactly once, and an unadjusted relationship is retained.
 func applyAdjacency(graph map[string]*Lineage, final adjacency) {
 	for name := range graph {
 		if _, ok := final[name]; !ok {
@@ -354,13 +358,12 @@ func applyAdjacency(graph map[string]*Lineage, final adjacency) {
 		entry.Parents = append([]string(nil), parents...)
 		entry.Children = nil
 	}
-	for name, parents := range final {
-		for _, parent := range parents {
-			graph[parent].Children = append(graph[parent].Children, name)
-		}
-	}
+	// Derive every child list once, from the committed parent edges, rather
+	// than patching lists edge by edge: this is the exact rule
+	// lineageFromAdjacency applies when reading a graph file or snapshot.
+	children := childrenFromParents(final)
 	for name := range graph {
-		graph[name].Children = uniqueSorted(graph[name].Children)
+		graph[name].Children = children[name]
 	}
 }
 
@@ -428,8 +431,11 @@ func affectedDownstreams(original, final adjacency, newNames, changedNames, remo
 		seeds[name] = true
 	}
 
-	origChildren := invertAdjacency(original)
-	finalChildren := invertAdjacency(final)
+	// Both reverse views come from the single shared derivation rule, the
+	// same one that rebuilds the graph when the batch commits, so the impact
+	// walk follows exactly the children a read or apply would materialize.
+	origChildren := childrenFromParents(original)
+	finalChildren := childrenFromParents(final)
 
 	seen := make(map[string]bool)
 	queue := make([]string, 0, len(seeds))
@@ -461,21 +467,6 @@ func affectedDownstreams(original, final adjacency, newNames, changedNames, remo
 	}
 	sort.Strings(out)
 	return out
-}
-
-// invertAdjacency maps each dataset to the datasets that depend on it (its
-// children), with each child list sorted by name.
-func invertAdjacency(adj adjacency) map[string][]string {
-	children := make(map[string][]string, len(adj))
-	for name, parents := range adj {
-		for _, parent := range parents {
-			children[parent] = append(children[parent], name)
-		}
-	}
-	for name := range children {
-		sort.Strings(children[name])
-	}
-	return children
 }
 
 // adjacencyToDatasets renders the final adjacency as sorted, JSON-ready
