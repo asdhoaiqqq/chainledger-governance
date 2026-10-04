@@ -180,7 +180,7 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	// a dataset whose name cannot be exported — two names differing only in an
 	// invalid byte ("p\xff" vs "p\xfe") would even render identically once the
 	// report is marshaled. This is the in-memory counterpart of
-	// checkPlanNameEncoding; see plan_name_encoding.go.
+	// checkPlanNameEncoding; see name_encoding.go.
 	if err := validatePlanNamesUTF8(plan); err != nil {
 		return nil, nil, err
 	}
@@ -547,7 +547,7 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	// would be silently rewritten to U+FFFD by json.Unmarshal, and a corrupted
 	// upstream could then resolve to a genuinely different dataset (an edge
 	// written as "源" plus a lone \uD800 would point at the real dataset
-	// "源�"). See graph_name_encoding.go.
+	// "源�"). See name_encoding.go.
 	if err := checkGraphNameEncoding(data); err != nil {
 		return nil, err
 	}
@@ -591,7 +591,7 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 // that does not exist. A genuine "�", correctly paired surrogate escapes,
 // and names that merely look like escapes (a backslash before an ordinary
 // letter) stay legal; unknown fields and their nested strings are not
-// checked. See plan_name_encoding.go.
+// checked. See name_encoding.go.
 func UnmarshalPlan(data []byte) (Plan, error) {
 	var p Plan
 	if err := checkPlanDuplicateFields(data); err != nil {
