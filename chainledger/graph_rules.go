@@ -18,8 +18,9 @@
 //     as one relationship, and an empty upstream list marks a root, so an
 //     empty graph stays legal;
 //   - a known field declared twice within the same object (datasets in the
-//     graph object, name or upstreams in a dataset record) is rejected, however
-//     the two declarations are spelled.
+//     graph object, name or upstreams in a dataset record) is rejected,
+//     however the two declarations are spelled; that JSON-level scan is
+//     shared by every document reader and lives in duplicate_fields.go.
 //
 // The snapshot-only envelope rules (required fields, format version, content
 // identifier, and duplicates of the snapshot's own fields) live in

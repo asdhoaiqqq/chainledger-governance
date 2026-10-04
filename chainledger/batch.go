@@ -2,12 +2,9 @@
 package chainledger
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
-	"strings"
 )
 
 // PlanChange is one record in a lineage adjustment plan: the dataset name and
@@ -497,118 +494,35 @@ func UnmarshalPlan(data []byte) (Plan, error) {
 	return p, nil
 }
 
-// checkPlanDuplicateFields rejects a plan in which a known field is declared
-// more than once within the same object: changes or removals at the top
-// level, and name or upstreams inside each change record. It reuses the
-// snapshot/graph scanner (UseNumber decoding, case-folded key matching,
-// abort-on-malformed), so a plan can never be judged differently from the
-// other documents about what counts as a repeated field, and an oversized
-// number buried in an ignored unknown field cannot hide a later duplicate.
-// Documents not shaped like a plan are left to the regular parse.
+// checkGraphFileDuplicateFields applies the shared repeated-known-field rule
+// (see duplicate_fields.go) to a standalone graph file, supplying the graph
+// file's own location: datasets may be declared only once in the top-level
+// graph object, and name and upstreams only once in each dataset record. The
+// scan is the same checkGraphObject ParseSnapshot runs on the embedded graph,
+// so preview, apply, and snapshot can never disagree about a graph that
+// repeats a known field.
+func checkGraphFileDuplicateFields(data []byte) error {
+	return runFieldScan(data, func(dec *json.Decoder) error {
+		return checkGraphObject(dec, "at the top level of the graph")
+	})
+}
+
+// checkPlanDuplicateFields applies the shared repeated-known-field rule (see
+// duplicate_fields.go) to a plan, supplying the plan's own field scope and
+// locations: changes or removals at the top level, and name or upstreams
+// inside each change record. A change record carries the same fields as a
+// dataset record, so both use the shared datasetRecordFields scope and a plan
+// can never be judged differently from the other documents about what counts
+// as a repeated field.
 func checkPlanDuplicateFields(data []byte) error {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	err := checkPlanTopLevel(dec)
-	if errors.Is(err, errAbortScan) {
-		return nil
-	}
-	return err
-}
-
-// checkPlanTopLevel scans the top-level plan object for repeated
-// changes/removals declarations, descending into the changes array.
-func checkPlanTopLevel(dec *json.Decoder) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return nil // not an object: the regular parse reports the type error
-	}
-	seen := make(map[string]bool, 2)
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		field, known := planField(key)
-		if known {
-			if seen[field] {
-				return duplicateFieldError(field, "at the top level of the plan")
-			}
-			seen[field] = true
-		}
-		if field == "changes" {
-			if err := checkChangesValue(dec); err != nil {
-				return err
-			}
-		} else if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
-}
-
-// checkChangesValue scans one changes array, checking every record that is
-// an object for repeated name/upstreams declarations.
-func checkChangesValue(dec *json.Decoder) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '[' {
-		return skipRest(dec, tok) // not an array: the regular parse reports it
-	}
-	for index := 0; dec.More(); index++ {
-		if err := checkChangeRecord(dec, index); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing ']'
-	return err
-}
-
-// checkChangeRecord scans one element of the changes array. If it is an
-// object, name and upstreams must each be declared at most once.
-func checkChangeRecord(dec *json.Decoder, index int) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return skipRest(dec, tok) // not an object: the regular parse reports it
-	}
-	seen := make(map[string]bool, 2)
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		// A change record carries the same fields as a dataset record, so the
-		// shared datasetField mapping keeps the two readers in lockstep.
-		if field, known := datasetField(key); known {
-			if seen[field] {
-				return duplicateFieldError(field, fmt.Sprintf("in the change record at index %d of \"changes\"", index))
-			}
-			seen[field] = true
-		}
-		if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
-}
-
-// planField maps a top-level plan key to the canonical name of the plan field
-// it selects, matching the decoder's case-insensitive field lookup.
-func planField(key string) (string, bool) {
-	switch {
-	case strings.EqualFold(key, "changes"):
-		return "changes", true
-	case strings.EqualFold(key, "removals"):
-		return "removals", true
-	}
-	return "", false
+	return runFieldScan(data, func(dec *json.Decoder) error {
+		return checkObjectFields(dec, "at the top level of the plan", []knownField{
+			{name: "changes", nested: func(dec *json.Decoder) error {
+				return checkArrayElements(dec, func(dec *json.Decoder, index int) error {
+					return checkObjectFields(dec, fmt.Sprintf("in the change record at index %d of \"changes\"", index), datasetRecordFields)
+				})
+			}},
+			{name: "removals"},
+		})
+	})
 }
