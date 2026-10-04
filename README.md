@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -371,16 +371,244 @@ b        distance=2 path=[b c report]
 - **原名称与新名称相同且确实存在时，成功返回且图不变**；不存在的同名请求仍报告未登记。
 - 更名后旧名称可以当作全新数据集重新 `Register`，更名后的节点也可以用新名称继续参与登记。
 
-```go
-graph := map[string]*chainledger.Lineage{}
-// ... 先登记 source -> a, source -> b, report 依赖 a 和 b ...
-if err := chainledger.Rename(graph, "a", "z"); err != nil {
-	fmt.Println(err) // 失败原因，如 dataset not found: a
-	return
-}
-// report 的直接上游中原来 a 的位置变为 z；从 source 查询 report 的
-// 最短说明路径按新名称重新计算为 [source b report]（b < z）。
+下面的示例与 [`examples/rename`](examples/rename/main.go) 中的可独立运行程序一致，可在仓库根目录执行 `go run ./examples/rename` 复现。程序从一张**空的内存血缘图**开始，用 `Register` 自己登记全部数据，不依赖任何外部服务。登记的是两条等长分支汇合到同一派生数据集 `report`、`report` 再派生 `view` 的血缘，另有一个与起点无关的 `isolated`；随后对其中一条分支里的中间数据集 `a` 做一次更名：
+
 ```
+source ──> a ──> z ──┐
+  │                  ├──> report ──> view
+  └──> b ──> c ──────┘
+```
+
+特意先登记 `b` 侧分支，并在 `report` 的上游列表里把 `c` 写在 `z` 前面——这两点都不决定等长路径选哪条。新名称选 `m`：它在 Go 字符串顺序中排在 `b` 之后，能让更名前后等长说明路径从一条分支切到另一条分支。
+
+```go
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/asdhoaiqqq/chainledger-governance/chainledger"
+)
+
+func main() {
+	// 血缘图从一张空的内存 map 开始，由 Register 填充。
+	graph := map[string]*chainledger.Lineage{}
+
+	register := func(name string, parents ...string) {
+		if err := chainledger.Register(graph, chainledger.Dataset{Name: name}, parents); err != nil {
+			fmt.Fprintf(os.Stderr, "register %s: %v\n", name, err)
+			os.Exit(1)
+		}
+	}
+
+	register("source")
+	register("b", "source")
+	register("a", "source")
+	register("c", "b")
+	register("z", "a")
+	register("report", "c", "z")
+	register("view", "report")
+	register("isolated")
+
+	// edges 直接读图这个 map：parents 是直接上游，children 是直接下游；
+	// 当前未登记的名称打印 <unregistered>，旧名换新名就在原位置可见。
+	edges := func(names ...string) {
+		for _, name := range names {
+			if e, ok := graph[name]; ok {
+				fmt.Printf("  %-8s parents=%v children=%v\n", name, e.Parents, e.Children)
+			} else {
+				fmt.Printf("  %-8s <unregistered>\n", name)
+			}
+		}
+	}
+
+	printImpacts := func(found []chainledger.Impact) {
+		for _, im := range found {
+			fmt.Printf("  %-8s distance=%d path=%v\n", im.Dataset, im.Distance, im.Path)
+		}
+	}
+	printUpstreams := func(found []chainledger.Upstream) {
+		for _, up := range found {
+			fmt.Printf("  %-8s distance=%d path=%v\n", up.Dataset, up.Distance, up.Path)
+		}
+	}
+
+	impacts := func(origin string) []chainledger.Impact {
+		found, err := chainledger.Impacts(graph, origin)
+		if err != nil {
+			fmt.Printf("Impacts(%q) error: %v\n", origin, err)
+			return nil
+		}
+		fmt.Printf("Impacts(%q) -> %d downstream dataset(s):\n", origin, len(found))
+		printImpacts(found)
+		return found
+	}
+	upstreams := func(target string) []chainledger.Upstream {
+		found, err := chainledger.Upstreams(graph, target)
+		if err != nil {
+			fmt.Printf("Upstreams(%q) error: %v\n", target, err)
+			return nil
+		}
+		fmt.Printf("Upstreams(%q) -> %d upstream dataset(s):\n", target, len(found))
+		printUpstreams(found)
+		return found
+	}
+	rename := func(oldName, newName string) {
+		if err := chainledger.Rename(graph, oldName, newName); err != nil {
+			fmt.Printf("Rename(%s, %s) refused: %v\n", oldName, newName, err)
+			return
+		}
+		fmt.Printf("Rename(%s, %s) ok\n", oldName, newName)
+	}
+
+	// 旧名和将来的新名都列进邻接输出，每个阶段都有一个显示 <unregistered>。
+	allNames := []string{"source", "a", "m", "b", "c", "z", "report", "view", "isolated"}
+
+	// 更名前先在两个方向上各查一次并保存返回切片；每条 Path 都是独立拷贝，
+	// 之后的更名和新查询不会改写这些结果。
+	fmt.Println("== before the rename ==")
+	edges(allNames...)
+	fmt.Printf("datasets in graph: %d\n", len(graph))
+	impactsBefore := impacts("source")
+	upstreamsBefore := upstreams("report")
+
+	// c 已被另一条分支上的数据集占用：新名称冲突，更名被拒绝，错误指出冲突名。
+	rename("a", "c")
+	fmt.Println("== after the refused rename ==")
+	edges(allNames...)
+	fmt.Printf("datasets in graph: %d\n", len(graph))
+	impacts("source")
+	upstreams("report")
+
+	// 合法更名：m 在字符串顺序上排在 b 之后，等长路径的整路比较因此改选另一分支。
+	rename("a", "m")
+	fmt.Println("== after the rename ==")
+	edges(allNames...)
+	fmt.Printf("datasets in graph: %d\n", len(graph))
+
+	// 更名前取得的切片仍是原名称、原路径；只有针对当前图重新查询才反映更名。
+	fmt.Println("== results obtained before the rename, printed again now ==")
+	fmt.Println(`Impacts("source") snapshot from before the rename:`)
+	printImpacts(impactsBefore)
+	fmt.Println(`Upstreams("report") snapshot from before the rename:`)
+	printUpstreams(upstreamsBefore)
+
+	fmt.Println("== results re-queried after the rename ==")
+	impacts("source")
+	upstreams("report")
+
+	// 旧名称不是别名：更名成功后它就是未登记名称，两个查询方向都如此报告。
+	impacts("a")
+	upstreams("a")
+}
+```
+
+实际输出（错误、邻接列表和查询结果都是程序真实打印，不是示意）：
+
+```text
+== before the rename ==
+  source   parents=[] children=[b a]
+  a        parents=[source] children=[z]
+  m        <unregistered>
+  b        parents=[source] children=[c]
+  c        parents=[b] children=[report]
+  z        parents=[a] children=[report]
+  report   parents=[c z] children=[view]
+  view     parents=[report] children=[]
+  isolated parents=[] children=[]
+datasets in graph: 8
+Impacts("source") -> 6 downstream dataset(s):
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  c        distance=2 path=[source b c]
+  z        distance=2 path=[source a z]
+  report   distance=3 path=[source a z report]
+  view     distance=4 path=[source a z report view]
+Upstreams("report") -> 5 upstream dataset(s):
+  c        distance=1 path=[c report]
+  z        distance=1 path=[z report]
+  a        distance=2 path=[a z report]
+  b        distance=2 path=[b c report]
+  source   distance=3 path=[source a z report]
+Rename(a, c) refused: dataset name already in use: c
+== after the refused rename ==
+  source   parents=[] children=[b a]
+  a        parents=[source] children=[z]
+  m        <unregistered>
+  b        parents=[source] children=[c]
+  c        parents=[b] children=[report]
+  z        parents=[a] children=[report]
+  report   parents=[c z] children=[view]
+  view     parents=[report] children=[]
+  isolated parents=[] children=[]
+datasets in graph: 8
+Impacts("source") -> 6 downstream dataset(s):
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  c        distance=2 path=[source b c]
+  z        distance=2 path=[source a z]
+  report   distance=3 path=[source a z report]
+  view     distance=4 path=[source a z report view]
+Upstreams("report") -> 5 upstream dataset(s):
+  c        distance=1 path=[c report]
+  z        distance=1 path=[z report]
+  a        distance=2 path=[a z report]
+  b        distance=2 path=[b c report]
+  source   distance=3 path=[source a z report]
+Rename(a, m) ok
+== after the rename ==
+  source   parents=[] children=[b m]
+  a        <unregistered>
+  m        parents=[source] children=[z]
+  b        parents=[source] children=[c]
+  c        parents=[b] children=[report]
+  z        parents=[m] children=[report]
+  report   parents=[c z] children=[view]
+  view     parents=[report] children=[]
+  isolated parents=[] children=[]
+datasets in graph: 8
+== results obtained before the rename, printed again now ==
+Impacts("source") snapshot from before the rename:
+  a        distance=1 path=[source a]
+  b        distance=1 path=[source b]
+  c        distance=2 path=[source b c]
+  z        distance=2 path=[source a z]
+  report   distance=3 path=[source a z report]
+  view     distance=4 path=[source a z report view]
+Upstreams("report") snapshot from before the rename:
+  c        distance=1 path=[c report]
+  z        distance=1 path=[z report]
+  a        distance=2 path=[a z report]
+  b        distance=2 path=[b c report]
+  source   distance=3 path=[source a z report]
+== results re-queried after the rename ==
+Impacts("source") -> 6 downstream dataset(s):
+  b        distance=1 path=[source b]
+  m        distance=1 path=[source m]
+  c        distance=2 path=[source b c]
+  z        distance=2 path=[source m z]
+  report   distance=3 path=[source b c report]
+  view     distance=4 path=[source b c report view]
+Upstreams("report") -> 5 upstream dataset(s):
+  c        distance=1 path=[c report]
+  z        distance=1 path=[z report]
+  b        distance=2 path=[b c report]
+  m        distance=2 path=[m z report]
+  source   distance=3 path=[source b c report]
+Impacts("a") error: dataset not found: a
+Upstreams("a") error: dataset not found: a
+```
+
+要点：
+
+- **更名保留了原来的依赖位置。** 邻接列表直接读自图这个 map：更名后 `source` 的下游仍是两项，只是原位置的 `a` 换成 `m`（`children=[b m]`），`z` 的上游由 `[a]` 变为 `[m]`；`m` 自身仍是 `parents=[source] children=[z]`，汇合点 `report` 的 `parents=[c z]`、`view` 的关系都没有动。旧名 `a` 显示 `<unregistered>`，而图中数据集数量更名前后都是 8。
+- **最短距离一个都没变。** 更名后 `Impacts("source")` 仍是 6 个下游，`m` 接替 `a` 在距离 1，`z` 仍在距离 2，`report` 距离 3、`view` 距离 4；`Upstreams("report")` 仍是 5 个上游，各距离也保持不变。变化的只有名称：同距离结果按当前名称排序（距离 1 由 `a, b` 变为 `b, m`）。
+- **等长说明路径切到了另一条分支，而这来自整条路径逐跳比较。** 更名前汇合点 `report` 的两条等长最短路径是 `[source a z report]` 与 `[source b c report]`，从起点开始逐跳比较，第 1 跳 `a < b`，所以选 a 侧路线，`view` 在这条路线上再延伸一跳。更名后两条路线变成 `[source m z report]` 与 `[source b c report]`，仍是第 1 跳分出胜负，这次 `b < m`，于是改选 b 侧路线；`Upstreams("report")` 里共享来源 `source` 的路径同样切成 `[source b c report]`。如果只比较汇合点的直接上游，会因为 `c < z` 永远选 b 侧路线，根本观察不到更名带来的这次翻转——所以比较的是从路径起点开始的整条路径，不能给人“只比较汇合点直接上游”的印象。
+- **两个查询方向的路径都沿实际派生方向书写。** `Impacts` 的路径从起点 `source` 写到受影响数据集；`Upstreams` 的路径同样从来源写到被查询的 `report`（如距离 1 的 `[c report]`、距离 3 的 `[source b c report]`），不会因为是“向上查”就倒着写。
+- **旧结果保留原内容，之后的查询才反映新名称。** 更名前取得的 `impactsBefore`、`upstreamsBefore` 在更名后再次打印，仍是 `a` 和 `[source a z report]` 等原内容；只有更名后重新调用 `Impacts`、`Upstreams` 得到的结果才出现 `m` 和 b 侧路径。更名成功后再用旧名查询，两个方向都明确返回 `dataset not found: a`——旧名称不是仍可查询的别名。
+- **新名称被占用的更名尝试被原子拒绝。** `Rename(a, c)` 因为 `c` 已被另一分支上的数据集登记而失败，错误直接指出冲突名称（`dataset name already in use: c`）；拒绝后邻接列表、数据集数量和两个方向的查询结果与更名前**完全一致**（仍是 `children=[b a]`、路径仍走 a 侧），随后合法的 `Rename(a, m)` 才生效。
+- 更名只通过 Go 库调用；命令行继续只有 `demo`、`version`、`help` 三个固定入口，用途和行为不变。
 
 ## 移除数据集登记（Go 库）
 
