@@ -434,10 +434,17 @@ func stringSliceEqual(a, b []string) bool {
 }
 
 // MarshalGraphFile serializes the in-memory graph to the on-disk JSON format.
-// The graph must be valid; an invalid graph returns an error.
+// The graph must satisfy every structure rule a reader enforces; nil nodes,
+// empty names, missing upstreams, and dependency cycles (including a dataset
+// that lists itself) reject the export with no bytes returned, so a successful
+// result can always be read back with UnmarshalGraphFile. The check is
+// read-only: the in-memory graph is never modified.
 func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 	adj, err := graphAdjacency(graph)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateAcyclic(adj); err != nil {
 		return nil, err
 	}
 	gf := GraphFile{Datasets: adjacencyToDatasets(adj)}
