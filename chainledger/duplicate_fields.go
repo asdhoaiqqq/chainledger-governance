@@ -1,19 +1,32 @@
 // Package chainledger implements the on-chain data governance core.
 //
-// This file is the single implementation of the repeated-known-field rule
-// shared by every JSON document the readers understand (snapshot, standalone
-// graph file, and adjustment plan): within one object, a field the reader
-// recognizes may be declared only once. A repeated declaration is ambiguous —
-// the regular decoder would silently keep only the last value — so the whole
-// document is refused, even when the duplicates carry identical values, the
-// first is null, or the surviving value would pass every other check. Unknown
-// fields keep their ignore-everything behavior and may repeat freely.
+// This file holds the single object-walking rule shared by the two raw-JSON
+// checks every reader runs over the documents it understands (snapshot,
+// standalone graph file, and adjustment plan):
+//
+//   - The repeated-known-field rule: within one object, a field the reader
+//     recognizes may be declared only once. A repeated declaration is
+//     ambiguous — the regular decoder would silently keep only the last
+//     value — so the whole document is refused, even when the duplicates
+//     carry identical values, the first is null, or the surviving value
+//     would pass every other check.
+//   - The raw name-encoding rule (name_encoding.go) validates, in its own
+//     pass, each name the document carries against its raw string literal.
+//
+// The two checks run as separate passes in each reader's fixed order, but
+// traverse objects with exactly the same walk below: keys are recognized
+// after JSON unescaping with Unicode case folding, a known field whose value
+// nests another checked object or array is descended into, and every other
+// value — unknown fields included, with everything nested inside them — is
+// skipped. Unknown fields keep their ignore-everything behavior and may
+// repeat freely; their duplicate keys, keys that merely spell a known field,
+// and corrupt strings never reach either check.
 //
 // Each document supplies only its own field scope (which keys are known at
 // each level, and which known field's value nests another checked object or
-// array) and its own error locations; the walking, matching, and error
-// formatting below are common, so the three readers can never drift apart
-// about what counts as a duplicate.
+// array) and its own error locations; the walking and matching below are
+// common, so the readers can never drift apart about which fields are known,
+// how a record is read, or what counts as a duplicate.
 //
 // Matching rules, common to every document:
 //
@@ -82,43 +95,21 @@ func matchKnownField(key string, fields []knownField) *knownField {
 	return nil
 }
 
-// checkObjectFields scans the object the decoder is positioned at: each known
-// field may be declared at most once, known fields with a nested check descend
-// into their value, and every other value is skipped. location describes the
-// object itself in duplicate errors. A value that is not an object is consumed
-// and left for the regular parse to report.
+// checkObjectFields runs the once-only pass of the shared object walk: each
+// known field may be declared at most once, and a second declaration of one
+// — matched case-folded, even when the two values are identical, one is
+// null, or one is an empty list — rejects the whole document. location
+// describes the object itself in the duplicate error. A value that is not an
+// object is consumed and left for the regular parse to report.
 func checkObjectFields(dec *json.Decoder, location string, fields []knownField) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return skipRest(dec, tok) // not an object: the regular parse reports it
-	}
 	seen := make(map[string]bool, len(fields))
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
+	return walkKnownObject(dec, fields, func(field *knownField) error {
+		if seen[field.name] {
+			return duplicateFieldError(field.name, location)
 		}
-		if field := matchKnownField(key, fields); field != nil {
-			if seen[field.name] {
-				return duplicateFieldError(field.name, location)
-			}
-			seen[field.name] = true
-			if field.nested != nil {
-				if err := field.nested(dec); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
-	return err
+		seen[field.name] = true
+		return nil
+	})
 }
 
 // checkArrayElements scans the array the decoder is positioned at, running
@@ -141,17 +132,18 @@ func checkArrayElements(dec *json.Decoder, check func(dec *json.Decoder, index i
 	return err
 }
 
-// scanObjectFields walks the object the decoder is positioned at using exactly
-// the same key recognition and value skipping as checkObjectFields — keys
-// matched after JSON unescaping with Unicode case folding, known fields with a
-// nested checker descended into, every other value skipped with whatever it
-// nests — but WITHOUT the once-only rule: a recognized field is checked on
-// every occurrence instead of rejecting the second one. The raw name-encoding
-// scan (name_encoding.go) uses this walker; it runs only after the
-// duplicate-field scan has already rejected repeated known fields, while it
-// must still validate the literals of every known value the document carries.
-// A value that is not an object is consumed and left for the regular parse.
-func scanObjectFields(dec *json.Decoder, fields []knownField) error {
+// walkKnownObject is the one object traversal shared by both raw-JSON checks.
+// It walks the object the decoder is positioned at: keys are matched after
+// JSON unescaping with Unicode case folding; every time a key selects a
+// known field, onKnown is invoked with that field (it enforces the once-only
+// rule in a duplicate pass and is nil in a name-encoding pass), and then a
+// known field with a nested checker is descended into while every other
+// value — an unknown field, or a known field without a nested checker — is
+// skipped together with whatever it nests. Without the once-only rule a
+// recognized field is reached on every occurrence; with it, onKnown rejects
+// the second one before its value is examined. A value that is not an object
+// is consumed and left for the regular parse to report.
+func walkKnownObject(dec *json.Decoder, fields []knownField, onKnown func(field *knownField) error) error {
 	tok, err := scanToken(dec)
 	if err != nil {
 		return err
@@ -164,11 +156,18 @@ func scanObjectFields(dec *json.Decoder, fields []knownField) error {
 		if err != nil {
 			return err
 		}
-		if field := matchKnownField(key, fields); field != nil && field.nested != nil {
-			if err := field.nested(dec); err != nil {
-				return err
+		if field := matchKnownField(key, fields); field != nil {
+			if onKnown != nil {
+				if err := onKnown(field); err != nil {
+					return err
+				}
 			}
-			continue
+			if field.nested != nil {
+				if err := field.nested(dec); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		// Unknown field, or a known field without a value checker: ignored
 		// with everything nested inside it.
@@ -178,6 +177,17 @@ func scanObjectFields(dec *json.Decoder, fields []knownField) error {
 	}
 	_, err = scanToken(dec) // closing '}'
 	return err
+}
+
+// scanObjectFields runs the name-encoding pass of walkKnownObject WITHOUT the
+// once-only rule: a recognized field's value checker runs on every
+// occurrence instead of rejecting the second one. The raw name-encoding
+// scan (name_encoding.go) uses this walker; it runs only after the
+// duplicate-field scan has already rejected repeated known fields, while it
+// must still validate the literals of every known value the document carries.
+// A value that is not an object is consumed and left for the regular parse.
+func scanObjectFields(dec *json.Decoder, fields []knownField) error {
+	return walkKnownObject(dec, fields, nil)
 }
 
 // datasetRecordFields is the field scope of one dataset record — the same
