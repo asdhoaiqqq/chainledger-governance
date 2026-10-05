@@ -393,6 +393,161 @@ func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
 	return upstreams, nil
 }
 
+// CommonUpstream names one dataset that two queried datasets can BOTH trace
+// back to along upstream edges — a shared source of the pair. DistanceToFirst
+// and PathToFirst describe the shortest derivation from this source to the
+// first queried target; DistanceToSecond and PathToSecond describe it to the
+// second queried target. Both paths are written along the actual derivation
+// direction (source first, queried target last) and include both ends.
+type CommonUpstream struct {
+	Dataset          string
+	DistanceToFirst  int
+	PathToFirst      []string
+	DistanceToSecond int
+	PathToSecond     []string
+}
+
+// CommonUpstreams returns the datasets that are upstream of BOTH first and
+// second, i.e. datasets each queried target can reach by following parent
+// edges, counting each target itself as its own upstream. Comparing two
+// derived datasets therefore answers not only "where did each one come from"
+// but "which sources do their lineages actually share, and how far away are
+// those shared points".
+//
+// Only the closest shared points are reported: a common source whose direct or
+// indirect downstream contains ANOTHER common source is omitted. Every
+// intermediate dataset on a downstream path between two common sources is
+// itself common (it reaches both targets through the later shared source), so
+// this frontier is decided by a single edge — a common source with a direct
+// child that is also common is hidden behind that child. Several sources can
+// be returned together; they are not picked by distance and need not be roots
+// with no upstreams. For example, when raw derives a and b and both feed left
+// and right, CommonUpstreams(left, right) returns a and b and excludes raw —
+// even if raw also feeds both targets directly and is fewer edges away, a and
+// b are later common sources standing between raw and the targets.
+//
+// Degenerate pairs follow the same rule:
+//
+//   - When both targets are the same dataset, the sole result is that dataset,
+//     with both distances zero and both paths just [name].
+//   - When one target is itself an upstream of the other, that upstream target
+//     is the sole result, with distance zero on its own side; its own upstream
+//     ancestors are hidden behind it.
+//   - When the two lineages share no source at all, the query succeeds with a
+//     non-nil empty list.
+//
+// Each side's distance is the minimum number of lineage edges from the source
+// to that target; among equally short routes the lexicographically smallest
+// full path wins, compared name by name from the source in Go string order —
+// exactly the two-level rule Upstreams uses, and likewise independent of
+// registration order or the stored direct-upstream list order. Each source
+// appears at most once and results are ordered by source name in Go string
+// order.
+//
+// Names match by exact registered value (case-sensitive). The targets are
+// validated in input order: an empty name is rejected as a missing name, and a
+// name absent from the graph (also against an empty or nil graph) is rejected
+// with an error naming it; a failure returns nil results, never partial
+// sources. The query is read-only, changing no node, relationship or list
+// order, and every returned path is an independent copy: the two sides do not
+// share backing arrays, and mutating a result can neither reach the graph nor
+// another record or a later query.
+func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonUpstream, error) {
+	if first == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[first]; !ok {
+		return nil, errInvalid("dataset not found: " + first)
+	}
+	if second == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[second]; !ok {
+		return nil, errInvalid("dataset not found: " + second)
+	}
+
+	// Resolve each target's ancestor closure with its shortest, tie-broken
+	// explanation paths; the two BFS walks are independent of one another, so
+	// the distances and paths on either side can differ asymmetrically.
+	distFirst, pathFirst := upstreamShortestPaths(graph, first)
+	distSecond, pathSecond := upstreamShortestPaths(graph, second)
+
+	// A shared source belongs to both closures.
+	common := make(map[string]bool)
+	for name := range distFirst {
+		if _, ok := distSecond[name]; ok {
+			common[name] = true
+		}
+	}
+
+	// Keep only the frontier: a common source with a direct child that is also
+	// common has another common source strictly downstream of it and is hidden.
+	// Register rejects cycles, so no child can loop back to an ancestor, and one
+	// edge is sufficient to witness any longer downstream chain of common
+	// sources (the intermediate nodes are common as well).
+	results := make([]CommonUpstream, 0, len(common))
+	for name := range common {
+		hidden := false
+		for _, child := range graph[name].Children {
+			if common[child] {
+				hidden = true
+				break
+			}
+		}
+		if hidden {
+			continue
+		}
+		results = append(results, CommonUpstream{
+			Dataset:          name,
+			DistanceToFirst:  distFirst[name],
+			PathToFirst:      append([]string(nil), pathFirst[name]...),
+			DistanceToSecond: distSecond[name],
+			PathToSecond:     append([]string(nil), pathSecond[name]...),
+		})
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].Dataset < results[j].Dataset })
+	return results, nil
+}
+
+// upstreamShortestPaths walks parent edges from target and returns, for every
+// dataset in target's ancestor closure (target itself included, at distance 0
+// with path [target]), its shortest edge distance to target and the
+// lexicographically smallest shortest path written from the ancestor toward
+// the target. It is the per-target half of CommonUpstreams and applies exactly
+// traceLineage's rule set: a whole BFS level commits at once, the fewest-edge
+// route wins, and among equal-length routes the smallest full name sequence
+// wins hop by hop from the source. Every committed path gets its own backing
+// array via dirUpstream.extendPath.
+func upstreamShortestPaths(graph map[string]*Lineage, target string) (map[string]int, map[string][]string) {
+	distance := map[string]int{target: 0}
+	best := map[string][]string{target: {target}}
+	frontier := []string{target}
+	for level := 0; len(frontier) > 0; level++ {
+		candidates := map[string][]string{}
+		var next []string
+		for _, node := range frontier {
+			for _, parent := range graph[node].Parents {
+				if _, seen := distance[parent]; seen {
+					continue // reached on an earlier, strictly shorter level
+				}
+				candidate := dirUpstream.extendPath(best[node], parent)
+				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+					if !ok {
+						next = append(next, parent)
+					}
+					candidates[parent] = candidate
+				}
+			}
+		}
+		for _, hop := range next {
+			distance[hop] = level + 1
+			best[hop] = candidates[hop]
+		}
+		frontier = next
+	}
+	return distance, best
+}
+
 // queryDirection carries the only way the two lineage queries differ: which
 // edges to walk and from which end an explanation path is written.
 type queryDirection int
