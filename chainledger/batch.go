@@ -215,7 +215,10 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	}
 
 	// Build the final adjacency: start from the original parents, replace each
-	// planned dataset's parents with its normalized upstreams.
+	// planned dataset's parents with its normalized upstreams. Being named in
+	// the plan does not by itself make a dataset new or changed — that is
+	// judged below by diffing the original and final graphs, exactly the way a
+	// snapshot comparison judges two versions.
 	final := make(adjacency, len(original)+len(plan.Changes))
 	for name, parents := range original {
 		final[name] = append([]string(nil), parents...)
@@ -223,32 +226,9 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	for name := range removalDecls {
 		delete(final, name)
 	}
-	var newNames []string
-	var changedNames []string
 	for _, change := range plan.Changes {
-		wanted := uniqueSorted(change.Upstreams)
-		old, existed := original[change.Name]
-		switch {
-		case !existed:
-			newNames = append(newNames, change.Name)
-		case !stringSliceEqual(old, wanted):
-			changedNames = append(changedNames, change.Name)
-		}
-		final[change.Name] = wanted
+		final[change.Name] = uniqueSorted(change.Upstreams)
 	}
-	sort.Strings(newNames)
-	sort.Strings(changedNames)
-
-	// Datasets actually removed: names in removals that existed in the
-	// original graph. Deleting a name that does not exist is a no-op and is
-	// not reported, so a successful plan can be applied again with empty lists.
-	var removedNames []string
-	for name := range removalDecls {
-		if _, existed := original[name]; existed {
-			removedNames = append(removedNames, name)
-		}
-	}
-	sort.Strings(removedNames)
 
 	// Every upstream must resolve to a dataset that exists in the FINAL graph
 	// (new datasets may reference each other regardless of plan order; a
@@ -271,6 +251,14 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	if err := validateAcyclic(final); err != nil {
 		return nil, nil, err
 	}
+
+	// Classify the dataset-level changes with the shared old -> new rule a
+	// snapshot comparison uses (see diffDatasets): only-in-final is new,
+	// only-in-original is removed, present-on-both is changed only when the
+	// direct upstream set actually differs. Deleting a name that does not
+	// exist is a no-op and is not reported, so a successful plan can be
+	// applied again with empty change and impact lists.
+	newNames, removedNames, changedNames := diffDatasets(original, final)
 
 	added, removed := diffRelations(original, final)
 	affected := affectedDownstreams(original, final, newNames, changedNames, removedNames)
@@ -344,6 +332,42 @@ func ApplyBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, error) {
 // relationships after the batch returns.
 func applyAdjacency(graph map[string]*Lineage, final adjacency) {
 	materializeLineage(graph, final)
+}
+
+// diffDatasets is the single authority for classifying dataset-level changes
+// between two versions of a graph, shared by the batch report (preview and
+// apply) and the snapshot comparison so both can never disagree about the
+// rule. Changes are always judged in the direction original -> final:
+//
+//   - a dataset present only in final is NEW — even when it arrives carrying
+//     upstreams, it is never also listed as changed;
+//   - a dataset present only in original is REMOVED — a removed dataset is
+//     never also listed as an upstream change;
+//   - a dataset present on both sides is CHANGED only when its direct
+//     upstream set actually differs; a dataset whose upstreams were cleared
+//     still exists (as a root), so it is changed, not removed.
+//
+// Names are case-sensitive and compared verbatim; only the name set and each
+// dataset's normalized upstream set matter, never record order, upstream
+// order, or duplicate upstreams. Each returned list is sorted by name byte
+// order and is nil when empty; callers normalize nil to [] for JSON.
+func diffDatasets(original, final adjacency) (newNames, removedNames, changedNames []string) {
+	for name, finalParents := range final {
+		if originalParents, ok := original[name]; !ok {
+			newNames = append(newNames, name)
+		} else if !stringSliceEqual(originalParents, finalParents) {
+			changedNames = append(changedNames, name)
+		}
+	}
+	for name := range original {
+		if _, ok := final[name]; !ok {
+			removedNames = append(removedNames, name)
+		}
+	}
+	sort.Strings(newNames)
+	sort.Strings(removedNames)
+	sort.Strings(changedNames)
+	return newNames, removedNames, changedNames
 }
 
 // diffRelations returns the directed edges present in final but not original

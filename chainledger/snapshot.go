@@ -249,24 +249,13 @@ func CompareSnapshots(oldSnap, newSnap *SnapshotFile) *CompareReport {
 	oldAdj := adjacencyFromValidFile(oldSnap.Graph)
 	newAdj := adjacencyFromValidFile(newSnap.Graph)
 
-	added, removed := diffRelations(oldAdj, newAdj)
+	// Dataset-level changes follow the shared old -> new rule the batch report
+	// uses (see diffDatasets), so comparing two snapshots classifies new,
+	// removed, and directly changed datasets exactly the way previewing or
+	// applying the batch that turns one version into the other does.
+	newNodes, removedNodes, changedNodes := diffDatasets(oldAdj, newAdj)
 
-	var newNodes, removedNodes, changedNodes []string
-	for name := range newAdj {
-		if oldParents, ok := oldAdj[name]; !ok {
-			newNodes = append(newNodes, name)
-		} else if !stringSliceEqual(oldParents, newAdj[name]) {
-			changedNodes = append(changedNodes, name)
-		}
-	}
-	for name := range oldAdj {
-		if _, ok := newAdj[name]; !ok {
-			removedNodes = append(removedNodes, name)
-		}
-	}
-	sort.Strings(newNodes)
-	sort.Strings(removedNodes)
-	sort.Strings(changedNodes)
+	added, removed := diffRelations(oldAdj, newAdj)
 
 	common := make([]string, 0)
 	for name := range oldAdj {
