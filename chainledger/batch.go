@@ -241,19 +241,13 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	// Every upstream must resolve to a dataset that exists in the FINAL graph
 	// (new datasets may reference each other regardless of plan order; a
 	// retained dataset that still references a deleted name is rejected here,
-	// with both the referrer and the referenced name in the error). Iterate
-	// over sorted names so the reported pair is deterministic.
-	names := make([]string, 0, len(final))
-	for name := range final {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		for _, parent := range final[name] {
-			if _, ok := final[parent]; !ok {
-				return nil, nil, fmt.Errorf("%w: dataset %q references upstream %q which does not exist in the final graph", ErrNotFound, name, parent)
-			}
-		}
+	// with both the referrer and the referenced name in the error). The
+	// existence judgment is the shared one in firstMissingUpstream — the same
+	// rule an existing graph is checked against — only the wording differs,
+	// because here the reference is missing from the graph the plan would
+	// leave behind rather than from the graph being read.
+	if referrer, upstream, found := firstMissingUpstream(final); found {
+		return nil, nil, fmt.Errorf("%w: dataset %q references upstream %q which does not exist in the final graph", ErrNotFound, referrer, upstream)
 	}
 	// The final graph must be acyclic, judged after all replacements.
 	if err := validateAcyclic(final); err != nil {

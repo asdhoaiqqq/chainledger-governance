@@ -104,11 +104,20 @@ func normalizeDatasets(datasets []GraphDataset) (adjacency, error) {
 	return adj, nil
 }
 
-// validateAdjacencyReferences rejects an edge whose upstream is not a declared
-// dataset. Referrers are visited in sorted order with their parents sorted, so
-// the first reported (referrer, upstream) pair is stable regardless of map
-// iteration or record order.
-func validateAdjacencyReferences(adj adjacency) error {
+// firstMissingUpstream is the single authority for the direct-upstream
+// existence judgment every graph check shares: each dataset's direct upstreams
+// must themselves be keys of the adjacency being checked. It is used both for
+// an existing graph (validateAdjacencyReferences, where a missing upstream is
+// "not registered") and for the final graph a batch plan would leave behind
+// (computeBatch, where it "does not exist in the final graph"), so the two
+// scenarios can never drift apart on what counts as a missing reference —
+// only on how the rejection is worded.
+//
+// Referrers are visited in name byte order and each referrer's parents in
+// their stored (sorted, duplicate-free) order, so the first reported
+// (referrer, upstream) pair is stable regardless of map iteration, record
+// order, or upstream input order. found is false when every upstream resolves.
+func firstMissingUpstream(adj adjacency) (referrer, upstream string, found bool) {
 	names := make([]string, 0, len(adj))
 	for name := range adj {
 		names = append(names, name)
@@ -117,9 +126,19 @@ func validateAdjacencyReferences(adj adjacency) error {
 	for _, name := range names {
 		for _, parent := range adj[name] {
 			if _, ok := adj[parent]; !ok {
-				return fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
+				return name, parent, true
 			}
 		}
+	}
+	return "", "", false
+}
+
+// validateAdjacencyReferences rejects an edge whose upstream is not a declared
+// dataset, with the referrer and the referenced name both in the error. The
+// judgment itself lives in firstMissingUpstream.
+func validateAdjacencyReferences(adj adjacency) error {
+	if referrer, upstream, found := firstMissingUpstream(adj); found {
+		return fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, referrer, upstream)
 	}
 	return nil
 }
