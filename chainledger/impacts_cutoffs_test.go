@@ -467,7 +467,15 @@ func TestImpactsWithCutoffsPathsNeverTraverseCutoff(t *testing.T) {
 		{"view", "report"},
 	})
 
-	for _, cutoffs := range [][]string{nil, {}, {"z"}, {"c"}, {"z", "c"}, {"report"}, {"view"}, {"source"}} {
+	for _, cutoffs := range [][]string{
+		nil, {},
+		{"z"}, {"c"}, {"z", "c"},
+		{"report"}, {"view"}, {"source"},
+		// Cutoffs that lie past other cutoffs: report lies past both z and c and
+		// view past report, so each is shielded and must be absent even though
+		// the unrestricted query reaches both of them.
+		{"z", "c", "report"}, {"report", "view"},
+	} {
 		got, err := ImpactsWithCutoffs(graph, "source", cutoffs)
 		if err != nil {
 			t.Fatalf("cutoffs %v: %v", cutoffs, err)
@@ -498,15 +506,56 @@ func TestImpactsWithCutoffsPathsNeverTraverseCutoff(t *testing.T) {
 				t.Fatalf("origin leaked into results for cutoffs %v", cutoffs)
 			}
 		}
-		// A reachable cutoff must still be present.
-		full := mustImpacts(t, graph, "source")
+		// A cutoff is present exactly when some route from the origin reaches it
+		// without passing another cutoff. Reachability in the unrestricted full
+		// query alone is not enough: a cutoff whose every route runs through an
+		// earlier cutoff is shielded by it and must not appear. The expectation
+		// is derived by an independent walk that treats cutoffs as terminals,
+		// not from the unrestricted query's (possibly truncated) best path.
+		gotNames := impactNames(got)
 		for _, c := range cutoffs {
 			if c == "source" {
 				continue
 			}
-			if slices.Contains(impactNames(full), c) && !slices.Contains(impactNames(got), c) {
-				t.Fatalf("cutoffs %v: reachable cutoff %s missing from %v", cutoffs, c, impactNames(got))
+
+			wantPresent := reachableStoppingAtCutoffs(graph, "source", c, cutset)
+			if wantPresent && !slices.Contains(gotNames, c) {
+				t.Fatalf("cutoffs %v: cutoff %s reachable on an allowed route but missing from %v",
+					cutoffs, c, gotNames)
+			}
+			if !wantPresent && slices.Contains(gotNames, c) {
+				t.Fatalf("cutoffs %v: shielded cutoff %s must be absent, got %v", cutoffs, c, gotNames)
 			}
 		}
 	}
+}
+
+// reachableStoppingAtCutoffs reports whether target can be reached from origin
+// by following child edges without expanding any cutoff. A cutoff is a valid
+// terminal (it may be the target) but is never traversed through. This mirrors
+// the propagation rule independently of traceLineage, so tests can use it to
+// judge which cutoffs the query owes a result record.
+func reachableStoppingAtCutoffs(graph map[string]*Lineage, origin, target string, cutset map[string]bool) bool {
+	if origin == target {
+		return true
+	}
+	visited := map[string]bool{origin: true}
+	frontier := []string{origin}
+	for len(frontier) > 0 {
+		node := frontier[0]
+		frontier = frontier[1:]
+		if cutset[node] {
+			continue // reached cutoff stays a terminal; nothing propagates through it
+		}
+		for _, child := range graph[node].Children {
+			if child == target {
+				return true
+			}
+			if !visited[child] {
+				visited[child] = true
+				frontier = append(frontier, child)
+			}
+		}
+	}
+	return false
 }
