@@ -393,7 +393,144 @@ func Upstreams(graph map[string]*Lineage, target string) ([]Upstream, error) {
 	return upstreams, nil
 }
 
-// queryDirection carries the only way the two lineage queries differ: which
+// CommonUpstream names one dataset that the two targets of a CommonUpstreams
+// query both derive from, directly or transitively. A target itself counts as
+// a common source of the pair, so an upstream target can appear as a result.
+//
+// DistanceToFirst and DistanceToSecond are the numbers of lineage edges on the
+// shortest path from this source to the first and second target respectively
+// (a direct upstream of a target has distance 1, and the target naming itself
+// has distance 0); PathToFirst and PathToSecond are those shortest paths
+// written along the actual derivation direction, from this source to each
+// target, one name per hop, with both endpoints included.
+type CommonUpstream struct {
+	Dataset          string
+	DistanceToFirst  int
+	PathToFirst      []string
+	DistanceToSecond int
+	PathToSecond     []string
+}
+
+// CommonUpstreams returns the nearest datasets upstream of both first and
+// second: every common source that has no other common source among its own
+// direct or indirect downstreams.
+//
+// A common source is any registered dataset reachable from both targets by
+// following parent edges, and a target counts as a common source of the pair.
+// Sources chain above each other through shared derivation, and only the ones
+// closest to the targets survive: if one common source can reach another
+// common source downstream (the two need not share that route to both targets,
+// nor the same distance to them), the upstream one is dropped, however short
+// its own edge distance to the targets. For example, raw derives a and b, and
+// both a and b feed left and right; the answer for (left, right) is {a, b},
+// never raw — even if raw also feeds the two targets directly over shorter
+// edges, because a and b are common sources strictly downstream of raw. There
+// may be several nearest sources at once: they are not chosen by distance and
+// need not be roots without upstreams.
+//
+// Each source appears once. Results are ordered by source name in Go string
+// order, never by distance, registration order, or stored parent/child list
+// order. The two distances are the shortest edge counts from the source to
+// each target independently; each explanation path follows that target's
+// shortest derivation route from the source, written source-first. When a
+// target has several equally short routes from the source, the path is chosen
+// exactly as for Upstreams: the full name sequences are compared hop by hop
+// from the source in Go string order and the smaller one wins, so registration
+// order and direct-upstream list order never decide it.
+//
+// When the two targets name the same registered dataset, that dataset is the
+// sole result with both distances 0 and both paths containing only its name.
+// When one target is itself upstream of the other, it is the sole result,
+// carrying distance 0 on its own side. Two registered targets sharing no
+// upstream at all succeed with a non-nil empty list.
+//
+// Names match by exact registered value (case-sensitive). The targets are
+// validated in argument order: an empty name is rejected as a missing name,
+// and a non-empty name absent from the graph (also against an empty or nil
+// graph) is rejected with an error naming it; any failure returns nil results
+// rather than partial sources. The query is read-only — it changes no node,
+// edge or stored list order — and every returned path is an independent copy:
+// mutating it cannot reach the graph, other records, or later queries.
+func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonUpstream, error) {
+	if first == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[first]; !ok {
+		return nil, errInvalid("dataset not found: " + first)
+	}
+	if second == "" {
+		return nil, errInvalid("dataset name is required")
+	}
+	if _, ok := graph[second]; !ok {
+		return nil, errInvalid("dataset not found: " + second)
+	}
+
+	// Resolve the full parent-edge ancestry of each target with the same
+	// shortest-path machinery Upstreams uses. Each map covers the target
+	// itself at distance 0, which the common-source definition relies on.
+	firstDistance, firstPath := shortestPathMap(graph, first, dirUpstream, nil)
+	secondDistance, secondPath := shortestPathMap(graph, second, dirUpstream, nil)
+
+	common := make(map[string]bool)
+	for name := range firstDistance {
+		if _, ok := secondDistance[name]; ok {
+			common[name] = true
+		}
+	}
+
+	// A common source survives only when none of its strict downstreams is
+	// itself common. The check is a child-edge reachability walk restricted to
+	// the common set: finding one other common node anywhere below the source
+	// disqualifies it, regardless of which routes made that node common.
+	results := make([]CommonUpstream, 0)
+	for source := range common {
+		if hasCommonDescendant(graph, source, common) {
+			continue
+		}
+		results = append(results, CommonUpstream{
+			Dataset:          source,
+			DistanceToFirst:  firstDistance[source],
+			PathToFirst:      append([]string(nil), firstPath[source]...),
+			DistanceToSecond: secondDistance[source],
+			PathToSecond:     append([]string(nil), secondPath[source]...),
+		})
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Dataset < results[j].Dataset
+	})
+	return results, nil
+}
+
+// hasCommonDescendant reports whether any dataset other than source reachable
+// downstream of source through child edges is a member of common. The walk
+// stays within the common set but follows edges through non-common datasets:
+// the rule disqualifies source for a common source lying at any depth of its
+// actual downstream, not only directly shared children.
+func hasCommonDescendant(graph map[string]*Lineage, source string, common map[string]bool) bool {
+	visited := map[string]bool{source: true}
+	frontier := []string{source}
+	for len(frontier) > 0 {
+		node := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		entry, ok := graph[node]
+		if !ok {
+			continue
+		}
+		for _, child := range entry.Children {
+			if visited[child] {
+				continue
+			}
+			visited[child] = true
+			if common[child] {
+				return true
+			}
+			frontier = append(frontier, child)
+		}
+	}
+	return false
+}
+
+// queryDirection carries the only way the lineage queries differ: which
 // edges to walk and from which end an explanation path is written.
 type queryDirection int
 
@@ -500,6 +637,48 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		blocked[cutoff] = true
 	}
 
+	// The walk itself is the shared shortest-path machinery: it resolves start
+	// at distance 0 as well, which the hit list below excludes.
+	distance, best := shortestPathMap(graph, start, direction, blocked)
+
+	hits := make([]lineageHit, 0, len(distance)-1)
+	for name, d := range distance {
+		if name == start {
+			continue
+		}
+		hits = append(hits, lineageHit{
+			name:     name,
+			distance: d,
+			path:     append([]string(nil), best[name]...),
+		})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].distance != hits[j].distance {
+			return hits[i].distance < hits[j].distance
+		}
+		return hits[i].name < hits[j].name
+	})
+	return hits, nil
+}
+
+// shortestPathMap runs the direction-neutral shortest-path walk: a BFS that
+// commits a whole distance level at once, so a node reached through several
+// branches within the same level keeps exactly one candidate path before the
+// level commits. It returns, for every node reachable from start (start itself
+// included, at distance 0 with the one-name path [start]), the minimum number
+// of lineage edges and the lexicographically smallest shortest explanation
+// path, chosen by comparing the full name sequence from the path's beginning
+// in Go string order. When blocked is non-empty, a blocked node is still
+// resolved itself but its frontier is dropped, exactly as cutoff handling
+// requires; a nil or empty set means unrestricted propagation. Every stored
+// path lives in its own slice, independent of the graph and of other entries.
+//
+// Register rejects cycles, so equal-length rediscoveries only happen inside one
+// level's candidate map; a node committed on an earlier level can never be
+// re-explained at a longer one. The caller is responsible for validating start
+// and the blocked names before calling; every name looked up here is assumed
+// registered.
+func shortestPathMap(graph map[string]*Lineage, start string, direction queryDirection, blocked map[string]bool) (map[string]int, map[string][]string) {
 	distance := map[string]int{start: 0}
 	best := map[string][]string{start: {start}}
 	frontier := []string{start}
@@ -508,9 +687,9 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
-			// A reached cutoff stays a result itself but is a dead end: nothing
-			// propagates through it, even though a parallel route may still
-			// reach the same downstream independently.
+			// A reached blocked node stays resolved itself but is a dead end:
+			// nothing propagates through it, even though a parallel route may
+			// still reach the same node independently.
 			if blocked[node] {
 				continue
 			}
@@ -533,25 +712,7 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		}
 		frontier = next
 	}
-
-	hits := make([]lineageHit, 0, len(distance)-1)
-	for name, d := range distance {
-		if name == start {
-			continue
-		}
-		hits = append(hits, lineageHit{
-			name:     name,
-			distance: d,
-			path:     append([]string(nil), best[name]...),
-		})
-	}
-	sort.Slice(hits, func(i, j int) bool {
-		if hits[i].distance != hits[j].distance {
-			return hits[i].distance < hits[j].distance
-		}
-		return hits[i].name < hits[j].name
-	})
-	return hits, nil
+	return distance, best
 }
 
 // lessPath reports whether path a sorts before path b as a name sequence:

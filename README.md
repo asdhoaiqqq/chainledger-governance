@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份派生数据**最近**共同来自哪些数据集，调用同一库的 `CommonUpstreams` 函数，见下文「查询两份数据集的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -412,6 +412,87 @@ b        distance=2 path=[b c report]
 - 已登记但没有上游的数据集：查询成功，返回**非 nil 的空列表**。
 
 查询是只读的：不改变任何节点、关系或列表顺序；返回的每条 `Path` 都是独立拷贝，调用方修改它不会影响图、其他记录的路径或之后的查询结果。用同名 `Register` 替换直接上游后，再次查询反映新关系，而之前取得的结果仍保留原内容。完整可运行示例位于 [`examples/upstreams`](examples/upstreams/main.go)，可在仓库根目录执行 `go run ./examples/upstreams` 复现上面的输出。
+
+## 查询两份数据集的最近共同上游（Go 库）
+
+`Upstreams` 只能分别列出每份派生数据的来源；要比较两份派生数据“最近共同来自哪些数据集”，调用：
+
+```go
+common, err := chainledger.CommonUpstreams(graph, first, second)
+```
+
+`first`、`second` 是两个已登记数据集名称，按当前血缘图分别沿 parent 边向上追溯。每个结果是一条 `chainledger.CommonUpstream`：
+
+- `Dataset`：两个目标都能沿上游关系追到的共同来源名称。**目标自身也算共同来源。**
+- `DistanceToFirst` / `DistanceToSecond`：该来源到第一个、第二个目标的**最短依赖边数**（直接上游距离 1，目标命名自身时距离 0）。两侧距离各自独立计算，可以不同。
+- `PathToFirst` / `PathToSecond`：对应的最短路径，沿实际派生方向**从该来源写到对应目标**，首尾都包含在内。
+
+### “最近”的判定：后面还有共同来源的，排除
+
+共同来源之间可能本身也有上下游关系。规则是：**如果一个共同来源的直接或间接下游中还存在另一个共同来源，它就不出现在结果里。**判定只看“下游能不能到达另一个共同来源”，不看那条路线是否同时通向两个目标，也不看距离长短。
+
+例如 `raw` 派生 `a`、`b`，`a`、`b` 都参与 `left` 和 `right` 的派生：
+
+```
+raw ──> a ──┬──> left
+  │         │
+  └──> b ──┴──> right
+```
+
+查询 `CommonUpstreams(graph, "left", "right")` 返回 `a`、`b`，**排除 `raw`**：`a`、`b` 都是 `raw` 之后的共同来源。即使之后让 `raw` 同时**直接**参与两个目标的派生、到它们的边数更短，`raw` 仍然被排除——“最近”规则先于距离，不因短路边而放宽。
+
+要点：
+
+- 结果可以有多个，也可能只有一个；**不按距离大小挑选**，也不限定为没有上游的根。
+- 每个来源只出现一次；结果按**来源名称的 Go 字符串顺序**排列（不是按距离、登记顺序或直接上游列表顺序）。
+- 两个目标相同（如 `CommonUpstreams(graph, "left", "left")`）时，唯一结果是 `left` 自身，两侧距离均为 0，两条路径都只包含 `left`。
+- 一个目标本身就是另一个目标的上游时（如 `("a", "left")`），唯一结果是这个上游目标，它到自身一侧的距离为 0、路径只含自身；更老的共同来源仍被排除。
+- 两个已登记目标没有任何共同来源时，查询成功并返回**非 nil 的空列表**。
+
+### 两侧距离与说明路径
+
+两侧距离分别取该来源到每个目标的最短边数，因此同一来源可能出现 `(2, 1)` 这样不对称的距离。路径沿实际派生方向从来源写到对应目标；当从某来源到某个目标存在多条同样短的路线时，选路规则与 `Upstreams` 完全一致：**从来源开始逐跳比较整条路径名称**，取 Go 字符串顺序较小的一条。登记顺序和直接上游列表顺序都不影响结果。
+
+下例中 `r2` 经 `y1`、`y2` 两条等长路线派生 `mixL`（登记时故意把 `y2` 写在前面），同时直接派生 `mixR`：查询 `("mixL", "mixR")` 时 `r2` 是唯一共同来源，到 `mixL` 的路径选词典序更小的 `[r2 y1 mixL]`，到 `mixR` 为 `[r2 mixR]`。
+
+### 示例与真实输出
+
+完整可运行示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)，可在仓库根目录执行 `go run ./examples/common-upstreams` 复现：
+
+```text
+CommonUpstreams("left", "right") -> 2 common source(s):
+  a    to-first  distance=1 path=[a left]
+       to-second distance=1 path=[a right]
+  b    to-first  distance=1 path=[b left]
+       to-second distance=1 path=[b right]
+CommonUpstreams("left", "right") -> 2 common source(s):
+  a    to-first  distance=1 path=[a left]
+       to-second distance=1 path=[a right]
+  b    to-first  distance=1 path=[b left]
+       to-second distance=1 path=[b right]
+CommonUpstreams("left", "left") -> 1 common source(s):
+  left to-first  distance=0 path=[left]
+       to-second distance=0 path=[left]
+CommonUpstreams("a", "left") -> 1 common source(s):
+  a    to-first  distance=0 path=[a]
+       to-second distance=1 path=[a left]
+CommonUpstreams("left", "oright") -> 0 common source(s)
+CommonUpstreams("mixL", "mixR") -> 1 common source(s):
+  r2   to-first  distance=2 path=[r2 y1 mixL]
+       to-second distance=1 path=[r2 mixR]
+CommonUpstreams("", "right") error: dataset name is required
+CommonUpstreams("left", "ghost") error: dataset not found: ghost
+```
+
+第二段 `left/right` 结果是在给两个目标都增加对 `raw` 的直接依赖之后再次查询的：`raw` 到两个目标的边数变为 1，但结果仍是 `a`、`b`——更短的直接边不能让被排除的老来源回来。交换两个目标参数会对调每条记录的两侧字段（距离与路径），来源集合与排序不变。
+
+### 失败与边界行为
+
+- 两个目标**按输入顺序校验**：第一个目标名称为空报 `dataset name is required`；第一个合法而第二个为空时同样报缺少名称；名称非空但未登记时，错误指出该名称（如 `dataset not found: ghost`）。对空图或 nil 图查询任何非空名称都按未登记处理。
+- 任何校验失败都返回 nil 结果，不会返回部分来源。
+- 名称按登记值精确匹配，区分大小写。
+- 查询是只读的：不改变节点、关系或列表顺序；每条记录的两侧路径都是彼此独立的拷贝（同一记录的两条路径也不共享底层数组），修改它们不会影响图、其他记录或之后的查询。
+- 现有登记、更名、移除与 `Impacts`、`Upstreams` 查询入口的签名和行为保持不变；命令行继续只有 `demo`、`version`、`help`。
 
 ## 数据集更名（Go 库）
 
