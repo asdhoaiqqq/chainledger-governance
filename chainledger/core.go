@@ -466,11 +466,13 @@ func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonU
 		return nil, errInvalid("dataset not found: " + second)
 	}
 
-	// Resolve each target's ancestor closure with its shortest, tie-broken
-	// explanation paths; the two BFS walks are independent of one another, so
-	// the distances and paths on either side can differ asymmetrically.
-	distFirst, pathFirst := upstreamShortestPaths(graph, first)
-	distSecond, pathSecond := upstreamShortestPaths(graph, second)
+	// Resolve each target's ancestor closure through the one shared
+	// distance-and-path rule set — the exact same shortestPathTree walk that
+	// Upstreams runs, only here the target itself is kept in the maps. The two
+	// walks are independent of one another, so the distances and paths on
+	// either side can differ asymmetrically.
+	distFirst, pathFirst := shortestPathTree(graph, first, dirUpstream, nil)
+	distSecond, pathSecond := shortestPathTree(graph, second, dirUpstream, nil)
 
 	// A shared source belongs to both closures.
 	common := make(map[string]bool)
@@ -509,33 +511,55 @@ func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonU
 	return results, nil
 }
 
-// upstreamShortestPaths walks parent edges from target and returns, for every
-// dataset in target's ancestor closure (target itself included, at distance 0
-// with path [target]), its shortest edge distance to target and the
-// lexicographically smallest shortest path written from the ancestor toward
-// the target. It is the per-target half of CommonUpstreams and applies exactly
-// traceLineage's rule set: a whole BFS level commits at once, the fewest-edge
-// route wins, and among equal-length routes the smallest full name sequence
-// wins hop by hop from the source. Every committed path gets its own backing
-// array via dirUpstream.extendPath.
-func upstreamShortestPaths(graph map[string]*Lineage, target string) (map[string]int, map[string][]string) {
-	distance := map[string]int{target: 0}
-	best := map[string][]string{target: {target}}
-	frontier := []string{target}
+// shortestPathTree is the one distance-and-path rule set shared by every
+// lineage query: it walks neighbor edges of direction from start and returns,
+// for every reached dataset (start itself included, at distance 0 with path
+// [start]), its shortest edge distance from start and the lexicographically
+// smallest shortest path as written by that direction.
+//
+// It backs both query shapes: traceLineage (Impacts and Upstreams) discards
+// start itself and sorts the rest into returned records, while CommonUpstreams
+// keeps start in the maps as the target-is-its-own-source entry and compares
+// the two closures. A whole BFS level commits at once: a node reached through
+// several branches within the same level keeps exactly one candidate before
+// the level commits, the fewest-edge route always wins, and among
+// equal-length routes the smallest full name sequence wins hop by hop from the
+// written path's beginning (see lessPath). A node committed on an earlier,
+// strictly shorter level is never re-explained on a longer one (Register
+// rejects cycles, so equal-length rediscoveries only happen inside one
+// level's candidate map).
+//
+// When blocked is non-empty, a reachable node named in it stays in the maps
+// but is a dead end: its neighbors are never expanded, so routes that would
+// pass through it disappear; a nil or empty set means propagation is
+// unrestricted. Every committed path gets its own backing array via
+// direction.extendPath, so stored paths never alias each other or slices held
+// in the graph; the graph is read only. Callers are expected to have
+// validated start and every blocked name already.
+func shortestPathTree(graph map[string]*Lineage, start string, direction queryDirection, blocked map[string]bool) (map[string]int, map[string][]string) {
+	distance := map[string]int{start: 0}
+	best := map[string][]string{start: {start}}
+	frontier := []string{start}
 	for level := 0; len(frontier) > 0; level++ {
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
-			for _, parent := range graph[node].Parents {
-				if _, seen := distance[parent]; seen {
+			if blocked[node] {
+				// A reached cutoff stays a result itself but is a dead end:
+				// nothing propagates through it, even though a parallel route
+				// may still reach the same node independently.
+				continue
+			}
+			for _, hop := range direction.neighbors(graph[node]) {
+				if _, seen := distance[hop]; seen {
 					continue // reached on an earlier, strictly shorter level
 				}
-				candidate := dirUpstream.extendPath(best[node], parent)
-				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+				candidate := direction.extendPath(best[node], hop)
+				if current, ok := candidates[hop]; !ok || lessPath(candidate, current) {
 					if !ok {
-						next = append(next, parent)
+						next = append(next, hop)
 					}
-					candidates[parent] = candidate
+					candidates[hop] = candidate
 				}
 			}
 		}
@@ -596,33 +620,17 @@ type lineageHit struct {
 }
 
 // traceLineage runs the one query rule set shared by Impacts and Upstreams and
-// returns every dataset reachable from start besides start itself. When
-// cutoffs is non-empty, a reachable cutoff node is still returned but its
-// neighbors are never expanded, so paths that would pass through it disappear;
-// a nil cutoffs list means propagation is unrestricted.
+// returns every dataset reachable from start besides start itself. Distance,
+// tie-broken paths and the cutoff frontier are entirely the shared
+// shortestPathTree rule set; this wrapper adds only the query-specific shape:
+// validation, cutoff-name handling, dropping the query's own node, and ordering
+// the returned records by distance and then by name.
 //
-// The traversal is a BFS that commits a whole distance level at once, so a node
-// reached through several branches within the same level keeps exactly one
-// candidate before the level commits. The rules shared by both directions are:
-//
-//   - Distance is the minimum number of lineage edges; a node committed on an
-//     earlier level can never be re-explained at a longer one (Register
-//     rejects cycles, so equal-length rediscoveries only happen inside one
-//     level's candidate map).
-//   - Each dataset appears at most once, however many branches merge into it.
-//   - Among equal-length shortest paths, the lexicographically smallest full
-//     path wins: names are compared one by one from the path's beginning in Go
-//     string order. Downstream paths begin at the query origin and upstream
-//     paths at the source, so candidates for one upstream share their first
-//     hop and compare directly against the committed tails.
-//   - Hits are ordered by distance ascending and then by dataset name, never
-//     by registration order or the stored parent/child list order.
-//
-// With cutoffs set, every distance, candidate path and ordering decision is
-// taken over edges that leave no cutoff behind: a committed cutoff stays in
-// the result but its frontier is dropped, and a node reached around a cutoff
-// is explained by the route that avoided it rather than by any truncated
-// route from the unrestricted graph.
+// With cutoffs set, shortestPathTree is handed the cutoff set: a reachable
+// cutoff stays in the result but its neighbors are never expanded, so paths
+// that would pass through it disappear, and a node reached around a cutoff is
+// explained by the route that avoided it rather than by any truncated route
+// from the unrestricted graph.
 //
 // Explanation paths are written in the query direction (see extendPath). The
 // graph is read only and every returned path is an independent copy. An empty
@@ -655,39 +663,7 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		blocked[cutoff] = true
 	}
 
-	distance := map[string]int{start: 0}
-	best := map[string][]string{start: {start}}
-	frontier := []string{start}
-	for level := 0; len(frontier) > 0; level++ {
-		nextDistance := level + 1
-		candidates := map[string][]string{}
-		var next []string
-		for _, node := range frontier {
-			// A reached cutoff stays a result itself but is a dead end: nothing
-			// propagates through it, even though a parallel route may still
-			// reach the same downstream independently.
-			if blocked[node] {
-				continue
-			}
-			for _, hop := range direction.neighbors(graph[node]) {
-				if _, seen := distance[hop]; seen {
-					continue // reached on an earlier, strictly shorter level
-				}
-				candidate := direction.extendPath(best[node], hop)
-				if current, ok := candidates[hop]; !ok || lessPath(candidate, current) {
-					if !ok {
-						next = append(next, hop)
-					}
-					candidates[hop] = candidate
-				}
-			}
-		}
-		for _, hop := range next {
-			distance[hop] = nextDistance
-			best[hop] = candidates[hop]
-		}
-		frontier = next
-	}
+	distance, best := shortestPathTree(graph, start, direction, blocked)
 
 	hits := make([]lineageHit, 0, len(distance)-1)
 	for name, d := range distance {
