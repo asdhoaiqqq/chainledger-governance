@@ -92,6 +92,105 @@ func TestReadersShareGraphStructureRules(t *testing.T) {
 	}
 }
 
+// TestFirstMissingReferenceOrdering guards the single shared direct-upstream
+// rule: with several dangling edges present at once, the reported pair is the
+// referrer first by name byte order, then that referrer's first missing
+// upstream by byte order — regardless of map iteration, record order, or
+// upstream input order. Case and surrounding whitespace are kept verbatim and
+// a repeated upstream is one relationship.
+func TestFirstMissingReferenceOrdering(t *testing.T) {
+	// Adjacency values are normalized as every production caller builds them;
+	// uniqueSorted makes the repeated upstream one relationship and sorts
+	// names, so neither upstream input order nor the duplicate can change the
+	// reported pair. Map order is deliberately scrambled relative to byte
+	// order.
+	adj := adjacency{
+		"b": {"aaa", "zzz"},
+		"A": {"B", "ghost"}, // 0x41 sorts before lowercase 0x62
+		// " A" (leading space, 0x20) sorts before "A".
+		" A": uniqueSorted([]string{"later-missing", "aaa-missing", "aaa-missing"}),
+	}
+	referrer, referenced, ok := firstMissingReference(adj)
+	if !ok {
+		t.Fatal("firstMissingReference found no missing reference")
+	}
+	if referrer != " A" || referenced != "aaa-missing" {
+		t.Fatalf("first pair = (%q, %q), want (%q, %q)", referrer, referenced, " A", "aaa-missing")
+	}
+
+	// An empty graph and a graph with only roots have no missing reference.
+	for name, empty := range map[string]adjacency{
+		"empty graph":  {},
+		"roots only":   {"A": nil, "B": {}},
+		"resolved all": {"A": {}, "B": {"A"}},
+	} {
+		if _, _, ok := firstMissingReference(empty); ok {
+			t.Errorf("%s unexpectedly reported a missing reference", name)
+		}
+	}
+}
+
+// TestMissingReferenceStagesShareTheRule is a parity guard for the
+// consolidation: an existing graph and a batch's final graph apply the same
+// direct-upstream rule (same pair, ErrNotFound in both) while staying two
+// stages with their own wording — "not registered" for the graph being read,
+// "does not exist in the final graph" for the batch result.
+func TestMissingReferenceStagesShareTheRule(t *testing.T) {
+	const (
+		existingWording = "which is not registered"
+		finalWording    = "which does not exist in the final graph"
+	)
+
+	t.Run("existing graph", func(t *testing.T) {
+		graph := map[string]*Lineage{
+			// B sorts after A; the shared rule must report A's missing upstream
+			// first even though B is constructed first here.
+			"B": {Dataset: "B", Parents: []string{"also-gone"}},
+			"A": {Dataset: "A", Parents: []string{"zzz-gone", "aaa-gone"}},
+		}
+		err := ValidateGraph(graph)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("ValidateGraph err = %v, want ErrNotFound", err)
+		}
+		msg := err.Error()
+		for _, want := range []string{`"A"`, `"aaa-gone"`, existingWording} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error %q missing %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, finalWording) {
+			t.Errorf("existing-graph error used final-graph wording: %q", msg)
+		}
+	})
+
+	t.Run("batch final graph", func(t *testing.T) {
+		// Start from a legal graph; the plan removes "A" while two retained
+		// datasets still reference names that will not exist in the final
+		// graph. The pair ordering comes from the shared rule, and the error
+		// keeps the final-graph wording.
+		graph := map[string]*Lineage{
+			"A": {Dataset: "A"},
+			"B": {Dataset: "B", Parents: []string{"A"}},
+			"C": {Dataset: "C", Parents: []string{"A"}},
+		}
+		plan := Plan{Removals: []string{"A"}}
+		_, err := PreviewBatch(graph, plan)
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("PreviewBatch err = %v, want ErrNotFound", err)
+		}
+		msg := err.Error()
+		// B < C byte order; A is the only missing upstream of B.
+		for _, want := range []string{`"B"`, `"A"`, finalWording} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("error %q missing %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, existingWording) {
+			t.Errorf("final-graph error used existing-graph wording: %q", msg)
+		}
+	})
+}
+
 // TestUnmarshalGraphFileRejectsDuplicateFields: a known field declared twice
 // within the same object makes the whole graph file ambiguous and must be
 // rejected, even when the duplicates carry identical values, the first is

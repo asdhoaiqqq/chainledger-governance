@@ -89,7 +89,7 @@ func validateInMemoryNamesUTF8(graph map[string]*Lineage) error {
 // records. It rejects empty dataset names and datasets declared more than
 // once; every surviving upstream list is sorted and deduplicated. It does not
 // check that upstreams resolve to a declared dataset; use
-// validateAdjacencyReferences for that.
+// firstMissingReference for that.
 func normalizeDatasets(datasets []GraphDataset) (adjacency, error) {
 	adj := make(adjacency, len(datasets))
 	for _, ds := range datasets {
@@ -104,11 +104,21 @@ func normalizeDatasets(datasets []GraphDataset) (adjacency, error) {
 	return adj, nil
 }
 
-// validateAdjacencyReferences rejects an edge whose upstream is not a declared
-// dataset. Referrers are visited in sorted order with their parents sorted, so
-// the first reported (referrer, upstream) pair is stable regardless of map
-// iteration or record order.
-func validateAdjacencyReferences(adj adjacency) error {
+// firstMissingReference is the single authority for the direct-upstream rule,
+// shared by every graph that gets checked: the graph read from a file, the
+// graph embedded in a snapshot, a live in-memory graph, and the final graph a
+// batch converges on. Every direct upstream a dataset names must be a dataset
+// that exists in the graph being checked; nothing else is judged here (the
+// cycle rule lives in validateAcyclic).
+//
+// Referrers are visited in sorted name byte order and each referrer's parents
+// in sorted byte order, so the first reported (referrer, upstream) pair is
+// stable regardless of map iteration, record order, or upstream input order.
+// Names are compared verbatim — case and surrounding whitespace matter — and
+// a parent list is expected to already be normalized, so a repeated upstream
+// is one relationship and can only be reported once. An empty graph or a
+// dataset with no parents yields ok == false.
+func firstMissingReference(adj adjacency) (referrer, referenced string, ok bool) {
 	names := make([]string, 0, len(adj))
 	for name := range adj {
 		names = append(names, name)
@@ -116,12 +126,35 @@ func validateAdjacencyReferences(adj adjacency) error {
 	sort.Strings(names)
 	for _, name := range names {
 		for _, parent := range adj[name] {
-			if _, ok := adj[parent]; !ok {
-				return fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, name, parent)
+			if _, exists := adj[parent]; !exists {
+				return name, parent, true
 			}
 		}
 	}
-	return nil
+	return "", "", false
+}
+
+// missingReferenceError rejects an existing graph — one read from a file,
+// embedded in a snapshot, or held in memory — that references a name that is
+// not a dataset of that graph. The name is described as "not registered", the
+// wording every existing-graph check has always used; the referrer and the
+// referenced name are both quoted, and the failure is ErrNotFound so Go callers
+// can recognize it with errors.Is.
+func missingReferenceError(referrer, referenced string) error {
+	return fmt.Errorf("%w: dataset %q references upstream %q which is not registered", ErrNotFound, referrer, referenced)
+}
+
+// finalGraphMissingReferenceError rejects a batch whose final graph — the
+// graph after every add, replacement, and removal — still references a name
+// that is absent from that final graph. This is the same direct-upstream rule
+// as missingReferenceError (both run firstMissingReference), but judged on the
+// final graph and worded for that stage: a dataset newly added in the same
+// batch may reference another dataset declared later in the plan, while a
+// retained dataset that still points at a removed name is rejected with no
+// automatic edge removal or conversion to a root. The referrer and the
+// referenced name are both quoted, and the failure is ErrNotFound.
+func finalGraphMissingReferenceError(referrer, referenced string) error {
+	return fmt.Errorf("%w: dataset %q references upstream %q which does not exist in the final graph", ErrNotFound, referrer, referenced)
 }
 
 // validateGraphStructureFromFile runs every graph-structure rule shared by the
@@ -136,16 +169,19 @@ func validateGraphStructureFromFile(datasets []GraphDataset) (adjacency, error) 
 	return validateGraphAdjacency(adj)
 }
 
-// validateGraphAdjacency runs the structure rules that apply to a graph after
-// its records have been normalized (empty names and duplicate declarations
-// already rejected): every direct upstream must be a declared dataset, and the
-// parent edges must be acyclic. It is the shared tail of both structure
-// authorities, validateGraphStructureFromFile for parsed documents and
-// validatedGraphAdjacency for live in-memory graphs, so the two inputs can
-// never disagree about whether one set of direct-upstream relations is legal.
+// validateGraphAdjacency runs the structure rules that apply to an existing
+// graph after its records have been normalized (empty names and duplicate
+// declarations already rejected): every direct upstream must be a declared
+// dataset, and the parent edges must be acyclic. It is the shared tail of both
+// existing-graph structure authorities, validateGraphStructureFromFile for
+// parsed documents and validatedGraphAdjacency for live in-memory graphs, so
+// the two inputs can never disagree about whether one set of direct-upstream
+// relations is legal. The batch path checks the same direct-upstream rule on
+// its final graph with firstMissingReference directly; the two stages stay
+// distinct because an existing graph is rejected before any plan is judged.
 func validateGraphAdjacency(adj adjacency) (adjacency, error) {
-	if err := validateAdjacencyReferences(adj); err != nil {
-		return nil, err
+	if referrer, referenced, missing := firstMissingReference(adj); missing {
+		return nil, missingReferenceError(referrer, referenced)
 	}
 	if err := validateAcyclic(adj); err != nil {
 		return nil, err

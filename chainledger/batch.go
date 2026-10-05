@@ -238,22 +238,19 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 		final[change.Name] = uniqueSorted(change.Upstreams)
 	}
 
-	// Every upstream must resolve to a dataset that exists in the FINAL graph
-	// (new datasets may reference each other regardless of plan order; a
-	// retained dataset that still references a deleted name is rejected here,
-	// with both the referrer and the referenced name in the error). Iterate
-	// over sorted names so the reported pair is deterministic.
-	names := make([]string, 0, len(final))
-	for name := range final {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		for _, parent := range final[name] {
-			if _, ok := final[parent]; !ok {
-				return nil, nil, fmt.Errorf("%w: dataset %q references upstream %q which does not exist in the final graph", ErrNotFound, name, parent)
-			}
-		}
+	// The final graph obeys the same direct-upstream rule as an existing graph
+	// — every upstream a dataset names must exist in the graph being checked —
+	// but the rule is run here on the FINAL graph, after every add,
+	// replacement, and removal: datasets newly added in the same batch may
+	// reference one another regardless of plan order, while a retained dataset
+	// that still points at a removed name is rejected. The judgment itself is
+	// the shared firstMissingReference, so the two stages can never drift apart
+	// about what counts as a missing direct upstream; the final-graph wording
+	// (and the separate pass over the untouched original graph above) keeps
+	// the stages distinct. Sorted iteration inside the helper makes the
+	// reported (referrer, upstream) pair deterministic.
+	if referrer, referenced, missing := firstMissingReference(final); missing {
+		return nil, nil, finalGraphMissingReferenceError(referrer, referenced)
 	}
 	// The final graph must be acyclic, judged after all replacements.
 	if err := validateAcyclic(final); err != nil {
