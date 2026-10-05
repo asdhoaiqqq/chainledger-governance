@@ -15,6 +15,12 @@
 // formatting below are common, so the three readers can never drift apart
 // about what counts as a duplicate.
 //
+// The same object walker (walkObjectFields, entered through checkObjectFields
+// here and scanObjectFields in name_encoding.go) is also the one the raw
+// name-encoding scan uses: both checks recognize fields and skip unknown
+// values by exactly one set of rules and can never drift apart about which
+// value is which.
+//
 // Matching rules, common to every document:
 //
 //   - Field names are compared after JSON string unescaping and with the same
@@ -82,12 +88,32 @@ func matchKnownField(key string, fields []knownField) *knownField {
 	return nil
 }
 
-// checkObjectFields scans the object the decoder is positioned at: each known
-// field may be declared at most once, known fields with a nested check descend
-// into their value, and every other value is skipped. location describes the
-// object itself in duplicate errors. A value that is not an object is consumed
-// and left for the regular parse to report.
-func checkObjectFields(dec *json.Decoder, location string, fields []knownField) error {
+// walkObjectFields scans the object the decoder is positioned at, applying
+// the single key-recognition and value-skipping rule every raw-JSON check in
+// this package shares: keys are read after JSON unescaping and matched to the
+// object's known fields with Unicode case folding, a known field with a
+// nested checker has its value descended into, and every other value — an
+// unknown field's, or a known leaf field's — is skipped together with
+// whatever it nests.
+//
+// The two checks that walk documents differ in only one thing, what happens
+// when a recognized key occurs more than once within the same object:
+//
+//   - rejectRepeated (the duplicate-field scan): every known field — one
+//     without a nested checker included — may be declared at most once. The
+//     second occurrence rejects the whole document with the field and the
+//     object's location, whether or not the two values agree, whether the
+//     first is null or the second an empty list; the last value is never
+//     taken.
+//   - visit every occurrence (the raw name-encoding scan): the nested
+//     checker runs on each occurrence, so the literal of every known value
+//     the document carries is validated. That scan runs only after the
+//     duplicate scan has already rejected repeated known fields.
+//
+// location names the object itself in duplicate errors and is unused on the
+// visit path. A value that is not an object is consumed and left for the
+// regular parse to report.
+func walkObjectFields(dec *json.Decoder, location string, fields []knownField, rejectRepeated bool) error {
 	tok, err := scanToken(dec)
 	if err != nil {
 		return err
@@ -95,17 +121,23 @@ func checkObjectFields(dec *json.Decoder, location string, fields []knownField) 
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
 		return skipRest(dec, tok) // not an object: the regular parse reports it
 	}
-	seen := make(map[string]bool, len(fields))
+	var seen map[string]bool
+	if rejectRepeated {
+		seen = make(map[string]bool, len(fields))
+	}
 	for dec.More() {
 		key, err := scanKey(dec)
 		if err != nil {
 			return err
 		}
-		if field := matchKnownField(key, fields); field != nil {
-			if seen[field.name] {
-				return duplicateFieldError(field.name, location)
+		field := matchKnownField(key, fields)
+		if field != nil {
+			if rejectRepeated {
+				if seen[field.name] {
+					return duplicateFieldError(field.name, location)
+				}
+				seen[field.name] = true
 			}
-			seen[field.name] = true
 			if field.nested != nil {
 				if err := field.nested(dec); err != nil {
 					return err
@@ -113,12 +145,33 @@ func checkObjectFields(dec *json.Decoder, location string, fields []knownField) 
 				continue
 			}
 		}
+		// Unknown field, or a known field without a value checker: ignored
+		// together with everything nested inside it.
 		if err := skipValue(dec); err != nil {
 			return err
 		}
 	}
 	_, err = scanToken(dec) // closing '}'
 	return err
+}
+
+// checkObjectFields is the duplicate-scan entry into the shared walker: each
+// known field of the object may be declared at most once, known fields with a
+// nested check descend into their value, and every other value is skipped.
+// location describes the object itself in duplicate errors.
+func checkObjectFields(dec *json.Decoder, location string, fields []knownField) error {
+	return walkObjectFields(dec, location, fields, true)
+}
+
+// scanObjectFields is the name-encoding scan's entry into the same shared
+// walker: it recognizes exactly the same keys and skips exactly the same
+// values as checkObjectFields, but WITHOUT the once-only rule — a recognized
+// field's value is checked on every occurrence instead of rejecting the
+// second one. It runs only after the duplicate-field scan has already
+// rejected repeated known fields, while it must still validate the literals
+// of every known value the document carries.
+func scanObjectFields(dec *json.Decoder, fields []knownField) error {
+	return walkObjectFields(dec, "", fields, false)
 }
 
 // checkArrayElements scans the array the decoder is positioned at, running
@@ -138,45 +191,6 @@ func checkArrayElements(dec *json.Decoder, check func(dec *json.Decoder, index i
 		}
 	}
 	_, err = scanToken(dec) // closing ']'
-	return err
-}
-
-// scanObjectFields walks the object the decoder is positioned at using exactly
-// the same key recognition and value skipping as checkObjectFields — keys
-// matched after JSON unescaping with Unicode case folding, known fields with a
-// nested checker descended into, every other value skipped with whatever it
-// nests — but WITHOUT the once-only rule: a recognized field is checked on
-// every occurrence instead of rejecting the second one. The raw name-encoding
-// scan (name_encoding.go) uses this walker; it runs only after the
-// duplicate-field scan has already rejected repeated known fields, while it
-// must still validate the literals of every known value the document carries.
-// A value that is not an object is consumed and left for the regular parse.
-func scanObjectFields(dec *json.Decoder, fields []knownField) error {
-	tok, err := scanToken(dec)
-	if err != nil {
-		return err
-	}
-	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return skipRest(dec, tok) // not an object: the regular parse reports it
-	}
-	for dec.More() {
-		key, err := scanKey(dec)
-		if err != nil {
-			return err
-		}
-		if field := matchKnownField(key, fields); field != nil && field.nested != nil {
-			if err := field.nested(dec); err != nil {
-				return err
-			}
-			continue
-		}
-		// Unknown field, or a known field without a value checker: ignored
-		// with everything nested inside it.
-		if err := skipValue(dec); err != nil {
-			return err
-		}
-	}
-	_, err = scanToken(dec) // closing '}'
 	return err
 }
 
