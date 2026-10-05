@@ -86,10 +86,10 @@ func computeContentID(canonical []byte) string {
 // serialized without silently rewriting the name, so the frozen document would
 // not be a faithful, readable copy of the graph.
 func BuildSnapshot(graph map[string]*Lineage) (*SnapshotFile, error) {
-	if err := ValidateGraph(graph); err != nil {
-		return nil, err
-	}
-	adj, err := graphAdjacency(graph)
+	// One read of the existing graph settles its legality and yields the
+	// canonical relations the snapshot freezes — the same shared judgment
+	// ValidateGraph, preview, apply, and graph export make.
+	adj, err := validatedGraphAdjacency(graph)
 	if err != nil {
 		return nil, err
 	}

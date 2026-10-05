@@ -72,9 +72,9 @@ func TestReadersShareGraphStructureRules(t *testing.T) {
 			}
 
 			// Valid graph: both readers keep the same normalized graph.
-			fileAdj, err := graphAdjacency(fileGraph)
+			fileAdj, err := validatedGraphAdjacency(fileGraph)
 			if err != nil {
-				t.Fatalf("graphAdjacency: %v", err)
+				t.Fatalf("validatedGraphAdjacency: %v", err)
 			}
 			fileBytes, err := json.Marshal(GraphFile{Datasets: adjacencyToDatasets(fileAdj)})
 			if err != nil {

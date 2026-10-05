@@ -133,6 +133,17 @@ func validateGraphStructureFromFile(datasets []GraphDataset) (adjacency, error) 
 	if err != nil {
 		return nil, err
 	}
+	return validateGraphAdjacency(adj)
+}
+
+// validateGraphAdjacency runs the structure rules that apply to a graph after
+// its records have been normalized (empty names and duplicate declarations
+// already rejected): every direct upstream must be a declared dataset, and the
+// parent edges must be acyclic. It is the shared tail of both structure
+// authorities, validateGraphStructureFromFile for parsed documents and
+// validatedGraphAdjacency for live in-memory graphs, so the two inputs can
+// never disagree about whether one set of direct-upstream relations is legal.
+func validateGraphAdjacency(adj adjacency) (adjacency, error) {
 	if err := validateAdjacencyReferences(adj); err != nil {
 		return nil, err
 	}
