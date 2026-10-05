@@ -63,56 +63,18 @@ type BatchReport struct {
 	AffectedDownstreams []string   `json:"affectedDownstreams"`
 }
 
-// graphAdjacency derives the normalized parent map from the in-memory graph.
-// It rejects nil lineage nodes, empty names, names that are not valid UTF-8
-// (dataset names or direct upstream references), and references to upstreams
-// that are not registered; the name/reference rules are the shared ones from
-// normalizeDatasets and validateAdjacencyReferences, also used by the file and
-// snapshot readers. It does not check for cycles; use validateAcyclic for that.
-func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
-	if graph == nil {
-		return nil, fmt.Errorf("%w: create the graph map with make before validating", ErrNotInitialized)
-	}
-	// Check encoding before anything that would quote these names or turn them
-	// into JSON: a missing-upstream check must not label an unregistered,
-	// non-UTF-8 upstream as ErrNotFound when the name itself is unusable, and
-	// json.Marshal would silently rewrite an invalid byte into U+FFFD. The
-	// check is read-only and reports the offending raw bytes.
-	if err := validateInMemoryNamesUTF8(graph); err != nil {
-		return nil, err
-	}
-	records := make([]GraphDataset, 0, len(graph))
-	for name, entry := range graph {
-		if entry == nil {
-			return nil, fmt.Errorf("%w: dataset %q points to a nil lineage node", ErrInvalidArgument, name)
-		}
-		if name == "" {
-			return nil, fmt.Errorf("%w: dataset name is required", ErrInvalidArgument)
-		}
-		records = append(records, GraphDataset{Name: name, Upstreams: entry.Parents})
-	}
-	adj, err := normalizeDatasets(records)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateAdjacencyReferences(adj); err != nil {
-		return nil, err
-	}
-	return adj, nil
-}
-
 // ValidateGraph checks the in-memory graph for structural problems: nil nodes,
 // empty names, names that are not valid UTF-8 (dataset names or direct upstream
 // references), missing upstreams, and cycles. It does not mutate the graph.
 //
-// A graph that fails validation cannot be used as the basis for a batch: an
-// adjustment plan must not be allowed to paper over pre-existing corruption.
+// The judgment is the shared one in validateGraphAdjacency (see
+// graph_rules.go), so preview, apply, export, and snapshot build always accept
+// or reject the same graph ValidateGraph does. A graph that fails validation
+// cannot be used as the basis for a batch: an adjustment plan must not be
+// allowed to paper over pre-existing corruption.
 func ValidateGraph(graph map[string]*Lineage) error {
-	adj, err := graphAdjacency(graph)
-	if err != nil {
-		return err
-	}
-	return validateAcyclic(adj)
+	_, err := validateGraphAdjacency(graph)
+	return err
 }
 
 // validatePlanNamesUTF8 rejects a plan in which any name that takes part in
@@ -161,14 +123,13 @@ func validatePlanNamesUTF8(plan Plan) error {
 }
 
 // computeBatch validates the graph and plan, then computes the final adjacency
-// and the diff report. It does not mutate graph. The returned adjacency is the
-// graph as it will be after the batch; callers that want to commit it should
-// pass it to applyAdjacency.
+// and the diff report. It does not mutate graph. The original graph is
+// validated exactly once, with the shared judgment ValidateGraph exposes, and
+// the validated adjacency is reused as the diff baseline. The returned
+// adjacency is the graph as it will be after the batch; callers that want to
+// commit it should pass it to applyAdjacency.
 func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency, error) {
-	if err := ValidateGraph(graph); err != nil {
-		return nil, nil, err
-	}
-	original, err := graphAdjacency(graph)
+	original, err := validateGraphAdjacency(graph)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -522,14 +483,12 @@ func stringSliceEqual(a, b []string) bool {
 // empty names, names that are not valid UTF-8 (dataset names or direct upstream
 // references), missing upstreams, and dependency cycles (including a dataset
 // that lists itself) reject the export with no bytes returned, so a successful
-// result can always be read back with UnmarshalGraphFile. The check is
-// read-only: the in-memory graph is never modified.
+// result can always be read back with UnmarshalGraphFile. The check is the
+// shared one ValidateGraph exposes and is read-only: the in-memory graph is
+// never modified.
 func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
-	adj, err := graphAdjacency(graph)
+	adj, err := validateGraphAdjacency(graph)
 	if err != nil {
-		return nil, err
-	}
-	if err := validateAcyclic(adj); err != nil {
 		return nil, err
 	}
 	gf := GraphFile{Datasets: adjacencyToDatasets(adj)}

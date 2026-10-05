@@ -5,7 +5,10 @@
 // each dataset's direct upstreams. The rules below are the single authority for
 // turning that description into the validated, normalized adjacency both
 // readers build on, so the two file formats can never disagree about whether
-// one graph is legal or about which lineage relations it expresses:
+// one graph is legal or about which lineage relations it expresses. The same
+// rules judge an in-memory graph through validateGraphAdjacency, the one check
+// behind ValidateGraph, batch preview/apply, graph export, and snapshot build,
+// so an in-memory graph and its serialized form are never judged differently:
 //
 //   - an empty dataset name is rejected;
 //   - a dataset declared more than once is rejected;
@@ -122,6 +125,65 @@ func validateAdjacencyReferences(adj adjacency) error {
 		}
 	}
 	return nil
+}
+
+// graphAdjacency derives the normalized parent map from the in-memory graph.
+// It rejects nil lineage nodes, empty names, names that are not valid UTF-8
+// (dataset names or direct upstream references), and references to upstreams
+// that are not registered; the name/reference rules are the shared ones from
+// normalizeDatasets and validateAdjacencyReferences, also used by the file and
+// snapshot readers. It does not check for cycles; use validateGraphAdjacency
+// for the complete in-memory judgment.
+func graphAdjacency(graph map[string]*Lineage) (adjacency, error) {
+	if graph == nil {
+		return nil, fmt.Errorf("%w: create the graph map with make before validating", ErrNotInitialized)
+	}
+	// Check encoding before anything that would quote these names or turn them
+	// into JSON: a missing-upstream check must not label an unregistered,
+	// non-UTF-8 upstream as ErrNotFound when the name itself is unusable, and
+	// json.Marshal would silently rewrite an invalid byte into U+FFFD. The
+	// check is read-only and reports the offending raw bytes.
+	if err := validateInMemoryNamesUTF8(graph); err != nil {
+		return nil, err
+	}
+	records := make([]GraphDataset, 0, len(graph))
+	for name, entry := range graph {
+		if entry == nil {
+			return nil, fmt.Errorf("%w: dataset %q points to a nil lineage node", ErrInvalidArgument, name)
+		}
+		if name == "" {
+			return nil, fmt.Errorf("%w: dataset name is required", ErrInvalidArgument)
+		}
+		records = append(records, GraphDataset{Name: name, Upstreams: entry.Parents})
+	}
+	adj, err := normalizeDatasets(records)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAdjacencyReferences(adj); err != nil {
+		return nil, err
+	}
+	return adj, nil
+}
+
+// validateGraphAdjacency is the in-memory counterpart of
+// validateGraphStructureFromFile: it runs every structure rule the public
+// ValidateGraph enforces — nil nodes, empty names, names that are not valid
+// UTF-8, unregistered upstreams, and cycles — and returns the validated,
+// normalized adjacency. It is the single judgment behind ValidateGraph,
+// preview/apply, graph export, and snapshot build, so one operation validates
+// the original graph exactly once and every consumer reads the same canonical
+// adjacency instead of re-deriving it after a separate validation pass. The
+// graph is only read, never modified.
+func validateGraphAdjacency(graph map[string]*Lineage) (adjacency, error) {
+	adj, err := graphAdjacency(graph)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAcyclic(adj); err != nil {
+		return nil, err
+	}
+	return adj, nil
 }
 
 // validateGraphStructureFromFile runs every graph-structure rule shared by the
