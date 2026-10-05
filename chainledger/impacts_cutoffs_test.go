@@ -455,7 +455,11 @@ func TestImpactsWithCutoffsReadOnlyAndIsolated(t *testing.T) {
 
 // A rich graph queried repeatedly: a nil cutoff slice and the variadic no-arg
 // form both reproduce Impacts exactly, and every cutoff result is a subset
-// whose paths only traverse allowed nodes.
+// whose paths only traverse allowed nodes. Reachability and distances are
+// cross-checked against an independent BFS oracle (cutoffReachability) rather
+// than against the unrestricted query: a cutoff the full query can reach is
+// NOT required in the cutoff result when another cutoff blocks every route to
+// it.
 func TestImpactsWithCutoffsPathsNeverTraverseCutoff(t *testing.T) {
 	graph := buildRegisteredGraph(t, [][]string{
 		{"source"},
@@ -467,10 +471,27 @@ func TestImpactsWithCutoffsPathsNeverTraverseCutoff(t *testing.T) {
 		{"view", "report"},
 	})
 
-	for _, cutoffs := range [][]string{nil, {}, {"z"}, {"c"}, {"z", "c"}, {"report"}, {"view"}, {"source"}} {
+	full := mustImpacts(t, graph, "source")
+	for _, cutoffs := range [][]string{
+		nil, {},
+		{"z"}, {"c"}, {"z", "c"}, {"report"}, {"view"}, {"source"},
+		// Two cutoffs on the SAME lineage route: every route from source to z
+		// passes through a (source -> a -> z -> report), so with both named the
+		// traversal stops at a and never reaches z. z IS reachable in the full
+		// query but must not appear in this result, while report and view are
+		// still reached around both via b and c. Input order cannot matter.
+		{"a", "z"}, {"z", "a"},
+		// a still hides z behind it, and c is an independently reached cutoff:
+		// its own frontier drops, so report and view leave too.
+		{"a", "z", "c"},
+	} {
 		got, err := ImpactsWithCutoffs(graph, "source", cutoffs)
 		if err != nil {
 			t.Fatalf("cutoffs %v: %v", cutoffs, err)
+		}
+		// With no cutoffs the result is byte-for-byte the unrestricted query.
+		if len(cutoffs) == 0 && !reflect.DeepEqual(got, full) {
+			t.Fatalf("cutoffs %v: %v, want full Impacts %v", cutoffs, got, full)
 		}
 		cutset := map[string]bool{}
 		for _, c := range cutoffs {
@@ -498,15 +519,75 @@ func TestImpactsWithCutoffsPathsNeverTraverseCutoff(t *testing.T) {
 				t.Fatalf("origin leaked into results for cutoffs %v", cutoffs)
 			}
 		}
-		// A reachable cutoff must still be present.
-		full := mustImpacts(t, graph, "source")
-		for _, c := range cutoffs {
-			if c == "source" {
-				continue
+		// Independent oracle over routes that leave every cutoff behind: the
+		// reached set and BFS distances must match exactly. A cutoff hidden
+		// behind another cutoff (z behind a above) is absent from the oracle
+		// set even though the unrestricted query reaches it — that is the
+		// judgment the full-query comparison got wrong.
+		wantNames, wantDistance := cutoffReachability(graph, "source", cutoffs)
+		if len(seen) != len(wantNames) {
+			t.Fatalf("cutoffs %v: got %d datasets %v, want %d %v",
+				cutoffs, len(seen), seen, len(wantNames), wantNames)
+		}
+		for name := range wantNames {
+			if !seen[name] {
+				t.Fatalf("cutoffs %v: %s reachable without passing a cutoff but missing from %v",
+					cutoffs, name, impactNames(got))
 			}
-			if slices.Contains(impactNames(full), c) && !slices.Contains(impactNames(got), c) {
-				t.Fatalf("cutoffs %v: reachable cutoff %s missing from %v", cutoffs, c, impactNames(got))
+		}
+		for _, im := range got {
+			if d := wantDistance[im.Dataset]; d != im.Distance {
+				t.Fatalf("cutoffs %v: %s distance = %d, want %d over cutoff-free routes (full-query distance must not be reused)",
+					cutoffs, im.Dataset, im.Distance, d)
+			}
+		}
+		// Sanity anchor for the corrected judgment itself: with a and z both
+		// named, z must be full-query reachable yet absent here.
+		if cutset["a"] && cutset["z"] {
+			if !slices.Contains(impactNames(full), "z") {
+				t.Fatalf("setup: z should be reachable in the full query, got %v", impactNames(full))
+			}
+			if slices.Contains(impactNames(got), "z") {
+				t.Fatalf("cutoffs %v: z lies only past cutoff a and must not appear, got %v",
+					cutoffs, impactNames(got))
 			}
 		}
 	}
+}
+
+// cutoffReachability independently answers the reachability and distance part
+// of the cutoff contract: a plain level-by-level BFS from origin over child
+// edges that records a node once and then never expands a reached cutoff. It
+// knows nothing about the production traversal's path tie-break, so the
+// regression compares its conclusions against the query instead of restating
+// the query's own logic. A cutoff that sits behind another cutoff on every
+// route is never reached and is therefore absent from the expected set, even
+// though the unrestricted graph reaches it.
+func cutoffReachability(graph map[string]*Lineage, origin string, cutoffs []string) (map[string]bool, map[string]int) {
+	blocked := make(map[string]bool, len(cutoffs))
+	for _, c := range cutoffs {
+		blocked[c] = true
+	}
+	reached := map[string]bool{origin: true}
+	distance := map[string]int{origin: 0}
+	frontier := []string{origin}
+	for level := 0; len(frontier) > 0; level++ {
+		var next []string
+		for _, node := range frontier {
+			if blocked[node] {
+				continue // reached itself, but propagation stops there
+			}
+			for _, child := range graph[node].Children {
+				if !reached[child] {
+					reached[child] = true
+					distance[child] = level + 1
+					next = append(next, child)
+				}
+			}
+		}
+		frontier = next
+	}
+	delete(reached, origin)
+	delete(distance, origin)
+	return reached, distance
 }
