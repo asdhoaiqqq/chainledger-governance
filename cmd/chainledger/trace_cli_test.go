@@ -332,6 +332,155 @@ func TestCLITraceDeepConvergingBranchesByteStable(t *testing.T) {
 	}
 }
 
+// traceSharedPrefixGraph is the CLI counterpart of the report-independence
+// fixture in the core package: T and U both reach roots R1 and R2 through the
+// common intermediate M, so both of T's paths share the prefix [T M], and X is
+// a disconnected root.
+const traceSharedPrefixGraph = `{"datasets":[
+	{"name":"T","upstreams":["M"]},
+	{"name":"U","upstreams":["M"]},
+	{"name":"M","upstreams":["R1","R2"]},
+	{"name":"R1","upstreams":[]},
+	{"name":"R2","upstreams":[]},
+	{"name":"X","upstreams":[]}
+]}`
+
+// runTraceCommand invokes `trace snapPath dataset` and returns its stdout,
+// stderr, and exit code.
+func runTraceCommand(t *testing.T, snapPath, dataset string) (stdout, stderr string, exit int) {
+	t.Helper()
+	return captureStdout(t, func() int {
+		return run([]string{"trace", snapPath, dataset})
+	})
+}
+
+// TestCLITraceReportsAreIndependentAcrossInvocations pins the command-line
+// shape of the report-independence guarantee: two successful trace outputs for
+// the same query and one for another downstream through the same shared
+// intermediate each keep representing the result at their own invocation, and
+// the read-only command never modifies the snapshot. A caller editing one
+// emitted JSON report cannot affect another invocation's report because each
+// run computes from the frozen snapshot file, which these later runs must find
+// byte-for-byte unchanged.
+func TestCLITraceReportsAreIndependentAcrossInvocations(t *testing.T) {
+	snapPath := snapshotForTrace(t, traceSharedPrefixGraph)
+	snapBytes := readFile(t, snapPath)
+
+	outT1, stderr, exit := runTraceCommand(t, snapPath, "T")
+	if exit != 0 {
+		t.Fatalf("first trace T exit = %d, stderr = %s", exit, stderr)
+	}
+	outT2, stderr, exit := runTraceCommand(t, snapPath, "T")
+	if exit != 0 {
+		t.Fatalf("second trace T exit = %d, stderr = %s", exit, stderr)
+	}
+	outU, stderr, exit := runTraceCommand(t, snapPath, "U")
+	if exit != 0 {
+		t.Fatalf("trace U exit = %d, stderr = %s", exit, stderr)
+	}
+
+	// Repeated results are byte-identical: every report is computed from the
+	// same frozen snapshot, so display edits of one copy can never reach later
+	// output.
+	if outT1 != outT2 {
+		t.Errorf("repeated T traces differ:\n%s\n%s", outT1, outT2)
+	}
+
+	// The other downstream through the same shared intermediate reports its
+	// own query name and its own complete paths.
+	var reportU chainledger.TraceReport
+	if err := json.Unmarshal([]byte(outU), &reportU); err != nil {
+		t.Fatalf("trace U stdout is not valid JSON: %v\n%s", err, outU)
+	}
+	if reportU.Dataset != "U" {
+		t.Errorf("U report Dataset = %q, want %q", reportU.Dataset, "U")
+	}
+	wantU := []chainledger.SourceTrace{
+		{Root: "R1", Path: []string{"U", "M", "R1"}},
+		{Root: "R2", Path: []string{"U", "M", "R2"}},
+	}
+	if !reflect.DeepEqual(reportU.Sources, wantU) {
+		t.Errorf("U Sources = %+v, want %+v", reportU.Sources, wantU)
+	}
+	var reportT chainledger.TraceReport
+	if err := json.Unmarshal([]byte(outT1), &reportT); err != nil {
+		t.Fatalf("trace T stdout is not valid JSON: %v\n%s", err, outT1)
+	}
+	wantT := []chainledger.SourceTrace{
+		{Root: "R1", Path: []string{"T", "M", "R1"}},
+		{Root: "R2", Path: []string{"T", "M", "R2"}},
+	}
+	if !reflect.DeepEqual(reportT.Sources, wantT) {
+		t.Errorf("T Sources = %+v, want %+v", reportT.Sources, wantT)
+	}
+
+	// The snapshot file is still byte-for-byte the frozen input.
+	if got := readFile(t, snapPath); got != snapBytes {
+		t.Errorf("snapshot changed across trace invocations:\n got %s\nwant %s", got, snapBytes)
+	}
+}
+
+// TestCLITraceSuccessThenErrorsLeavesSnapshotAndRequeryUntouched pins, end to
+// end, the boundary around rejected queries: after successful reports are in
+// hand, an empty name and an unknown name keep failing with the existing error
+// categories and empty stdout, while the snapshot file stays untouched and a
+// later successful query still reports the frozen sources and paths.
+func TestCLITraceSuccessThenErrorsLeavesSnapshotAndRequeryUntouched(t *testing.T) {
+	snapPath := snapshotForTrace(t, traceSharedPrefixGraph)
+	snapBytes := readFile(t, snapPath)
+
+	okOut, stderr, exit := runTraceCommand(t, snapPath, "T")
+	if exit != 0 {
+		t.Fatalf("trace T exit = %d, stderr = %s", exit, stderr)
+	}
+	rootOut, stderr, exit := runTraceCommand(t, snapPath, "R1")
+	if exit != 0 {
+		t.Fatalf("trace R1 exit = %d, stderr = %s", exit, stderr)
+	}
+
+	for _, dataset := range []string{"", "ghost"} {
+		stdout, stderr, exit := runTraceCommand(t, snapPath, dataset)
+		if exit == 0 {
+			t.Fatalf("trace %q succeeded, want failure", dataset)
+		}
+		if stdout != "" {
+			t.Errorf("trace %q stdout = %q, want empty", dataset, stdout)
+		}
+		if !strings.Contains(stderr, snapPath) {
+			t.Errorf("trace %q stderr = %q, must name the snapshot file", dataset, stderr)
+		}
+	}
+
+	// The snapshot file is unchanged by the rejected queries.
+	if got := readFile(t, snapPath); got != snapBytes {
+		t.Errorf("snapshot changed after rejected queries:\n got %s\nwant %s", got, snapBytes)
+	}
+
+	// A later successful query returns the frozen result byte-for-byte,
+	// including the root's single-element path.
+	retryT, stderr, exit := runTraceCommand(t, snapPath, "T")
+	if exit != 0 {
+		t.Fatalf("retry trace T exit = %d, stderr = %s", exit, stderr)
+	}
+	if retryT != okOut {
+		t.Errorf("retry trace T differs from the earlier success:\n got %s\nwant %s", retryT, okOut)
+	}
+	retryRoot, stderr, exit := runTraceCommand(t, snapPath, "R1")
+	if exit != 0 {
+		t.Fatalf("retry trace R1 exit = %d, stderr = %s", exit, stderr)
+	}
+	if retryRoot != rootOut {
+		t.Errorf("retry trace R1 differs from the earlier success:\n got %s\nwant %s", retryRoot, rootOut)
+	}
+	var rootReport chainledger.TraceReport
+	if err := json.Unmarshal([]byte(retryRoot), &rootReport); err != nil {
+		t.Fatalf("trace R1 stdout is not valid JSON: %v\n%s", err, retryRoot)
+	}
+	if want := []chainledger.SourceTrace{{Root: "R1", Path: []string{"R1"}}}; !reflect.DeepEqual(rootReport.Sources, want) {
+		t.Errorf("R1 Sources = %+v, want %+v", rootReport.Sources, want)
+	}
+}
+
 func TestCLIHelpMentionsTrace(t *testing.T) {
 	stdout, _, exit := captureStdout(t, func() int { return run([]string{"help"}) })
 	if exit != 0 {
