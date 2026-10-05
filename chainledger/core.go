@@ -466,16 +466,18 @@ func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonU
 		return nil, errInvalid("dataset not found: " + second)
 	}
 
-	// Resolve each target's ancestor closure with its shortest, tie-broken
-	// explanation paths; the two BFS walks are independent of one another, so
-	// the distances and paths on either side can differ asymmetrically.
-	distFirst, pathFirst := upstreamShortestPaths(graph, first)
-	distSecond, pathSecond := upstreamShortestPaths(graph, second)
+	// Resolve each target's ancestor closure, the target itself included, with
+	// its shortest, tie-broken explanation paths. Both closures come from the
+	// single distance/path rule set shared with Upstreams; the two walks are
+	// independent of one another, so the distances and paths on either side can
+	// differ asymmetrically.
+	toFirst := shortestLineagePaths(graph, first, dirUpstream, nil)
+	toSecond := shortestLineagePaths(graph, second, dirUpstream, nil)
 
 	// A shared source belongs to both closures.
 	common := make(map[string]bool)
-	for name := range distFirst {
-		if _, ok := distSecond[name]; ok {
+	for name := range toFirst.distance {
+		if toSecond.reaches(name) {
 			common[name] = true
 		}
 	}
@@ -499,53 +501,97 @@ func CommonUpstreams(graph map[string]*Lineage, first, second string) ([]CommonU
 		}
 		results = append(results, CommonUpstream{
 			Dataset:          name,
-			DistanceToFirst:  distFirst[name],
-			PathToFirst:      append([]string(nil), pathFirst[name]...),
-			DistanceToSecond: distSecond[name],
-			PathToSecond:     append([]string(nil), pathSecond[name]...),
+			DistanceToFirst:  toFirst.distanceTo(name),
+			PathToFirst:      toFirst.pathTo(name),
+			DistanceToSecond: toSecond.distanceTo(name),
+			PathToSecond:     toSecond.pathTo(name),
 		})
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].Dataset < results[j].Dataset })
 	return results, nil
 }
 
-// upstreamShortestPaths walks parent edges from target and returns, for every
-// dataset in target's ancestor closure (target itself included, at distance 0
-// with path [target]), its shortest edge distance to target and the
-// lexicographically smallest shortest path written from the ancestor toward
-// the target. It is the per-target half of CommonUpstreams and applies exactly
-// traceLineage's rule set: a whole BFS level commits at once, the fewest-edge
-// route wins, and among equal-length routes the smallest full name sequence
-// wins hop by hop from the source. Every committed path gets its own backing
-// array via dirUpstream.extendPath.
-func upstreamShortestPaths(graph map[string]*Lineage, target string) (map[string]int, map[string][]string) {
-	distance := map[string]int{target: 0}
-	best := map[string][]string{target: {target}}
-	frontier := []string{target}
+// lineageClosure holds one BFS walk's shortest-distance and tie-broken
+// explanation-path result for every dataset reachable from its start, the
+// start itself included at distance 0 with path [start]. It is the single
+// distance/path rule set shared by Upstreams, Impacts(WithCutoffs) and each
+// side of CommonUpstreams; callers differ only in which edges they walk,
+// whether they stop propagation at cutoffs, and which subset of the closure
+// they report.
+type lineageClosure struct {
+	distance map[string]int
+	best     map[string][]string
+}
+
+// reaches reports whether start can reach name.
+func (c *lineageClosure) reaches(name string) bool {
+	_, ok := c.distance[name]
+	return ok
+}
+
+// distanceTo is the committed shortest edge distance to name; an unreachable
+// name yields 0, which callers only ask for reached names.
+func (c *lineageClosure) distanceTo(name string) int {
+	return c.distance[name]
+}
+
+// pathTo returns an independent copy of the committed shortest path to name,
+// written along the actual derivation direction so that mutating it can reach
+// neither the closure's storage nor any other returned record.
+func (c *lineageClosure) pathTo(name string) []string {
+	return append([]string(nil), c.best[name]...)
+}
+
+// shortestLineagePaths walks direction edges from start and computes the
+// shortest edge distance and the lexicographically smallest shortest path for
+// every dataset in start's closure. When cutoffs is non-empty, a reachable
+// cutoff node stays in the closure at its own distance but is never expanded:
+// distances and paths beyond it are computed solely over routes that pass no
+// cutoff. A nil cutoffs list means propagation is unrestricted.
+//
+// A whole BFS level commits at once, so the fewest-edge route wins and a node
+// reached through several merging branches keeps exactly one candidate before
+// the level commits; among equal-length routes the smallest full name sequence
+// wins hop by hop from the path's beginning (see lessPath and the
+// queryDirection.extendPath rule). Register rejects cycles, so equal-length
+// rediscoveries only happen inside one level's candidate map. The graph is
+// read only and every committed path lives in its own backing array.
+func shortestLineagePaths(graph map[string]*Lineage, start string, direction queryDirection, cutoffs map[string]bool) *lineageClosure {
+	closure := &lineageClosure{
+		distance: map[string]int{start: 0},
+		best:     map[string][]string{start: {start}},
+	}
+	frontier := []string{start}
 	for level := 0; len(frontier) > 0; level++ {
 		candidates := map[string][]string{}
 		var next []string
 		for _, node := range frontier {
-			for _, parent := range graph[node].Parents {
-				if _, seen := distance[parent]; seen {
+			// A reached cutoff stays in the closure itself but is a dead end:
+			// nothing propagates through it, even though a parallel route may
+			// still reach the same node independently.
+			if cutoffs[node] {
+				continue
+			}
+			for _, hop := range direction.neighbors(graph[node]) {
+				if closure.reaches(hop) {
 					continue // reached on an earlier, strictly shorter level
 				}
-				candidate := dirUpstream.extendPath(best[node], parent)
-				if current, ok := candidates[parent]; !ok || lessPath(candidate, current) {
+				candidate := direction.extendPath(closure.best[node], hop)
+				if current, ok := candidates[hop]; !ok || lessPath(candidate, current) {
 					if !ok {
-						next = append(next, parent)
+						next = append(next, hop)
 					}
-					candidates[parent] = candidate
+					candidates[hop] = candidate
 				}
 			}
 		}
 		for _, hop := range next {
-			distance[hop] = level + 1
-			best[hop] = candidates[hop]
+			closure.distance[hop] = level + 1
+			closure.best[hop] = candidates[hop]
 		}
 		frontier = next
 	}
-	return distance, best
+	return closure
 }
 
 // queryDirection carries the only way the two lineage queries differ: which
@@ -601,28 +647,14 @@ type lineageHit struct {
 // neighbors are never expanded, so paths that would pass through it disappear;
 // a nil cutoffs list means propagation is unrestricted.
 //
-// The traversal is a BFS that commits a whole distance level at once, so a node
-// reached through several branches within the same level keeps exactly one
-// candidate before the level commits. The rules shared by both directions are:
+// Distance, the once-per-level candidate commit and the lexicographic
+// whole-path tie break all come from the shared shortestLineagePaths walk —
+// the same walk CommonUpstreams uses for each side; only the direction, the
+// optional cutoff frontier, and this caller's presentation differ:
 //
-//   - Distance is the minimum number of lineage edges; a node committed on an
-//     earlier level can never be re-explained at a longer one (Register
-//     rejects cycles, so equal-length rediscoveries only happen inside one
-//     level's candidate map).
 //   - Each dataset appears at most once, however many branches merge into it.
-//   - Among equal-length shortest paths, the lexicographically smallest full
-//     path wins: names are compared one by one from the path's beginning in Go
-//     string order. Downstream paths begin at the query origin and upstream
-//     paths at the source, so candidates for one upstream share their first
-//     hop and compare directly against the committed tails.
 //   - Hits are ordered by distance ascending and then by dataset name, never
 //     by registration order or the stored parent/child list order.
-//
-// With cutoffs set, every distance, candidate path and ordering decision is
-// taken over edges that leave no cutoff behind: a committed cutoff stays in
-// the result but its frontier is dropped, and a node reached around a cutoff
-// is explained by the route that avoided it rather than by any truncated
-// route from the unrestricted graph.
 //
 // Explanation paths are written in the query direction (see extendPath). The
 // graph is read only and every returned path is an independent copy. An empty
@@ -655,49 +687,17 @@ func traceLineage(graph map[string]*Lineage, start string, direction queryDirect
 		blocked[cutoff] = true
 	}
 
-	distance := map[string]int{start: 0}
-	best := map[string][]string{start: {start}}
-	frontier := []string{start}
-	for level := 0; len(frontier) > 0; level++ {
-		nextDistance := level + 1
-		candidates := map[string][]string{}
-		var next []string
-		for _, node := range frontier {
-			// A reached cutoff stays a result itself but is a dead end: nothing
-			// propagates through it, even though a parallel route may still
-			// reach the same downstream independently.
-			if blocked[node] {
-				continue
-			}
-			for _, hop := range direction.neighbors(graph[node]) {
-				if _, seen := distance[hop]; seen {
-					continue // reached on an earlier, strictly shorter level
-				}
-				candidate := direction.extendPath(best[node], hop)
-				if current, ok := candidates[hop]; !ok || lessPath(candidate, current) {
-					if !ok {
-						next = append(next, hop)
-					}
-					candidates[hop] = candidate
-				}
-			}
-		}
-		for _, hop := range next {
-			distance[hop] = nextDistance
-			best[hop] = candidates[hop]
-		}
-		frontier = next
-	}
+	closure := shortestLineagePaths(graph, start, direction, blocked)
 
-	hits := make([]lineageHit, 0, len(distance)-1)
-	for name, d := range distance {
+	hits := make([]lineageHit, 0, len(closure.distance)-1)
+	for name := range closure.distance {
 		if name == start {
 			continue
 		}
 		hits = append(hits, lineageHit{
 			name:     name,
-			distance: d,
-			path:     append([]string(nil), best[name]...),
+			distance: closure.distanceTo(name),
+			path:     closure.pathTo(name),
 		})
 	}
 	sort.Slice(hits, func(i, j int) bool {
