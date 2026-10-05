@@ -251,22 +251,11 @@ func CompareSnapshots(oldSnap, newSnap *SnapshotFile) *CompareReport {
 
 	added, removed := diffRelations(oldAdj, newAdj)
 
-	var newNodes, removedNodes, changedNodes []string
-	for name := range newAdj {
-		if oldParents, ok := oldAdj[name]; !ok {
-			newNodes = append(newNodes, name)
-		} else if !stringSliceEqual(oldParents, newAdj[name]) {
-			changedNodes = append(changedNodes, name)
-		}
-	}
-	for name := range oldAdj {
-		if _, ok := newAdj[name]; !ok {
-			removedNodes = append(removedNodes, name)
-		}
-	}
-	sort.Strings(newNodes)
-	sort.Strings(removedNodes)
-	sort.Strings(changedNodes)
+	// The node classification is the shared old -> new rule (diffDatasetNodes)
+	// the batch report also follows, so comparing the snapshots taken around a
+	// batch yields the same new, removed, and directly changed datasets the
+	// batch itself reported.
+	nodeDiff := diffDatasetNodes(oldAdj, newAdj)
 
 	common := make([]string, 0)
 	for name := range oldAdj {
@@ -290,9 +279,9 @@ func CompareSnapshots(oldSnap, newSnap *SnapshotFile) *CompareReport {
 	}
 
 	return &CompareReport{
-		NewDatasets:       orEmptyStrings(newNodes),
-		RemovedDatasets:   orEmptyStrings(removedNodes),
-		ChangedDatasets:   orEmptyStrings(changedNodes),
+		NewDatasets:       orEmptyStrings(nodeDiff.New),
+		RemovedDatasets:   orEmptyStrings(nodeDiff.Removed),
+		ChangedDatasets:   orEmptyStrings(nodeDiff.Changed),
 		AddedRelations:    orEmptyRelations(added),
 		RemovedRelations:  orEmptyRelations(removed),
 		RootSourceChanges: rootChanges,

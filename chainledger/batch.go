@@ -223,32 +223,9 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 	for name := range removalDecls {
 		delete(final, name)
 	}
-	var newNames []string
-	var changedNames []string
 	for _, change := range plan.Changes {
-		wanted := uniqueSorted(change.Upstreams)
-		old, existed := original[change.Name]
-		switch {
-		case !existed:
-			newNames = append(newNames, change.Name)
-		case !stringSliceEqual(old, wanted):
-			changedNames = append(changedNames, change.Name)
-		}
-		final[change.Name] = wanted
+		final[change.Name] = uniqueSorted(change.Upstreams)
 	}
-	sort.Strings(newNames)
-	sort.Strings(changedNames)
-
-	// Datasets actually removed: names in removals that existed in the
-	// original graph. Deleting a name that does not exist is a no-op and is
-	// not reported, so a successful plan can be applied again with empty lists.
-	var removedNames []string
-	for name := range removalDecls {
-		if _, existed := original[name]; existed {
-			removedNames = append(removedNames, name)
-		}
-	}
-	sort.Strings(removedNames)
 
 	// Every upstream must resolve to a dataset that exists in the FINAL graph
 	// (new datasets may reference each other regardless of plan order; a
@@ -272,14 +249,24 @@ func computeBatch(graph map[string]*Lineage, plan Plan) (*BatchReport, adjacency
 		return nil, nil, err
 	}
 
+	// Classify the nodes with the shared old -> new rule (diffDatasetNodes),
+	// the same classification CompareSnapshots reports, so a batch report and
+	// a snapshot comparison of the same transition always agree on which
+	// datasets are new, removed, or directly changed. Derived from the two
+	// graphs rather than the plan text: deleting a name that does not exist is
+	// a no-op and is not reported, so a successful plan can be applied again
+	// with empty lists, and naming an existing dataset without altering its
+	// upstreams is not a change.
+	nodeDiff := diffDatasetNodes(original, final)
+
 	added, removed := diffRelations(original, final)
-	affected := affectedDownstreams(original, final, newNames, changedNames, removedNames)
+	affected := affectedDownstreams(original, final, nodeDiff.New, nodeDiff.Changed, nodeDiff.Removed)
 
 	report := &BatchReport{
 		FinalGraph:          GraphFile{Datasets: adjacencyToDatasets(final)},
-		NewDatasets:         newNames,
-		ChangedDatasets:     changedNames,
-		RemovedDatasets:     removedNames,
+		NewDatasets:         nodeDiff.New,
+		ChangedDatasets:     nodeDiff.Changed,
+		RemovedDatasets:     nodeDiff.Removed,
 		AddedRelations:      added,
 		RemovedRelations:    removed,
 		AffectedDownstreams: affected,

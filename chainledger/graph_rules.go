@@ -33,7 +33,9 @@
 //
 // The snapshot-only envelope rules (required fields, format version, content
 // identifier, and duplicates of the snapshot's own fields) live in
-// snapshot.go; this file is only the common graph structure.
+// snapshot.go; this file is only the common graph structure, plus the shared
+// old -> new node classification (diffDatasetNodes) that the batch report and
+// the snapshot comparison both build on.
 package chainledger
 
 import (
@@ -197,6 +199,56 @@ func validateAcyclic(adj adjacency) error {
 		}
 	}
 	return nil
+}
+
+// datasetDiff is the old -> new classification of dataset nodes shared by the
+// batch report (computeBatch) and the snapshot comparison (CompareSnapshots),
+// so the two reports can never disagree about what changed between an older
+// and a newer version of one graph. Each list is sorted by name byte order
+// and may be nil when empty; callers normalize nil to an empty list for JSON.
+type datasetDiff struct {
+	New     []string // present only in the new graph
+	Removed []string // present only in the old graph
+	Changed []string // present in both, direct upstream set differs
+}
+
+// diffDatasetNodes classifies the dataset nodes of two normalized adjacencies
+// in the fixed direction old -> new:
+//
+//   - a name only the new graph carries is new — even when it arrives with
+//     upstreams, it is never also an upstream change;
+//   - a name only the old graph carries is removed — it is never also an
+//     upstream change;
+//   - a name both graphs carry is changed only when its direct upstream set
+//     actually differs; a dataset that survives but had its upstreams cleared
+//     became a root and counts as changed, not removed.
+//
+// Names are case-sensitive and compared verbatim. Both adjacencies are
+// normalized (sorted, duplicate-free parent lists), so record order, upstream
+// order, and repeated upstreams carry no semantics and cannot manufacture a
+// difference; comparing a graph with itself — empty or not — yields three
+// empty lists. Mentioning a dataset is not what makes it changed: only the
+// two graphs decide.
+func diffDatasetNodes(oldAdj, newAdj adjacency) datasetDiff {
+	var diff datasetDiff
+	for name, newParents := range newAdj {
+		oldParents, ok := oldAdj[name]
+		switch {
+		case !ok:
+			diff.New = append(diff.New, name)
+		case !stringSliceEqual(oldParents, newParents):
+			diff.Changed = append(diff.Changed, name)
+		}
+	}
+	for name := range oldAdj {
+		if _, ok := newAdj[name]; !ok {
+			diff.Removed = append(diff.Removed, name)
+		}
+	}
+	sort.Strings(diff.New)
+	sort.Strings(diff.Removed)
+	sort.Strings(diff.Changed)
+	return diff
 }
 
 // materializeLineage turns validated, normalized parent adjacency into the
