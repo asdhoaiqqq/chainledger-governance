@@ -53,8 +53,16 @@ var snapshotCLIBin string
 // TestMain builds the command binary once and also implements the external
 // lock-holder helper mode (the test binary re-enters here as a subprocess).
 func TestMain(m *testing.M) {
-	if len(os.Args) >= 2 && os.Args[1] == lockHelperMode {
-		os.Exit(runLockHelper(os.Args[2:]))
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case lockHelperMode:
+			os.Exit(runLockHelper(os.Args[2:]))
+		}
+		// Platform-specific extra helper modes (e.g. the Linux mount-namespace
+		// write-fault helper). On platforms without such a mode this is a no-op.
+		if code, handled := dispatchExtraTestHelperMode(os.Args[1], os.Args[2:]); handled {
+			os.Exit(code)
+		}
 	}
 
 	dir, err := os.MkdirTemp("", "chainledger-snapshot-bin-")
