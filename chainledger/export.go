@@ -15,8 +15,8 @@ type lineageExportEdge struct {
 	To   string `json:"to"`
 }
 
-// lineageExportDocument is the JSON shape produced by ExportUpstreamLineage:
-// the full set of dataset names involved in a target's derivation, plus every
+// lineageExportDocument is the JSON shape produced by the lineage exports:
+// the set of dataset names involved in the requested derivation, plus every
 // direct dependency between them.
 type lineageExportDocument struct {
 	Nodes []string            `json:"nodes"`
@@ -74,11 +74,91 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 		return "", errInvalid("dataset not found: " + target)
 	}
 
-	// Collect the target plus its whole ancestor closure by walking parent
-	// edges. Register rejects cycles, so every walk terminates; the included
-	// set doubles as the visited set.
-	included := map[string]bool{target: true}
-	queue := []string{target}
+	return renderLineageExport(graph, ancestorClosure(graph, target))
+}
+
+// ExportSourceTargetLineage exports only the part of target's upstream lineage
+// that a specified registered source actually participates in, as a JSON
+// document for other programs to consume. Where ExportUpstreamLineage brings
+// along every source target depends on, this scoped export answers just "how
+// does this one source derive this target".
+//
+// The document holds exactly the datasets that lie on at least one existing
+// derivation route from source to target — source and target included — and
+// exactly the direct dependencies carried by those routes. Concretely a node
+// is included when it is both a direct or indirect downstream of source and a
+// direct or indirect upstream of target; an edge is included when both of its
+// endpoints are. Every node and edge appears once. Keeping the full node set
+// (rather than one picked path) preserves every branch simultaneously: if
+// source reaches target directly, through a, and through b and mid, limiting
+// the export to source and report still keeps all three routes complete — a
+// longer route is never dropped because a direct relation or a shorter route
+// exists.
+//
+// What stays out follows from the same intersection:
+//
+//   - An independent source that feeds an included intermediate dataset but is
+//     not itself downstream of source is excluded, and so is the edge from it:
+//     if a additionally depends on extra, neither extra nor extra -> a appears.
+//   - A downstream of source that cannot reach target is excluded; ancestors
+//     of source and downstreams of target are excluded as well.
+//
+// When source and target are the same registered dataset, that dataset alone
+// is exported with an empty edges array. When both are registered but no
+// derivation route from source to target exists, the export still succeeds but
+// holds two empty (non-null) arrays — no isolated endpoint is retained, and a
+// dependency running the other way (target derives source) is not treated as
+// reachability.
+//
+// The document shape, the {"from": upstream, "to": derived} edge direction,
+// the nodes-by-name and edges-by-from-then-to Go-string ordering, the
+// byte-exact name handling and the invalid-UTF-8 failure rule all match
+// ExportUpstreamLineage, judged over the scoped node set only: a name outside
+// the selected routes, including one on target's other ancestry, never blocks
+// this export. Output is therefore fully determined by the registered names
+// and independent of registration order and stored upstream-list order.
+//
+// Names match by exact registered value (case-sensitive). Source is validated
+// first: an empty name is a missing-name error and an unregistered name
+// (including against an empty or nil graph) is an error naming it; only then
+// is target checked the same way. Those checks take precedence over name
+// encoding. The export is read-only — it changes no node, bidirectional
+// relationship or stored list order — and any failure returns an empty
+// string, never a partial document.
+func ExportSourceTargetLineage(graph map[string]*Lineage, source, target string) (string, error) {
+	if source == "" {
+		return "", errInvalid("dataset name is required")
+	}
+	if _, ok := graph[source]; !ok {
+		return "", errInvalid("dataset not found: " + source)
+	}
+	if target == "" {
+		return "", errInvalid("dataset name is required")
+	}
+	if _, ok := graph[target]; !ok {
+		return "", errInvalid("dataset not found: " + target)
+	}
+
+	// A node belongs to a source -> target derivation exactly when it is
+	// downstream of source AND upstream of target. Register rejects cycles, so
+	// both walks terminate; the visited sets guard the loops regardless.
+	downstream := descendantClosure(graph, source)
+	upstream := ancestorClosure(graph, target)
+	included := make(map[string]bool)
+	for name := range downstream {
+		if upstream[name] {
+			included[name] = true
+		}
+	}
+
+	return renderLineageExport(graph, included)
+}
+
+// ancestorClosure collects start and every dataset reachable from it by
+// following parent edges.
+func ancestorClosure(graph map[string]*Lineage, start string) map[string]bool {
+	included := map[string]bool{start: true}
+	queue := []string{start}
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
@@ -89,7 +169,30 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 			}
 		}
 	}
+	return included
+}
 
+// descendantClosure collects start and every dataset reachable from it by
+// following child edges.
+func descendantClosure(graph map[string]*Lineage, start string) map[string]bool {
+	included := map[string]bool{start: true}
+	queue := []string{start}
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+		for _, child := range graph[node].Children {
+			if !included[child] {
+				included[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+	return included
+}
+
+// renderLineageExport serializes one already-decided node set in the single
+// document format shared by the lineage exports.
+func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (string, error) {
 	nodes := make([]string, 0, len(included))
 	for name := range included {
 		nodes = append(nodes, name)
@@ -103,7 +206,8 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 	// Nodes are already in Go string order, so the first invalid one is the
 	// deterministic answer regardless of registration or upstream-list order;
 	// %q exposes the actual bytes (non-displayable ones as \xNN) instead of a
-	// shared replacement glyph. Nodes outside this closure are never examined.
+	// shared replacement glyph. Nodes outside the selected set are never
+	// examined.
 	for _, name := range nodes {
 		if !utf8.ValidString(name) {
 			return "", errInvalid(fmt.Sprintf(
@@ -111,15 +215,19 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 		}
 	}
 
-	// Every direct dependency between included nodes is an edge. A parent of
-	// an included node is itself included by construction, so walking the
-	// parents of each included node covers exactly the dependencies among the
-	// selected nodes. The dedupe set guards the one-edge-once rule even if a
-	// stored list ever repeated a name.
+	// Every direct dependency between included nodes is an edge. In the full
+	// upstream export every parent of an included node is included by
+	// construction; in a source-scoped export an included intermediate node may
+	// also depend on an independent, excluded source, so the parent has to be
+	// checked against the set. The dedupe set guards the one-edge-once rule even
+	// if a stored list ever repeated a name.
 	edges := make([]lineageExportEdge, 0)
 	seen := make(map[lineageExportEdge]bool)
 	for _, name := range nodes {
 		for _, parent := range graph[name].Parents {
+			if !included[parent] {
+				continue
+			}
 			edge := lineageExportEdge{From: parent, To: name}
 			if !seen[edge] {
 				seen[edge] = true
