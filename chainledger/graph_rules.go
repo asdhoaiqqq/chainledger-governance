@@ -33,7 +33,9 @@
 //
 // The snapshot-only envelope rules (required fields, format version, content
 // identifier, and duplicates of the snapshot's own fields) live in
-// snapshot.go; this file is only the common graph structure.
+// snapshot.go; this file is only the common graph structure. The single read
+// path that sequences the raw scans, the JSON decode, and these structure
+// rules for both graph-carrying documents lives in graph_content.go.
 package chainledger
 
 import (

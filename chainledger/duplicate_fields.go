@@ -195,21 +195,6 @@ func scanObjectFields(dec *json.Decoder, fields []knownField) error {
 // "changes" array — so both readers judge one record identically.
 var datasetRecordFields = []knownField{{name: "name"}, {name: "upstreams"}}
 
-// checkGraphObject scans one graph object wherever it appears (the top level
-// of a standalone graph file, or the "graph" value inside a snapshot):
-// datasets may be declared only once, and each record of the datasets array
-// is checked for repeated name/upstreams declarations. location names the
-// graph object itself in the duplicate error.
-func checkGraphObject(dec *json.Decoder, location string) error {
-	return checkObjectFields(dec, location, []knownField{
-		{name: "datasets", nested: func(dec *json.Decoder) error {
-			return checkArrayElements(dec, func(dec *json.Decoder, index int) error {
-				return checkObjectFields(dec, fmt.Sprintf("in the dataset record at index %d of \"datasets\"", index), datasetRecordFields)
-			})
-		}},
-	})
-}
-
 // duplicateFieldError reports a known field declared twice, naming the field
 // and where in the document the repetition occurred.
 func duplicateFieldError(field, location string) error {

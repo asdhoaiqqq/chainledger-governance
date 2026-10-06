@@ -539,31 +539,15 @@ func MarshalGraphFile(graph map[string]*Lineage) ([]byte, error) {
 }
 
 // UnmarshalGraphFile parses the on-disk graph JSON and rebuilds the in-memory
-// graph (parents and derived children). The graph is checked with the same
-// structural rules a snapshot enforces (empty names, duplicate datasets,
-// missing upstreams, and cycles); a structurally invalid graph is rejected so
-// it cannot be used as the basis for a batch. As in a snapshot, a known field
-// declared twice within the same object — datasets in the graph object, name
-// or upstreams in a dataset record — is ambiguous and rejects the whole file,
-// even when the duplicates carry identical values.
+// graph (parents and derived children). The graph content is read through the
+// single shared path (see graph_content.go): the same repeated-known-field
+// scan, raw name-encoding scan, decode, and structural rules (empty names,
+// duplicate datasets, missing upstreams, and cycles) the snapshot reader
+// applies to its embedded graph, so the two documents can never judge one
+// graph differently. A structurally invalid graph is rejected so it cannot be
+// used as the basis for a batch.
 func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
-	if err := checkGraphFileDuplicateFields(data); err != nil {
-		return nil, err
-	}
-	// Every name the graph carries must survive decoding exactly as written:
-	// a raw literal with invalid UTF-8 bytes or an unpaired surrogate escape
-	// would be silently rewritten to U+FFFD by json.Unmarshal, and a corrupted
-	// upstream could then resolve to a genuinely different dataset (an edge
-	// written as "源" plus a lone \uD800 would point at the real dataset
-	// "源�"). See name_encoding.go.
-	if err := checkGraphNameEncoding(data); err != nil {
-		return nil, err
-	}
-	var gf GraphFile
-	if err := json.Unmarshal(data, &gf); err != nil {
-		return nil, fmt.Errorf("invalid graph JSON: %w", err)
-	}
-	adj, err := validateGraphStructureFromFile(gf.Datasets)
+	adj, err := readGraphContent(data, standaloneGraphContent)
 	if err != nil {
 		return nil, err
 	}
@@ -613,19 +597,6 @@ func UnmarshalPlan(data []byte) (Plan, error) {
 		return Plan{}, err
 	}
 	return p, nil
-}
-
-// checkGraphFileDuplicateFields applies the shared repeated-known-field rule
-// (see duplicate_fields.go) to a standalone graph file, supplying the graph
-// file's own location: datasets may be declared only once in the top-level
-// graph object, and name and upstreams only once in each dataset record. The
-// scan is the same checkGraphObject ParseSnapshot runs on the embedded graph,
-// so preview, apply, and snapshot can never disagree about a graph that
-// repeats a known field.
-func checkGraphFileDuplicateFields(data []byte) error {
-	return runFieldScan(data, func(dec *json.Decoder) error {
-		return checkGraphObject(dec, "at the top level of the graph")
-	})
 }
 
 // checkPlanDuplicateFields applies the shared repeated-known-field rule (see

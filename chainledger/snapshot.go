@@ -186,25 +186,17 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 		return nil, fmt.Errorf("%w: snapshot field %q must not be empty", ErrInvalidArgument, "contentId")
 	}
 
-	var gf GraphFile
-	// The embedded graph obeys exactly the same name-encoding rule as a
-	// standalone graph file: a raw name literal with invalid UTF-8 bytes or an
-	// unpaired surrogate escape would be silently rewritten to U+FFFD, and a
-	// corrupted upstream could then resolve to a genuinely different dataset.
-	// The check runs on the graph's raw bytes and rejects the whole snapshot
-	// even when the declared content identifier happens to match the
-	// rewritten graph's digest. The raw scan is the shared one in
-	// name_encoding.go applied to the graph document scope.
-	if err := checkGraphNameEncoding(raw.Graph); err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(raw.Graph, &gf); err != nil {
-		return nil, fmt.Errorf("invalid graph in snapshot: %w", err)
-	}
-	// The embedded graph obeys exactly the same structural rules as a
-	// standalone graph file, so the two readers can never judge one graph
-	// differently.
-	adj, err := validateGraphStructureFromFile(gf.Datasets)
+	// The embedded graph is read through the single shared graph-content path
+	// (see graph_content.go) — the same repeated-known-field scan, raw
+	// name-encoding scan, decode, and structural rules a standalone graph file
+	// gets — so the two readers can never judge one graph differently. A raw
+	// name literal with invalid UTF-8 bytes or an unpaired surrogate escape
+	// would be silently rewritten to U+FFFD by the decoder, and a corrupted
+	// upstream could then resolve to a genuinely different dataset, so the
+	// whole snapshot is rejected here even when the declared content
+	// identifier happens to match the rewritten graph's digest: the identifier
+	// is verified below, only after the graph has been read legally.
+	adj, err := readGraphContent(raw.Graph, snapshotGraphContent)
 	if err != nil {
 		return nil, err
 	}
@@ -225,19 +217,17 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 }
 
 // checkDuplicateFields applies the shared repeated-known-field rule (see
-// duplicate_fields.go) to a snapshot, supplying the snapshot's own field
-// scope and locations: formatVersion, contentId, and graph at the top level,
-// datasets inside graph, and name and upstreams inside each dataset record.
-// The embedded graph is scanned by the same checkGraphObject a standalone
-// graph file uses, so the two readers can never judge one graph differently.
+// duplicate_fields.go) to the snapshot's own envelope: formatVersion,
+// contentId, and graph may each be declared only once at the top level. The
+// embedded graph's content — including the repeated-field scan of the graph
+// object itself — is read separately through the single shared graph-content
+// path (see graph_content.go), so this scan does not descend into "graph".
 func checkDuplicateFields(data []byte) error {
 	return runFieldScan(data, func(dec *json.Decoder) error {
 		return checkObjectFields(dec, "at the top level of the snapshot", []knownField{
 			{name: "formatVersion"},
 			{name: "contentId"},
-			{name: "graph", nested: func(dec *json.Decoder) error {
-				return checkGraphObject(dec, `in "graph"`)
-			}},
+			{name: "graph"},
 		})
 	})
 }
