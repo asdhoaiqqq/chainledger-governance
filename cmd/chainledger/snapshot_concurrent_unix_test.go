@@ -56,6 +56,9 @@ func TestMain(m *testing.M) {
 	if len(os.Args) >= 2 && os.Args[1] == lockHelperMode {
 		os.Exit(runLockHelper(os.Args[2:]))
 	}
+	if code, handled := extraTestHelper(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 
 	dir, err := os.MkdirTemp("", "chainledger-snapshot-bin-")
 	if err != nil {
