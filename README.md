@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。若只想回答**某一个已登记来源怎样参与某一个已登记目标的派生**——只保留从该来源到该目标的现存派生路线，来源的其他上游、不参与这条派生的旁路输入和其他下游都不带入——调用同一库的 `ExportScopedUpstreamLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-scoped-upstreams`](examples/export-scoped-upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -534,6 +534,51 @@ fmt.Println(text)
 - **目标没有上游时也能成功**：`nodes` 只包含目标名称，`edges` 是 JSON 空数组（`[]`，不是 `null`）。
 - **失败不返回部分导出内容。** 目标为空时返回缺少名称的错误（`dataset name is required`）；目标未登记时返回指出该名称的错误（如 `dataset not found: ghost`），对空图或 nil 图中的非空目标同样按未登记处理；这两项检查优先于名称编码检查；失败一律返回空字符串。
 - **导出是只读的**：不改变图中的任何名称、双向关系或列表顺序；现有登记、更名、移除及各类血缘查询仍按当前名称精确匹配，不增加全图清洗或新的名称限制，调用方仍能用原始名称处理已有登记。
+
+## 限定来源的上游血缘导出（Go 库）
+
+`chainledger.ExportScopedUpstreamLineage(graph, source, target)` 在完整上游导出的基础上回答一个更窄的问题：调用方指定一个**已登记来源** `source` 和一个**已登记目标** `target`，得到只说明“这个来源怎样参与这个目标的派生”的 JSON 文本。文档包含从 `source` 到 `target` 的**所有现存派生路线**上的节点和直接依赖，两个端点也包含在内，每个节点、每条边只出现一次。
+
+判定一个节点是否入选，等价于它同时满足：从 `source` 沿下游边能到达它，且从它沿上游边能到达 `target`。入选节点之间现存的直接依赖全部作为边保留。因此：
+
+- **较长路线不会因为直达关系或更短路线而被省略。** 例如 `source` 直接派生 `report`，同时经 `a` 到达 `report`，还经 `b`、`mid` 到达 `report`，限定 `source` 与 `report` 后，三条路线完整保留，共 `source`、`a`、`b`、`mid`、`report` 五个节点和六条直接依赖。
+- **不参与该派生的输入不带入。** 若 `a` 还依赖另一个独立来源 `extra`，`extra` 及 `extra -> a` 这条边都不进入文档。
+- **到不了目标的其他下游不带入。** `source` 的其他下游若无法到达 `target`（以及它们的下游），同样不出现。
+- **来源之前的祖先、目标之后的下游不属于这次导出。**
+
+例如（`a` 还吃独立来源 `extra`，`source` 另有到不了 `report` 的下游 `orphan`，`source` 自己还有祖先 `pre`，`report` 再派生 `down`）：
+
+```
+pre ──> source ──┬──> a (also <- extra) ──┐
+                 │                         ├──> report ──> down
+                 ├──> b ──> mid ──────────┤
+                 ├──> orphan              │
+                 └────────────────────────┘ (report 也直接依赖 source)
+```
+
+下面的程序与 [`examples/export-scoped-upstreams`](examples/export-scoped-upstreams/main.go) 一致，可在仓库根目录执行 `go run ./examples/export-scoped-upstreams` 复现：
+
+```go
+text, err := chainledger.ExportScopedUpstreamLineage(graph, "source", "report")
+if err != nil { /* ... */ }
+fmt.Println(text)
+```
+
+实际输出（程序真实打印，不是示意）：
+
+```text
+{"nodes":["a","b","mid","report","source"],"edges":[{"from":"a","to":"report"},{"from":"b","to":"mid"},{"from":"mid","to":"report"},{"from":"source","to":"a"},{"from":"source","to":"b"},{"from":"source","to":"report"}]}
+```
+
+规则要点：
+
+- **输出格式、方向与排序沿用完整上游导出。** 顶层仍是 `nodes`、`edges` 两个数组；边仍是 `{"from": 上游, "to": 派生数据集}`，沿真实派生方向；节点按名称的 Go 字符串顺序排列，边先按 `from`、再按 `to` 排列。相同关系无论以何种登记顺序、上游列表顺序构造，输出文本字节一致。
+- **来源与目标相同且已登记时**，只输出该节点和空边数组：`{"nodes":["x"],"edges":[]}`（`edges` 是 `[]`，不是 `null`）。
+- **两端都已登记但不存在从来源到目标的派生路线时，成功返回两个空数组** `{"nodes":[],"edges":[]}`：不保留孤立端点。反方向的依赖不算可达——`child` 依赖 `root` 时，限定来源 `child`、目标 `root` 得到两个空数组，而不是把 `child -> root` 反过来看成路线。这与“名称有误”的失败返回是两种不同结果。
+- **名称按登记原值精确匹配，区分大小写。** 先校验来源、再校验目标：名称为空时返回缺少名称的错误（`dataset name is required`）；名称未登记（包括对空图或 nil 图查询）时返回指出对应名称的错误（如 `dataset not found: ghost`）。任一校验失败都返回空字符串，不返回部分文档；存在性检查优先于编码检查。
+- **UTF-8 规则只作用于实际入选的节点，与完整导出的编码错误规则一致。** 入选节点（含两个端点）的名称含非法字节时，整次导出失败、返回空字符串，错误形如 `dataset name is not valid UTF-8 and cannot be exported losslessly: "mid\xff"`，以 Go 引号形式给出各个坏字节；多个名称同时无效时报告按 Go 字符串顺序最靠前的一个。未入选节点的名称不能阻止导出——来源的祖先、`extra` 这样的旁路输入、到不了目标的下游即使名称含非法字节也不影响。路线为空时没有入选节点，周围节点的非法名称同样不影响成功的空文档。名称中真实存在的“�”字符（U+FFFD）本身是合法 UTF-8，正常导出。
+- **导出是只读的**：成功或失败都不改动图中的节点、双向关系或列表顺序。
+- **与完整导出兼容共存。** 原有 `ExportUpstreamLineage(graph, target)` 仍导出目标的全部上游；当指定的 `source` 恰好是目标全部上游的唯一根来源时，限定导出与完整导出版本字节一致。已有的登记、更名、移除及各类血缘查询不受影响。
 
 ## 数据集更名（Go 库）
 

@@ -15,8 +15,8 @@ type lineageExportEdge struct {
 	To   string `json:"to"`
 }
 
-// lineageExportDocument is the JSON shape produced by ExportUpstreamLineage:
-// the full set of dataset names involved in a target's derivation, plus every
+// lineageExportDocument is the JSON shape produced by the lineage exporters:
+// the set of dataset names involved in the exported derivation, plus every
 // direct dependency between them.
 type lineageExportDocument struct {
 	Nodes []string            `json:"nodes"`
@@ -56,10 +56,10 @@ type lineageExportDocument struct {
 // each non-displayable byte as its own \xNN escape, so different bad bytes
 // never share one replacement glyph. When several names are invalid, the one
 // sorting first in Go string order is reported, keeping the error independent
-// of registration and stored-list order. Only the target and its ancestors are
-// inspected: an unrelated dataset or a downstream of the target may hold an
-// invalid name without blocking this export. A real replacement character
-// (U+FFFD) that is itself part of a name is valid UTF-8 and exports normally.
+// of registration and stored-list order. Only the selected nodes are
+// inspected: an unselected dataset may hold an invalid name without blocking
+// this export. A real replacement character (U+FFFD) that is itself part of a
+// name is valid UTF-8 and exports normally.
 //
 // The export is read-only: it changes no node, edge or stored list order. An
 // empty target is rejected as a missing name; a target absent from the graph
@@ -77,8 +77,86 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 	// Collect the target plus its whole ancestor closure by walking parent
 	// edges. Register rejects cycles, so every walk terminates; the included
 	// set doubles as the visited set.
-	included := map[string]bool{target: true}
-	queue := []string{target}
+	included := ancestorSet(graph, target)
+	return renderLineageExport(graph, included)
+}
+
+// ExportScopedUpstreamLineage exports only the part of target's derivation
+// that a specified source takes part in, as a JSON document with the same
+// shape and ordering rules as ExportUpstreamLineage. The document holds every
+// node and every direct dependency lying on at least one existing derivation
+// route from source to target, source and target themselves included; each
+// node and edge appears exactly once.
+//
+// Every branch is preserved: a longer route from source to target is not
+// shortened away by a direct source -> target dependency or by a shorter
+// parallel route. For example, when source derives report directly, also
+// reaches report through a, and reaches it through b and mid, scoping the
+// export to source and report keeps all three routes complete. A source-side
+// dependency that does not lead to target stays out: if a additionally
+// depends on an independent source extra, neither extra nor the extra -> a
+// edge appears. Other downstreams of source that cannot reach target are
+// excluded just as source's own ancestors and target's own downstreams are —
+// the document ends at its two named endpoints.
+//
+// Names match by exact registered value (case-sensitive). source is validated
+// before target: an empty name is rejected as a missing name and an
+// unregistered name (also against an empty or nil graph) is rejected with an
+// error naming it; failures return an empty string. When both endpoints are
+// registered but no derivation route runs from source to target — including a
+// source that is actually downstream of target, since reverse dependencies
+// are not reachability — the export still succeeds with both "nodes" and
+// "edges" empty arrays; no isolated endpoint is kept. source and target being
+// the same registered dataset yields that one node and an empty edges array.
+//
+// The UTF-8 rule is exactly ExportUpstreamLineage's, applied only to the
+// nodes the scoped document actually contains: an invalid name on a selected
+// node fails the whole export (empty string, error quoting the offending
+// bytes), while an invalid name on an unselected node — an ancestor of
+// source, a side input like extra, or a downstream that cannot reach
+// target — never blocks it. Endpoint validation still precedes encoding
+// validation. The export is read-only: it changes no node, edge, relationship
+// or stored list order.
+func ExportScopedUpstreamLineage(graph map[string]*Lineage, source, target string) (string, error) {
+	if source == "" {
+		return "", errInvalid("dataset name is required")
+	}
+	if _, ok := graph[source]; !ok {
+		return "", errInvalid("dataset not found: " + source)
+	}
+	if target == "" {
+		return "", errInvalid("dataset name is required")
+	}
+	if _, ok := graph[target]; !ok {
+		return "", errInvalid("dataset not found: " + target)
+	}
+
+	// A node belongs to the scoped document exactly when some derivation route
+	// from source reaches target through it: source must reach it by following
+	// child edges and it must reach target by following parent edges. The
+	// intersection of the two closures is therefore precisely the union of all
+	// source -> ... -> target routes' node sets. Register rejects cycles, so
+	// neither walk can run forever. An edge between two selected nodes sits on
+	// a complete source-to-target route by construction, so keeping every such
+	// direct dependency preserves all routes, longer ones included, with no
+	// side inputs or unreachable branches leaking in.
+	downstreamOfSource := descendantSet(graph, source)
+	upstreamOfTarget := ancestorSet(graph, target)
+	included := make(map[string]bool)
+	for name := range downstreamOfSource {
+		if upstreamOfTarget[name] {
+			included[name] = true
+		}
+	}
+	return renderLineageExport(graph, included)
+}
+
+// ancestorSet collects start and every dataset reachable from it by following
+// parent edges — start itself and its whole upstream closure. The returned
+// set doubles as the visited set for the walk.
+func ancestorSet(graph map[string]*Lineage, start string) map[string]bool {
+	included := map[string]bool{start: true}
+	queue := []string{start}
 	for len(queue) > 0 {
 		node := queue[0]
 		queue = queue[1:]
@@ -89,7 +167,35 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 			}
 		}
 	}
+	return included
+}
 
+// descendantSet collects start and every dataset reachable from it by
+// following child edges — start itself and its whole downstream closure. The
+// returned set doubles as the visited set for the walk.
+func descendantSet(graph map[string]*Lineage, start string) map[string]bool {
+	included := map[string]bool{start: true}
+	queue := []string{start}
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+		for _, child := range graph[node].Children {
+			if !included[child] {
+				included[child] = true
+				queue = append(queue, child)
+			}
+		}
+	}
+	return included
+}
+
+// renderLineageExport builds the deterministic JSON document for one selected
+// node set. Both the full and the source-scoped upstream exports share this
+// rule set: Go-string node order, every direct dependency among the selected
+// nodes once ordered by from then to, strict UTF-8 validation of selected
+// names, and empty (non-null) arrays when the selection is empty. The graph is
+// only read.
+func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (string, error) {
 	nodes := make([]string, 0, len(included))
 	for name := range included {
 		nodes = append(nodes, name)
@@ -103,7 +209,8 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 	// Nodes are already in Go string order, so the first invalid one is the
 	// deterministic answer regardless of registration or upstream-list order;
 	// %q exposes the actual bytes (non-displayable ones as \xNN) instead of a
-	// shared replacement glyph. Nodes outside this closure are never examined.
+	// shared replacement glyph. Nodes outside the selection are never
+	// examined.
 	for _, name := range nodes {
 		if !utf8.ValidString(name) {
 			return "", errInvalid(fmt.Sprintf(
@@ -111,15 +218,18 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 		}
 	}
 
-	// Every direct dependency between included nodes is an edge. A parent of
-	// an included node is itself included by construction, so walking the
-	// parents of each included node covers exactly the dependencies among the
-	// selected nodes. The dedupe set guards the one-edge-once rule even if a
-	// stored list ever repeated a name.
+	// Every direct dependency between included nodes is an edge. The edge set
+	// is chosen by its two endpoints, so a parent outside the selection
+	// contributes nothing even though the full export of this child would
+	// include it. The dedupe set guards the one-edge-once rule even if a stored
+	// list ever repeated a name.
 	edges := make([]lineageExportEdge, 0)
 	seen := make(map[lineageExportEdge]bool)
 	for _, name := range nodes {
 		for _, parent := range graph[name].Parents {
+			if !included[parent] {
+				continue
+			}
 			edge := lineageExportEdge{From: parent, To: name}
 			if !seen[edge] {
 				seen[edge] = true
