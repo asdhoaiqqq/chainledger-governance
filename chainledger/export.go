@@ -3,6 +3,8 @@ package chainledger
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
+	"unicode/utf8"
 )
 
 // lineageExportEdge is one direct dependency in an exported lineage document,
@@ -49,6 +51,21 @@ type lineageExportDocument struct {
 // empty target is rejected as a missing name; a target absent from the graph
 // (including an empty or nil graph) is rejected with an error naming it.
 // Failures return an empty string and never a partial document.
+//
+// A name is written verbatim only when a JSON reader can recover its exact
+// registered bytes: every included name must be valid UTF-8. Registration only
+// rejects empty names, so a graph may still hold names with invalid UTF-8
+// bytes, which encoding/json would silently replace with U+FFFD; two distinct
+// names could then collapse into one after reading. Instead the whole export
+// fails with an empty string and an error naming the first offending dataset
+// in Go string order among the included nodes, so the reported dataset is
+// independent of registration and stored-list order. The name is quoted with
+// Go escaping, which renders every raw byte (including unprintable ones, e.g.
+// "\xff") rather than substituting a replacement character, so different bad
+// bytes produce different error text. Only nodes in this target's ancestor
+// closure are checked: unrelated datasets and the target's downstreams never
+// block the export. A name containing the actual U+FFFD character is valid
+// UTF-8 and exports normally.
 func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, error) {
 	if target == "" {
 		return "", errInvalid("dataset name is required")
@@ -78,6 +95,19 @@ func ExportUpstreamLineage(graph map[string]*Lineage, target string) (string, er
 		nodes = append(nodes, name)
 	}
 	sort.Strings(nodes)
+
+	// Every included name must survive a JSON round trip byte-for-byte.
+	// encoding/json replaces invalid UTF-8 with U+FFFD instead of erroring,
+	// which would report success for a document that loses (or merges) names;
+	// reject that case explicitly before any document is produced. The nodes
+	// are already in Go string order, so the first invalid one is the same
+	// dataset whatever the registration or stored-list orders were; only this
+	// export's closure was collected, leaving unrelated nodes unchecked.
+	for _, name := range nodes {
+		if !utf8.ValidString(name) {
+			return "", errInvalid("dataset name is not valid UTF-8: " + strconv.Quote(name))
+		}
+	}
 
 	// Every direct dependency between included nodes is an edge. A parent of
 	// an included node is itself included by construction, so walking the
