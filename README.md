@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。要把这样一份血缘 JSON 文本重新交回库、成功时得到一张**独立的新血缘图**并可直接继续登记与查询，调用同一库的 `ImportLineage` 函数，见下文「导入血缘 JSON（Go 库）」一节，示例位于 [`examples/import-lineage`](examples/import-lineage/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -606,6 +606,78 @@ ExportSourceTargetLineage("source", "ghost") error: dataset not found: ghost
 - **导出是只读的**：成功或失败都不改动图中的任何节点、双向关系或列表顺序，也不新增全图清洗或名称限制。
 
 `ExportUpstreamLineage(graph, target)` 的签名、调用方式与“导出目标全部上游”的行为保持不变；登记、更名、移除及现有血缘查询功能全部兼容。
+
+## 导入血缘 JSON（Go 库）
+
+`chainledger.ImportLineage(text)` 把一份血缘 JSON 文本重新交回库，成功时返回一张**全新的、独立的血缘图**（普通的 `map[string]*Lineage`），可以直接用于现有的全部功能：`Register`、`Rename`、`Unregister`、`Impacts`、`ImpactsWithCutoffs`、`Upstreams`、`CommonUpstreams`、`Roots` 以及两种导出。导入不接收、不读取、也不修改调用方原有的图。
+
+文档沿用两种导出现有的 JSON 形状，顶层是一个对象，含两个数组：
+
+- `nodes`：数据集名称数组。文档里列出的每个节点都会存在于新图中，**包括没有任何依赖的独立节点**；重复列出的名称只保留一次。
+- `edges`：直接依赖对象数组，每项写成 `{"from": 上游, "to": 派生数据集}`，方向与导出一致（`from` 是上游，`to` 是由它派生的数据集）。每条直接依赖同时体现为派生数据集的直接上游（`Parents`）和来源的直接下游（`Children`，反向边）；同一条依赖重复出现只保留一次。
+
+导入范围**恰好是文档列出的节点与关系**，不做任何推断或补全：
+
+- 用限定来源导出（`ExportSourceTargetLineage`）得到的文档若只保留了一部分血缘，导入后也只得到这一部分——被排除的其他来源、来源的祖先、到不了目标的分支以及目标的下游都不会被补回；在新图里查询这些名称会按未登记处理（`dataset not found: <名称>`）。
+- **直达关系与经过中间节点的较长分支一起保留**，互不排挤。说明路径仍由现有查询功能按“先最短边数、再按整条路径逐跳比较名称（Go 字符串顺序）”的规则选择，导入不改变这一规则。
+
+节点与边在文档中的排列顺序不影响导入结果；导入后各节点的直接上游、直接下游列表都按 Go 字符串顺序排列。因此，把现有导出文档（包括带查询端点的限定来源导出）导入后，用**相同目标**或**相同来源与目标**重新导出，得到的是**字节一致**的文本。
+
+名称按 JSON 解码后的**原值精确识别**：区分大小写，空格、中文、引号、反斜线和换行都原样保留，不裁剪、不改写。文本必须是合法 UTF-8，且包含**一个完整的 JSON 对象**；`nodes` 和 `edges` 都必须存在且是类型正确的数组（`null` 不是数组，元素类型也必须正确）。**两个空数组表示成功**：得到一张没有节点的空图，可以马上继续登记，不算是导入失败。
+
+失败规则——整次导入先完整校验再返回图，任何失败都返回 `nil` 图和说明文档问题的错误，**绝不返回部分图**：
+
+- 空文本或只有空白、非法 UTF-8、不是合法 JSON、顶层不是对象、存在两个 JSON 值、对象键重复、缺少 `nodes` 或 `edges`、字段为 `null` 或类型不对、数组元素类型不对，都会被拒绝。
+- 节点名称不能为空（`dataset name is required`）。
+- 每条边的两个端点都必须在 `nodes` 中列出；边缺少 `from`/`to`，或端点名称未在节点中列出时，整次导入失败，错误指出该名称（如 `edge endpoint not listed in nodes: ghost`）。
+- **自依赖或任意长度的依赖环**都整次失败，错误说明成环并沿实际派生方向列出环上的数据集，环从名称最小的数据集开始首尾相接，例如 `lineage contains a cycle: a -> b -> c -> a`；自依赖报 `lineage contains a cycle: a -> a`。多个分支汇合（菱形）不是环，正常导入。
+
+下面的程序与 [`examples/import-lineage`](examples/import-lineage/main.go) 一致，可在仓库根目录执行 `go run ./examples/import-lineage` 复现。程序先建立含祖先 `pre`、独立来源 `extra`/`lone` 和目标下游 `view` 的血缘，再限定 `source -> report` 导出；导入这份文档后，新图只含五个节点：
+
+```go
+text, err := chainledger.ExportSourceTargetLineage(graph, "source", "report")
+// ...
+imported, err := chainledger.ImportLineage(text)
+impacts, err := chainledger.Impacts(imported, "source")
+again, err := chainledger.ExportSourceTargetLineage(imported, "source", "report")
+// again == text：重新导出与导入的文档字节一致
+```
+
+实际输出（错误与查询结果都是程序真实打印，不是示意）：
+
+```text
+exported document:
+{"nodes":["a","b","mid","report","source"],"edges":[{"from":"a","to":"report"},{"from":"b","to":"mid"},{"from":"mid","to":"report"},{"from":"source","to":"a"},{"from":"source","to":"b"},{"from":"source","to":"report"}]}
+
+datasets after import: 5 (the export omitted pre, extra, lone and view)
+
+Impacts(source) on the imported graph:
+  a       distance=1 path=[source a]
+  b       distance=1 path=[source b]
+  report  distance=1 path=[source report]
+  mid     distance=2 path=[source b mid]
+
+re-export is byte-identical to the imported document
+
+registered newly into the imported graph; querying omitted datasets:
+  Upstreams(view) error: dataset not found: view
+  original graph still holds 9 datasets, imported graph holds 6
+
+empty document imported as a ready-to-register graph holding "fresh"
+
+empty text refused: lineage document is empty: expected one JSON object with nodes and edges arrays
+missing endpoint refused: edge endpoint not listed in nodes: ghost
+self dependency refused: lineage contains a cycle: a -> a
+three-node cycle refused: lineage contains a cycle: a -> b -> c -> a
+```
+
+要点：
+
+- **导入只创建新图。** 输出里调用方原图仍有 9 个数据集，导入图只有文档中的 5 个（再登记后 6 个）；对被排除的 `view` 查询明确按未登记报错。
+- **直达边决定最短距离，长分支仍然完整。** `report` 经直达边距离为 1，但经 `a` 和经 `b -> mid` 的分支仍在新图中（`mid` 距离 2，继续作为 `report` 的直接上游）。
+- **往返字节一致。** 同一份限定来源导出导入后再次导出，文本逐字节相同。
+- **两个空数组是可用空图**，登记 `fresh` 成功；空文本、缺失端点、自依赖和三环都整次失败且不返回部分图。
+- 现有导出格式、名称限制与查询行为保持不变；导入不引入新的名称清洗，也不经过命令行——命令行继续只有 `demo`、`version`、`help`。
 
 ## 数据集更名（Go 库）
 
