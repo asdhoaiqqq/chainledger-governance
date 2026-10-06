@@ -550,20 +550,12 @@ func UnmarshalGraphFile(data []byte) (map[string]*Lineage, error) {
 	if err := checkGraphFileDuplicateFields(data); err != nil {
 		return nil, err
 	}
-	// Every name the graph carries must survive decoding exactly as written:
-	// a raw literal with invalid UTF-8 bytes or an unpaired surrogate escape
-	// would be silently rewritten to U+FFFD by json.Unmarshal, and a corrupted
-	// upstream could then resolve to a genuinely different dataset (an edge
-	// written as "源" plus a lone \uD800 would point at the real dataset
-	// "源�"). See name_encoding.go.
-	if err := checkGraphNameEncoding(data); err != nil {
-		return nil, err
-	}
-	var gf GraphFile
-	if err := json.Unmarshal(data, &gf); err != nil {
-		return nil, fmt.Errorf("invalid graph JSON: %w", err)
-	}
-	adj, err := validateGraphStructureFromFile(gf.Datasets)
+	// Decode the graph content through the one pipeline a snapshot's embedded
+	// graph also uses (see graph_document.go): the raw name-encoding gate, a
+	// single JSON decode, then the shared structure rules. A corrupted name
+	// literal, an unresolvable upstream, or a cycle is therefore judged by
+	// exactly one implementation for both documents.
+	adj, err := readGraphDocument(data, "invalid graph JSON")
 	if err != nil {
 		return nil, err
 	}

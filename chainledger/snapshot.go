@@ -186,25 +186,15 @@ func ParseSnapshot(data []byte) (*SnapshotFile, error) {
 		return nil, fmt.Errorf("%w: snapshot field %q must not be empty", ErrInvalidArgument, "contentId")
 	}
 
-	var gf GraphFile
-	// The embedded graph obeys exactly the same name-encoding rule as a
-	// standalone graph file: a raw name literal with invalid UTF-8 bytes or an
-	// unpaired surrogate escape would be silently rewritten to U+FFFD, and a
-	// corrupted upstream could then resolve to a genuinely different dataset.
-	// The check runs on the graph's raw bytes and rejects the whole snapshot
-	// even when the declared content identifier happens to match the
-	// rewritten graph's digest. The raw scan is the shared one in
-	// name_encoding.go applied to the graph document scope.
-	if err := checkGraphNameEncoding(raw.Graph); err != nil {
-		return nil, err
-	}
-	if err := json.Unmarshal(raw.Graph, &gf); err != nil {
-		return nil, fmt.Errorf("invalid graph in snapshot: %w", err)
-	}
-	// The embedded graph obeys exactly the same structural rules as a
-	// standalone graph file, so the two readers can never judge one graph
-	// differently.
-	adj, err := validateGraphStructureFromFile(gf.Datasets)
+	// The embedded graph is decoded and checked by the one pipeline a
+	// standalone graph file uses (see graph_document.go): the raw
+	// name-encoding gate runs first on the graph's own bytes and rejects the
+	// whole snapshot even when the declared content identifier happens to
+	// match the rewritten graph's digest, then one JSON decode and the shared
+	// structure rules (empty names, duplicate datasets, missing upstreams,
+	// cycles) produce the canonical adjacency. The only snapshot-specific part
+	// is the wording of a graph that is not valid JSON.
+	adj, err := readGraphDocument(raw.Graph, "invalid graph in snapshot")
 	if err != nil {
 		return nil, err
 	}
