@@ -51,47 +51,78 @@ func TraceSources(snap *SnapshotFile, dataset string) (*TraceReport, error) {
 		return nil, fmt.Errorf("%w: dataset %q is not in the snapshot", ErrNotFound, dataset)
 	}
 
+	return &TraceReport{
+		ContentID: snap.ContentID,
+		Dataset:   dataset,
+		Sources:   rootSourceTraces(dataset, adj),
+	}, nil
+}
+
+// rootSourceTraces is the single root-source lookup shared by source tracing
+// and snapshot comparison. It walks the direct upstream edges reachable from
+// node in the already normalized adjacency and returns every reachable root —
+// a dataset with no upstream of its own — exactly once, even when several
+// branches converge on it. A node without upstreams is its own root and is
+// returned with the single-element path [node]; a still-derived intermediate
+// and any disconnected root never enter the result.
+//
+// Each root keeps one shortest path (fewest direct relations), complete with
+// the query node, every intermediate dataset, and the root. Among equally long
+// routes the choice is made at the first differing name from the query end in
+// UTF-8 byte order, never by the last branch name. The result is sorted by root
+// name byte order and is never nil. Names are kept verbatim (case and
+// surrounding spaces included); because adj is already normalized, record
+// order, upstream order, and repeated upstreams cannot change the output.
+func rootSourceTraces(node string, adj adjacency) []SourceTrace {
 	// Breadth-first walk from the queried dataset along direct upstream
 	// edges. best[node] holds the shortest, tie-broken path from the query to
 	// node; because every edge has the same weight, the first level at which
 	// a node is reached is its shortest distance, and keeping only the
 	// smallest candidate path per node preserves the global minimum.
-	best := map[string][]string{dataset: {dataset}}
-	frontier := []string{dataset}
+	best := map[string][]string{node: {node}}
+	frontier := []string{node}
 	for len(frontier) > 0 {
 		candidates := make(map[string][]string)
-		for _, node := range frontier {
-			for _, parent := range adj[node] {
+		for _, current := range frontier {
+			for _, parent := range adj[current] {
 				if _, seen := best[parent]; seen {
 					continue
 				}
-				path := append(append([]string{}, best[node]...), parent)
-				if current, ok := candidates[parent]; !ok || pathLess(path, current) {
+				path := append(append([]string{}, best[current]...), parent)
+				if existing, ok := candidates[parent]; !ok || pathLess(path, existing) {
 					candidates[parent] = path
 				}
 			}
 		}
 		next := make([]string, 0, len(candidates))
-		for node, path := range candidates {
-			best[node] = path
-			next = append(next, node)
+		for reached, path := range candidates {
+			best[reached] = path
+			next = append(next, reached)
 		}
 		frontier = next
 	}
 
 	sources := make([]SourceTrace, 0)
-	for node, path := range best {
-		if len(adj[node]) == 0 {
-			sources = append(sources, SourceTrace{Root: node, Path: path})
+	for reached, path := range best {
+		if len(adj[reached]) == 0 {
+			sources = append(sources, SourceTrace{Root: reached, Path: path})
 		}
 	}
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Root < sources[j].Root })
+	return sources
+}
 
-	return &TraceReport{
-		ContentID: snap.ContentID,
-		Dataset:   dataset,
-		Sources:   sources,
-	}, nil
+// rootSourceNames returns just the sorted root names of the shared
+// rootSourceTraces lookup, so the comparison's old/new root sets are by
+// construction the exact roots a trace reports in the same snapshot. It is
+// never nil.
+func rootSourceNames(node string, adj adjacency) []string {
+	traces := rootSourceTraces(node, adj)
+	roots := make([]string, len(traces))
+	for i, src := range traces {
+		roots[i] = src.Root
+	}
+	return roots
 }
 
 // pathLess compares two equal-purpose paths element by element from the start

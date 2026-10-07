@@ -145,7 +145,7 @@ func TestSnapshotFreezesContentWhenGraphEditedAfterward(t *testing.T) {
 		t.Errorf("A.upstreams = %v, want frozen empty list", got)
 	}
 	// The frozen graph's lineage still resolves D to both original roots.
-	if got := rootSources("D", adjacencyFromValidFile(snap.Graph)); !reflect.DeepEqual(got, []string{"A", "R"}) {
+	if got := rootSourceNames("D", adjacencyFromValidFile(snap.Graph)); !reflect.DeepEqual(got, []string{"A", "R"}) {
 		t.Errorf("frozen D roots = %v, want [A R]", got)
 	}
 }

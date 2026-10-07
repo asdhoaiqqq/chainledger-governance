@@ -670,13 +670,13 @@ func TestCompareRootsMultipathOnceAndSorted(t *testing.T) {
 		"C": {"A", "B"},
 		"D": {"C", "A"},
 	}
-	got := rootSources("D", adj)
+	got := rootSourceNames("D", adj)
 	want := []string{"A", "B"}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("rootSources(D) = %v, want %v", got, want)
+		t.Errorf("rootSourceNames(D) = %v, want %v", got, want)
 	}
-	if got := rootSources("A", adj); !reflect.DeepEqual(got, []string{"A"}) {
-		t.Errorf("rootSources(A) = %v, want [A] (root is its own source)", got)
+	if got := rootSourceNames("A", adj); !reflect.DeepEqual(got, []string{"A"}) {
+		t.Errorf("rootSourceNames(A) = %v, want [A] (root is its own source)", got)
 	}
 }
 

@@ -255,10 +255,17 @@ func CompareSnapshots(oldSnap, newSnap *SnapshotFile) *CompareReport {
 	}
 	sort.Strings(common)
 
+	// A common dataset's root set changes exactly when the shared root-source
+	// lookup (see rootSourceTraces) reports different roots in the two frozen
+	// versions, so oldRoots/newRoots are by construction the same root names a
+	// TraceSources run reports in the corresponding snapshot. A reroute or a
+	// shortcut that leaves the root set untouched reports nothing; losing the
+	// last reachable route to a root is reported here even when the dataset's
+	// own direct upstreams did not change.
 	rootChanges := make([]RootSourceChange, 0)
 	for _, name := range common {
-		oldRoots := rootSources(name, oldAdj)
-		newRoots := rootSources(name, newAdj)
+		oldRoots := rootSourceNames(name, oldAdj)
+		newRoots := rootSourceNames(name, newAdj)
 		if !stringSliceEqual(oldRoots, newRoots) {
 			rootChanges = append(rootChanges, RootSourceChange{
 				Dataset:  name,
@@ -286,33 +293,6 @@ func adjacencyFromValidFile(gf GraphFile) adjacency {
 		adj[ds.Name] = uniqueSorted(ds.Upstreams)
 	}
 	return adj
-}
-
-// rootSources returns the root datasets reachable from node by following
-// direct upstream edges. A node without upstreams is itself a root and its own
-// source, so it is included. Nodes reached by more than one path count once.
-// The result is sorted by name and never nil.
-func rootSources(node string, adj adjacency) []string {
-	visited := make(map[string]bool)
-	var roots []string
-	var walk func(string)
-	walk = func(current string) {
-		if visited[current] {
-			return
-		}
-		visited[current] = true
-		parents := adj[current]
-		if len(parents) == 0 {
-			roots = append(roots, current)
-			return
-		}
-		for _, parent := range parents {
-			walk(parent)
-		}
-	}
-	walk(node)
-	sort.Strings(roots)
-	return orEmptyStrings(roots)
 }
 
 func orEmptyStrings(s []string) []string {

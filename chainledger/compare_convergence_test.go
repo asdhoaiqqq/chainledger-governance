@@ -90,11 +90,11 @@ func TestCompareConvergenceOneBranchRerouted(t *testing.T) {
 	// roots through its other branches, so neither it nor the dataset derived
 	// after it is a source change despite the repoint upstream of them.
 	for _, name := range []string{"summary", "derived"} {
-		if got := rootSources(name, adjacencyFromValidFile(oldSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA", "rootB"}) {
-			t.Errorf("old rootSources(%s) = %v, want [rootA rootB]", name, got)
+		if got := rootSourceNames(name, adjacencyFromValidFile(oldSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA", "rootB"}) {
+			t.Errorf("old rootSourceNames(%s) = %v, want [rootA rootB]", name, got)
 		}
-		if got := rootSources(name, adjacencyFromValidFile(newSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA", "rootB"}) {
-			t.Errorf("new rootSources(%s) = %v, want [rootA rootB]", name, got)
+		if got := rootSourceNames(name, adjacencyFromValidFile(newSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA", "rootB"}) {
+			t.Errorf("new rootSourceNames(%s) = %v, want [rootA rootB]", name, got)
 		}
 	}
 	assertNameAbsentFromReport(t, report, "summary")
@@ -229,8 +229,8 @@ func TestCompareConvergenceRerouteOntoPathToSameRoot(t *testing.T) {
 		t.Errorf("a path-only swap to the same root set must not report source changes, got %v", report.RootSourceChanges)
 	}
 	// Sanity-check the rerouted branch still resolves to rootA, now indirectly.
-	if got := rootSources("branchA1", adjacencyFromValidFile(newSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA"}) {
-		t.Errorf("new rootSources(branchA1) = %v, want [rootA]", got)
+	if got := rootSourceNames("branchA1", adjacencyFromValidFile(newSnap.Graph)); !reflect.DeepEqual(got, []string{"rootA"}) {
+		t.Errorf("new rootSourceNames(branchA1) = %v, want [rootA]", got)
 	}
 }
 
