@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -42,10 +43,16 @@ import (
 //
 // Names are identified by their exact decoded JSON value: matching is
 // case-sensitive and spaces, Chinese characters, quotes, backslashes and
-// newlines are preserved verbatim — never trimmed or rewritten. The input
-// must be valid UTF-8 and hold exactly one complete JSON object; "nodes" and
-// "edges" must both be present, each as an array of the correct element type
-// (null is not an array). Two empty arrays import successfully as an empty,
+// newlines are preserved verbatim — never trimmed or rewritten. A correctly
+// paired surrogate escape (the character U+1F600 written as \ud83d\ude00)
+// decodes to the same name as the character written directly, so a node and
+// an edge endpoint spelled differently in the document still connect. A real
+// U+FFFD character and the \ufffd escape are ordinary valid name content, and
+// an escaped backslash in front of escape-looking text ("\\ud800") is just a
+// backslash followed by letters, never a surrogate escape. The input must be valid
+// UTF-8 and hold exactly one complete JSON object; "nodes" and "edges" must
+// both be present, each as an array of the correct element type (null is not
+// an array). Two empty arrays import successfully as an empty,
 // ready-to-register graph.
 //
 // The whole document is validated before the graph is returned, so every
@@ -57,6 +64,12 @@ import (
 //     object key, a missing or null array, or an element of the wrong type is
 //     rejected.
 //   - An empty node name is rejected as a missing name.
+//   - A node name or edge endpoint written with an unpaired Unicode surrogate
+//     escape — a high surrogate not immediately followed by its low-surrogate
+//     half, or a low surrogate on its own — fails the whole import. The error
+//     states the problem, quotes the offending escape exactly as written, and
+//     says whether it came from a node name or an edge's "from" or "to", so
+//     distinct bad names never collapse into one identical message.
 //   - Both endpoints of every edge must be listed in nodes; an edge naming a
 //     dataset the document does not list fails the whole import, and the error
 //     names that dataset. Edges missing an endpoint are rejected the same way.
@@ -82,7 +95,9 @@ func ImportLineage(text string) (map[string]*Lineage, error) {
 	// string (null is not a name). Names keep their exact decoded value: the
 	// document was already checked to be valid UTF-8, so every decoded name is
 	// the original value, with JSON unescaping applied (quotes, backslashes,
-	// newlines and all).
+	// newlines and all). The raw literal is also checked for unpaired
+	// surrogate escapes, which encoding/json would otherwise silently decode
+	// to U+FFFD and merge distinct names into one.
 	nodes := make(map[string]bool, len(nodeItems))
 	for _, item := range nodeItems {
 		trimmed := strings.TrimSpace(string(item))
@@ -92,6 +107,9 @@ func ImportLineage(text string) (map[string]*Lineage, error) {
 		var name string
 		if err := json.Unmarshal(item, &name); err != nil {
 			return nil, errInvalid("lineage document nodes must be an array of JSON strings: " + err.Error())
+		}
+		if escape := unpairedSurrogateEscape(trimmed); escape != "" {
+			return nil, errInvalid("lineage document node name contains an unpaired Unicode surrogate escape: " + escape)
 		}
 		if name == "" {
 			return nil, errInvalid("dataset name is required")
@@ -111,6 +129,23 @@ func ImportLineage(text string) (map[string]*Lineage, error) {
 		var edge lineageExportEdge
 		if err := json.Unmarshal(item, &edge); err != nil {
 			return nil, errInvalid(`lineage document edges must be an array of {"from": ..., "to": ...} objects: ` + err.Error())
+		}
+		// The endpoint names get the same unpaired-surrogate check as node
+		// names, applied to their raw JSON literals so the original escape
+		// spelling survives in the error. A non-string endpoint is left to the
+		// typed unmarshal above and the missing-endpoint checks below.
+		var rawEdge struct {
+			From json.RawMessage `json:"from"`
+			To   json.RawMessage `json:"to"`
+		}
+		if err := json.Unmarshal(item, &rawEdge); err != nil {
+			return nil, errInvalid(`lineage document edges must be an array of {"from": ..., "to": ...} objects: ` + err.Error())
+		}
+		if err := checkEndpointSurrogates(rawEdge.From, "from"); err != nil {
+			return nil, err
+		}
+		if err := checkEndpointSurrogates(rawEdge.To, "to"); err != nil {
+			return nil, err
 		}
 		if edge.From == "" {
 			return nil, errInvalid(`lineage document edge is missing its upstream endpoint ("from")`)
@@ -203,6 +238,64 @@ func requireJSONArray(raw json.RawMessage, field string) error {
 		return errInvalid("lineage document field " + field + " must be an array")
 	}
 	return nil
+}
+
+// checkEndpointSurrogates applies the unpaired-surrogate rule to one raw edge
+// endpoint value, naming the endpoint ("from" or "to") in the error. A value
+// that is not a JSON string at all is skipped: the typed unmarshal and the
+// missing-endpoint checks already cover it.
+func checkEndpointSurrogates(raw json.RawMessage, endpoint string) error {
+	trimmed := strings.TrimSpace(string(raw))
+	if !strings.HasPrefix(trimmed, `"`) {
+		return nil
+	}
+	if escape := unpairedSurrogateEscape(trimmed); escape != "" {
+		return errInvalid(`lineage document edge "` + endpoint + `" name contains an unpaired Unicode surrogate escape: ` + escape)
+	}
+	return nil
+}
+
+// unpairedSurrogateEscape scans a valid JSON string literal (surrounding
+// quotes included) for a \uXXXX escape in the UTF-16 surrogate range that does
+// not form a valid pair, and returns the first offending escape exactly as
+// written — or "" when every surrogate escape is properly paired. A high
+// surrogate (D800–DBFF) is valid only when the very next thing in the string
+// is a low-surrogate escape (DC00–DFFF); a lone high surrogate, a lone low
+// surrogate, a reversed pair and a pair separated by other characters are all
+// unpaired. encoding/json decodes a lone surrogate to U+FFFD instead of
+// failing, which would silently merge byte-different names into one, so the
+// raw literal is checked before the decoded value is trusted. An escaped
+// backslash (\\) is consumed as a unit, so text following it — as in the
+// literal "\\ud800" — is never mistaken for an escape introducer.
+func unpairedSurrogateEscape(literal string) string {
+	s := literal[1 : len(literal)-1] // the caller guarantees a quoted string
+	for i := 0; i < len(s); {
+		if s[i] != '\\' {
+			i++
+			continue
+		}
+		if s[i+1] != 'u' {
+			i += 2 // \\, \", \n, ... — the next byte belongs to this escape
+			continue
+		}
+		// The literal already decoded successfully, so four hex digits follow.
+		cp, _ := strconv.ParseUint(s[i+2:i+6], 16, 32)
+		switch {
+		case cp >= 0xD800 && cp <= 0xDBFF:
+			if i+12 <= len(s) && s[i+6] == '\\' && s[i+7] == 'u' {
+				lo, _ := strconv.ParseUint(s[i+8:i+12], 16, 32)
+				if lo >= 0xDC00 && lo <= 0xDFFF {
+					i += 12 // a complete pair encoding one character
+					continue
+				}
+			}
+			return s[i : i+6]
+		case cp >= 0xDC00 && cp <= 0xDFFF:
+			return s[i : i+6] // a low surrogate with no high surrogate before it
+		}
+		i += 6
+	}
+	return ""
 }
 
 // objectFrame tracks one container during the structural key scan: whether it
