@@ -24,7 +24,12 @@ import (
 //     the same direction the exports use. Each edge becomes the derived
 //     dataset's direct upstream (Parents) and, mirrored, the upstream's direct
 //     downstream (Children). The same dependency listed more than once counts
-//     once.
+//     once. The endpoint fields are recognized by their exact decoded key
+//     name: only keys that decode to precisely "from" and "to" (any JSON
+//     escape spelling included) set the endpoints. Case variants such as
+//     "From" or "TO" are unknown fields — ignored like any other unknown
+//     field, their values never validated or used — so an edge carrying only
+//     a case variant is rejected as missing that endpoint.
 //
 // Import scope is exactly the document: nothing is invented, inferred or
 // completed. A document produced by a source-scoped export rebuilds only that
@@ -130,19 +135,22 @@ func ImportLineage(text string) (map[string]*Lineage, error) {
 		// Decode the object structurally without accepting endpoint strings:
 		// the from/to values are then validated as names themselves, so an
 		// unpaired surrogate escape in an endpoint fails the import instead of
-		// silently matching a real "�" dataset.
-		var edgeRaw struct {
-			From json.RawMessage `json:"from"`
-			To   json.RawMessage `json:"to"`
-		}
+		// silently matching a real "�" dataset. Keys are matched by their exact
+		// decoded name through a map: only fields literally named "from" and
+		// "to" (however escaped in the raw text) set the endpoints. A struct
+		// unmarshal would also bind case variants like "From" or "FROM" to the
+		// endpoint fields, letting an unknown field overwrite the declared
+		// endpoints depending on member order; here they are unknown fields
+		// like any other and their values never participate in the lineage.
+		var edgeRaw map[string]json.RawMessage
 		if err := json.Unmarshal(item, &edgeRaw); err != nil {
 			return nil, errInvalid(`lineage document edges must be an array of {"from": ..., "to": ...} objects: ` + err.Error())
 		}
-		from, err := unmarshalEndpointName(edgeRaw.From, "from")
+		from, err := unmarshalEndpointName(edgeRaw["from"], "from")
 		if err != nil {
 			return nil, err
 		}
-		to, err := unmarshalEndpointName(edgeRaw.To, "to")
+		to, err := unmarshalEndpointName(edgeRaw["to"], "to")
 		if err != nil {
 			return nil, err
 		}
