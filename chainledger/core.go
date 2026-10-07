@@ -234,42 +234,38 @@ func toSet(names []string) map[string]bool {
 }
 
 // withName returns a NEW sorted, duplicate-free slice that is list with name
-// inserted at its byte-order position. It never writes through list's backing
-// array: that array may be shared with another record's name list (or may have
-// spare capacity another record's window occupies), so an in-place insertion
-// could overwrite names the other record still owns. Entries other than the
-// insertion are copied verbatim; the returned slice has no spare capacity.
+// added. It never writes through list's backing array: that array may be
+// shared with another record's name list (or may have spare capacity another
+// record's window occupies), so an in-place insertion could overwrite names
+// the other record still owns. The input list itself may be unsorted or hold
+// duplicate names in a hand-constructed graph, so the result is rebuilt by
+// copy and normalized with uniqueSorted rather than by binary-search
+// insertion: name ends up present exactly once, at its byte-order position,
+// and every other name is preserved exactly once as well.
 func withName(list []string, name string) []string {
-	index := sort.SearchStrings(list, name)
-	if index < len(list) && list[index] == name {
-		// Already present; return an independent copy so callers can never
-		// mutate a shared backing array through the result.
-		return append([]string(nil), list...)
-	}
-	out := make([]string, 0, len(list)+1)
-	out = append(out, list[:index]...)
-	out = append(out, name)
-	out = append(out, list[index:]...)
-	return out
+	combined := make([]string, 0, len(list)+1)
+	combined = append(combined, list...)
+	combined = append(combined, name)
+	return uniqueSorted(combined)
 }
 
-// withoutName returns a NEW sorted slice equal to list with name omitted (if
-// present). Unlike an in-place append(list[:i], list[i+1:]...), it never
-// shifts the original backing array, so removing a name from one record can
-// not move or duplicate the names another record's list shares in the same
-// storage. A list without the name — including one that becomes empty — is
-// still returned as an independent slice (nil when empty, matching the
-// package's empty-lineage convention).
+// withoutName returns a NEW sorted, duplicate-free slice equal to list with
+// EVERY occurrence of name omitted. Unlike an in-place
+// append(list[:i], list[i+1:]...), it never shifts the original backing
+// array, so removing a name from one record can not move or duplicate the
+// names another record's list shares in the same storage. The input list may
+// be unsorted or hold the name (or other names) more than once, so removal is
+// a full filter rather than a binary search — a search that assumes sorted
+// input can miss the name or drop only one of several copies. A list without
+// the name — including one that becomes empty — is still returned as an
+// independent slice (nil when empty, matching the package's empty-lineage
+// convention).
 func withoutName(list []string, name string) []string {
-	index := sort.SearchStrings(list, name)
-	if index >= len(list) || list[index] != name {
-		return append([]string(nil), list...)
+	remaining := make([]string, 0, len(list))
+	for _, existing := range list {
+		if existing != name {
+			remaining = append(remaining, existing)
+		}
 	}
-	if len(list) == 1 {
-		return nil
-	}
-	out := make([]string, 0, len(list)-1)
-	out = append(out, list[:index]...)
-	out = append(out, list[index+1:]...)
-	return out
+	return uniqueSorted(remaining)
 }
