@@ -193,22 +193,36 @@ func toSet(names []string) map[string]bool {
 }
 
 // addName inserts name into the already-sorted list, skipping duplicates.
+// The result always uses a fresh backing array: two lineage records may
+// legitimately share one backing array in a hand-built graph, and writing the
+// insertion in place would shift or overwrite names the other record still
+// owns.
 func addName(list []string, name string) []string {
 	index := sort.SearchStrings(list, name)
 	if index < len(list) && list[index] == name {
-		return list
+		// Keep the relationship as-is, but still hand back an independent
+		// backing array so later commits can never reach through an alias.
+		return append([]string(nil), list...)
 	}
-	list = append(list, "")
-	copy(list[index+1:], list[index:])
-	list[index] = name
-	return list
+	out := make([]string, 0, len(list)+1)
+	out = append(out, list[:index]...)
+	out = append(out, name)
+	out = append(out, list[index:]...)
+	return out
 }
 
 // removeName drops name from the already-sorted list if it is present.
+// The result is built on a fresh backing array: collapsing the gap in place
+// (append(list[:index], list[index+1:]...)) writes into storage another
+// lineage record may share, corrupting a relationship this registration did
+// not change.
 func removeName(list []string, name string) []string {
 	index := sort.SearchStrings(list, name)
 	if index >= len(list) || list[index] != name {
 		return list
 	}
-	return append(list[:index], list[index+1:]...)
+	out := make([]string, 0, len(list)-1)
+	out = append(out, list[:index]...)
+	out = append(out, list[index+1:]...)
+	return out
 }
