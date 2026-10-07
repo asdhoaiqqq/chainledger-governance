@@ -1,19 +1,63 @@
-// This file is the single business rule shared by the two read-only reports a
+// This file holds the root-source rules behind the two read-only reports a
 // frozen snapshot supports:
 //
 //   - source tracing (TraceSources) lists every root source with one
-//     representative path per root, and
+//     representative SHORTEST PATH per root (traceRootSources), and
 //   - snapshot comparison (CompareSnapshots) decides, for each dataset common
-//     to two versions, whether that reachable root set changed.
+//     to two versions, whether the reachable root SET changed (rootSources).
 //
-// Both ask the same question — "which datasets without upstreams are reachable
-// from this one by following direct upstream edges" — so they walk the same
-// normalized adjacency through the one finder below. The comparison can never
-// explain a root differently from a trace run against the same snapshot: its
-// old/new root names are a strict projection of what traceRootSources returns.
+// Both ask the same reachability question — "which datasets without upstreams
+// are reachable from this one by following direct upstream edges" — but the
+// comparison never displays a path: it only compares two root-name sets. The
+// two walkers below are therefore deliberately separate. A names-only
+// reachability walk is all the comparison needs; it neither selects a
+// representative route among several branches nor builds or copies a path for
+// any root, so a long derivation chain (or many downstreams sharing one
+// upstream segment) never causes trace-shaped slices to be allocated only to
+// be thrown away. Tracing still walks with full path state, because its
+// report does carry paths. Walking the same normalized adjacency under the
+// same root rule keeps the two reports in agreement: a root is reachable for
+// the comparison exactly when a trace against the same snapshot lists it.
 package chainledger
 
 import "sort"
+
+// rootSources finds, for one dataset within an already validated adjacency,
+// the names of every root source reachable by following direct upstream
+// edges. It is the comparison-only half of this file: it computes just the
+// root-name set, and never builds, chooses, or copies a path, because the
+// compare report never carries one.
+//
+// A dataset that itself has no upstream is a root and its own source, a root
+// reached through several branches is reported exactly once, intermediates
+// that still have upstreams never qualify, and roots in disconnected
+// components are never reached. The result is sorted by name byte order, is
+// never nil, and is a fresh slice owned by the caller.
+func rootSources(dataset string, adj adjacency) []string {
+	// Plain reachability walk along direct upstream edges. Only node identity
+	// matters: the first visit marks a node for the rest of the walk, so no
+	// per-route state (and no path slices) is ever kept.
+	visited := map[string]bool{dataset: true}
+	frontier := []string{dataset}
+	roots := make([]string, 0)
+	for len(frontier) > 0 {
+		node := frontier[len(frontier)-1]
+		frontier = frontier[:len(frontier)-1]
+		parents := adj[node]
+		if len(parents) == 0 {
+			roots = append(roots, node)
+			continue
+		}
+		for _, parent := range parents {
+			if !visited[parent] {
+				visited[parent] = true
+				frontier = append(frontier, parent)
+			}
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
 
 // traceRootSources finds, for one dataset within an already validated
 // adjacency, every root source reachable by following direct upstream edges:
@@ -67,22 +111,6 @@ func traceRootSources(dataset string, adj adjacency) []SourceTrace {
 	}
 	sort.Slice(sources, func(i, j int) bool { return sources[i].Root < sources[j].Root })
 	return sources
-}
-
-// rootSources is the names-only projection of the shared finder: the sorted
-// root names a snapshot comparison records as a dataset's old or new sources.
-// It is deliberately computed through traceRootSources so that the
-// comparison's roots are exactly the names a TraceSources query reports
-// against the same snapshot, in the same byte order. A node without upstreams
-// is itself a root and its own source; a root reached by more than one path
-// counts once. The result is sorted by name and never nil.
-func rootSources(node string, adj adjacency) []string {
-	traces := traceRootSources(node, adj)
-	roots := make([]string, 0, len(traces))
-	for _, src := range traces {
-		roots = append(roots, src.Root)
-	}
-	return roots
 }
 
 // pathLess compares two equal-purpose paths element by element from the start

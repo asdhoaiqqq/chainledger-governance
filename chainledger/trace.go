@@ -35,9 +35,12 @@ type TraceReport struct {
 // snap. The snapshot is assumed to have passed ParseSnapshot; it is only read,
 // never modified.
 //
-// The root lookup itself is the one shared rule traceRootSources, the same
-// finder the snapshot comparison uses to judge whether a dataset's sources
-// changed, so the two reports can never explain a root differently.
+// The root lookup follows the one root-source rule shared with the snapshot
+// comparison (see root_sources.go): both walk the same normalized adjacency
+// for "which upstream-less datasets are reachable", so the two reports can
+// never explain a root differently. The comparison computes the root-name
+// sets only; the trace additionally carries one representative path per
+// root.
 //
 // Every reachable root is reported exactly once with one shortest path (fewest
 // direct relations). Among equally short paths the one chosen is the smallest
