@@ -410,6 +410,12 @@ type objectFrame struct {
 // the explicit scan makes document problems deterministic.
 func rejectDuplicateKeys(text string) error {
 	dec := json.NewDecoder(strings.NewReader(text))
+	// Numbers are only structure here, never values: keep them as raw
+	// json.Number literals so a syntactically valid number of any magnitude
+	// (1e400, a hundred-digit integer) tokenizes without a float64 range
+	// error. The scanner still validates the literal itself, so 01, 1e or
+	// NaN remain malformed JSON and fail the document.
+	dec.UseNumber()
 	var stack []objectFrame
 	rootClosed := false
 	for {
