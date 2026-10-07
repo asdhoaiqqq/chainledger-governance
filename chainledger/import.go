@@ -77,6 +77,14 @@ import (
 //   - Both endpoints of every edge must be listed in nodes; an edge naming a
 //     dataset the document does not list fails the whole import, and the error
 //     names that dataset. Edges missing an endpoint are rejected the same way.
+//   - Edge endpoints are recognized strictly by their decoded JSON key: only a
+//     key that decodes to exactly "from" or "to" decides an endpoint. A
+//     different spelling ("From", "FROM", …) is an ordinary unknown field, no
+//     matter where it sits relative to the official key or what it contains
+//     (a string, number, null or nested object), and never overrides, fills in
+//     or rescues an endpoint. A \uXXXX escape spelling that decodes to "from"
+//     or "to" is the official key; repeating it together with the plain
+//     spelling is a duplicated key like any other.
 //   - A self-dependency or a dependency cycle of any length fails the whole
 //     import; the error states that the lineage contains a cycle and names the
 //     datasets on it.
@@ -127,22 +135,27 @@ func ImportLineage(text string) (map[string]*Lineage, error) {
 		if !strings.HasPrefix(trimmed, "{") {
 			return nil, errInvalid(`lineage document edges must be an array of {"from": ..., "to": ...} objects`)
 		}
-		// Decode the object structurally without accepting endpoint strings:
-		// the from/to values are then validated as names themselves, so an
-		// unpaired surrogate escape in an endpoint fails the import instead of
-		// silently matching a real "�" dataset.
-		var edgeRaw struct {
-			From json.RawMessage `json:"from"`
-			To   json.RawMessage `json:"to"`
-		}
+		// Decode the object into a case-sensitive map rather than a tagged
+		// struct: only a member whose decoded key is exactly "from" or "to" may
+		// decide an endpoint. encoding/json matches struct tags
+		// case-insensitively and lets the last match win, so "From"/"FROM"
+		// would populate the same field and could, depending on field order,
+		// overwrite the real endpoint — one and the same edge would then
+		// connect to different sources. Such case variants stay ordinary
+		// unknown members here; their values never reach the endpoint checks.
+		// rejectDuplicateKeys already scanned the raw document (comparing
+		// decoded keys), so a repeated "from"/"to" — including its \uXXXX
+		// spellings — has failed the import before map decoding, which itself
+		// keeps only the last value of a repeated key, can hide one.
+		var edgeRaw map[string]json.RawMessage
 		if err := json.Unmarshal(item, &edgeRaw); err != nil {
 			return nil, errInvalid(`lineage document edges must be an array of {"from": ..., "to": ...} objects: ` + err.Error())
 		}
-		from, err := unmarshalEndpointName(edgeRaw.From, "from")
+		from, err := unmarshalEndpointName(edgeRaw["from"], "from")
 		if err != nil {
 			return nil, err
 		}
-		to, err := unmarshalEndpointName(edgeRaw.To, "to")
+		to, err := unmarshalEndpointName(edgeRaw["to"], "to")
 		if err != nil {
 			return nil, err
 		}
