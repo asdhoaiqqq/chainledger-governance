@@ -14,10 +14,13 @@
 // representative route among several branches nor builds or copies a path for
 // any root, so a long derivation chain (or many downstreams sharing one
 // upstream segment) never causes trace-shaped slices to be allocated only to
-// be thrown away. Tracing still walks with full path state, because its
-// report does carry paths. Walking the same normalized adjacency under the
-// same root rule keeps the two reports in agreement: a root is reachable for
-// the comparison exactly when a trace against the same snapshot lists it.
+// be thrown away. Tracing must additionally carry one representative path per
+// root, but it keeps only constant state per reached dataset while walking — a
+// single predecessor and a route rank — and builds each reported root's path
+// once, at the end, instead of copying a growing full-path prefix into every
+// intermediate. Walking the same normalized adjacency under the same root rule
+// keeps the two reports in agreement: a root is reachable for the comparison
+// exactly when a trace against the same snapshot lists it.
 package chainledger
 
 import "sort"
@@ -59,6 +62,16 @@ func rootSources(dataset string, adj adjacency) []string {
 	return roots
 }
 
+// traceRouteState is all the per-dataset state the trace walk keeps while it
+// runs: pred is the direct upstream on the chosen shortest, tie-broken route
+// from the queried dataset (empty only for the query itself, since validated
+// names are never empty), and rank is the lexicographic rank of that route
+// among the routes finalized in the same BFS level.
+type traceRouteState struct {
+	pred string
+	rank int
+}
+
 // traceRootSources finds, for one dataset within an already validated
 // adjacency, every root source reachable by following direct upstream edges:
 // a dataset that itself has no upstream is a root and its own source, a root
@@ -74,53 +87,87 @@ func rootSources(dataset string, adj adjacency) []string {
 // keep their own complete path. The returned entries are sorted by root name
 // byte order, and every path is a fresh slice owned by the caller, so editing
 // a returned report can never reach the adjacency or another report.
+//
+// The walk stores only constant state per reached dataset — one predecessor
+// and one route rank — never a copy of the growing path, so the storage the
+// tracing stage adds is linear in the reached datasets, the direct relations
+// scanned, and the names of the paths it actually reports: a single long chain
+// no longer makes every intermediate hold the full prefix shared with the one
+// reported path. A reported root's full path is reconstructed once at the end
+// by following predecessors, which is also what gives roots past a merge point
+// independent slices.
 func traceRootSources(dataset string, adj adjacency) []SourceTrace {
-	// Breadth-first walk from the queried dataset along direct upstream
-	// edges. best[node] holds the shortest, tie-broken path from the query to
-	// node; because every edge has the same weight, the first level at which
-	// a node is reached is its shortest distance, and keeping only the
-	// smallest candidate path per node preserves the global minimum.
-	best := map[string][]string{dataset: {dataset}}
+	// Breadth-first walk from the queried dataset along direct upstream edges.
+	// Every edge has the same weight, so the level at which a dataset is first
+	// reached is its shortest distance; state holds its chosen route and the
+	// level-local rank of that route.
+	state := map[string]traceRouteState{dataset: {rank: 0}}
 	frontier := []string{dataset}
 	for len(frontier) > 0 {
-		candidates := make(map[string][]string)
+		// candidate[parent] is the best route by which a frontier node reaches
+		// a not-yet-finalized parent at the next level. All such routes append
+		// the same parent name, so they differ only in the predecessor's route,
+		// which the predecessor's rank compares in O(1): the smallest rank is
+		// exactly the lexicographically smallest full path, with no path copy.
+		candidate := make(map[string]traceRouteState)
 		for _, node := range frontier {
+			nodeRank := state[node].rank
 			for _, parent := range adj[node] {
-				if _, seen := best[parent]; seen {
+				if _, seen := state[parent]; seen {
 					continue
 				}
-				path := append(append([]string{}, best[node]...), parent)
-				if current, ok := candidates[parent]; !ok || pathLess(path, current) {
-					candidates[parent] = path
+				if best, ok := candidate[parent]; !ok || nodeRank < best.rank {
+					candidate[parent] = traceRouteState{pred: node, rank: nodeRank}
 				}
 			}
 		}
-		next := make([]string, 0, len(candidates))
-		for node, path := range candidates {
-			best[node] = path
+		if len(candidate) == 0 {
+			break
+		}
+
+		// Finalize the next level and assign its route ranks. A route is
+		// (predecessor route, own name): sorting the level by (predecessor
+		// rank, name) therefore reproduces element-by-element UTF-8 byte order
+		// of the complete equal-length paths without ever holding them.
+		next := make([]string, 0, len(candidate))
+		for node := range candidate {
 			next = append(next, node)
+		}
+		sort.Slice(next, func(i, j int) bool {
+			ri, rj := candidate[next[i]].rank, candidate[next[j]].rank
+			if ri != rj {
+				return ri < rj
+			}
+			return next[i] < next[j]
+		})
+		for rank, node := range next {
+			state[node] = traceRouteState{pred: candidate[node].pred, rank: rank}
 		}
 		frontier = next
 	}
 
-	sources := make([]SourceTrace, 0)
-	for node, path := range best {
+	// Reachable datasets without upstreams are roots, including the query when
+	// it is one. Report them sorted by root name byte order; each path is a
+	// fresh slice walked over the predecessors and reversed, so shared prefixes
+	// are copied per root and returned paths never alias one another.
+	roots := make([]string, 0)
+	for node := range state {
 		if len(adj[node]) == 0 {
-			sources = append(sources, SourceTrace{Root: node, Path: path})
+			roots = append(roots, node)
 		}
 	}
-	sort.Slice(sources, func(i, j int) bool { return sources[i].Root < sources[j].Root })
-	return sources
-}
+	sort.Strings(roots)
 
-// pathLess compares two equal-purpose paths element by element from the start
-// using plain string (UTF-8 byte) order, deciding on the first differing
-// name. A strict prefix counts as smaller, matching lexicographic order.
-func pathLess(a, b []string) bool {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return a[i] < b[i]
+	sources := make([]SourceTrace, 0, len(roots))
+	for _, root := range roots {
+		path := []string{root}
+		for node := state[root].pred; node != ""; node = state[node].pred {
+			path = append(path, node)
 		}
+		for left, right := 0, len(path)-1; left < right; left, right = left+1, right-1 {
+			path[left], path[right] = path[right], path[left]
+		}
+		sources = append(sources, SourceTrace{Root: root, Path: path})
 	}
-	return len(a) < len(b)
+	return sources
 }
