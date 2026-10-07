@@ -50,6 +50,19 @@ type Lineage struct {
 // independent of the caller's slice: mutating parents after Register returns
 // does not affect the graph.
 //
+// The relationship change is determined solely by the submitted dataset name
+// and its new upstreams. A hand-constructed graph may have two independent
+// Lineage records whose Children (or Parents) slices share one backing array,
+// overlap in a sub-slice window, or carry spare capacity another record's
+// list occupies. Such a graph is legal as long as names correspond and no
+// reference or cycle is missing, so Register never edits those name lists in
+// place: a parent list that gains or loses the dataset receives a freshly
+// allocated, independent slice (see withName and withoutName). Removing one
+// upstream can therefore never shift or duplicate names another record's
+// list shares, and adding one can never overwrite a name living in spare
+// capacity. Records of datasets not involved in the change keep their
+// previous contents.
+//
 // Registration is atomic. If any parent is missing or the resulting graph
 // would contain a cycle (including a dataset depending on itself, directly or
 // through other nodes), no node and no parent/child record is changed. Cycle
@@ -76,11 +89,19 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 		}
 	}
 
-	// Snapshot the current parents so validation can reason about the graph
-	// after the replacement, before anything is mutated.
-	var oldParents []string
-	if current := graph[dataset.Name]; current != nil {
+	// Snapshot the relationships this commit changes on independent slices
+	// BEFORE mutating anything. The commit decides from these copies which
+	// edges are kept, added, and removed, and reassigns the dataset's own
+	// lists to them; stored lists of other records (which may share backing
+	// storage) are never resliced in place.
+	current, existed := graph[dataset.Name]
+	var oldParents, oldChildren []string
+	if current != nil {
 		oldParents = append(oldParents, current.Parents...)
+		// Normalize the preserved downstream on the copy as well, so a
+		// hand-edited unsorted or duplicated list is repaired without an
+		// in-place write.
+		oldChildren = uniqueSorted(current.Children)
 	}
 
 	// Adding an edge dataset -> parent creates a cycle exactly when parent
@@ -93,31 +114,51 @@ func Register(graph map[string]*Lineage, dataset Dataset, parents []string) erro
 	}
 
 	// ---- All checks passed; commit below this line. ----
+	//
+	// No name list is edited in place. An in-place removal
+	// (append(list[:i], list[i+1:]...)) shifts the shared backing array and
+	// corrupts every other record whose list shares that storage — the removed
+	// name lands in a neighbor's window and a kept name can duplicate or
+	// vanish. In-place insertion is equally unsafe when the list has spare
+	// capacity another record's list occupies. withName and withoutName
+	// allocate independent slices instead.
 
-	current, existed := graph[dataset.Name]
 	if !existed || current == nil {
 		current = &Lineage{Dataset: dataset.Name}
 		graph[dataset.Name] = current
 	}
+	current.Parents = wanted
+	current.Children = oldChildren
 
 	newSet := toSet(wanted)
+	oldSet := toSet(oldParents)
+
+	// Dropped upstreams lose the dataset as a child. Every name list is
+	// rewritten on a fresh slice (see withoutName): an in-place removal would
+	// shift the shared backing array and corrupt another record's list that
+	// happens to share that storage.
 	for _, oldParent := range oldParents {
 		if newSet[oldParent] {
-			continue // relationship is kept
+			continue // relationship is kept; that record's list is not touched
 		}
 		if entry := graph[oldParent]; entry != nil {
-			entry.Children = removeName(entry.Children, dataset.Name)
+			entry.Children = withoutName(entry.Children, dataset.Name)
 		}
 	}
 
-	current.Parents = wanted
+	// Only newly added upstreams gain the dataset as a child, each listing it
+	// exactly once. withName allocates a fresh slice, so spare capacity in the
+	// stored list can never overwrite names another record's list occupies in
+	// the same backing array. Kept upstreams already list the dataset and are
+	// deliberately left alone, so an unrelated record sharing their list sees
+	// no movement at all.
 	for _, parent := range wanted {
+		if oldSet[parent] {
+			continue
+		}
 		entry := graph[parent]
-		entry.Children = addName(entry.Children, dataset.Name)
+		entry.Children = withName(entry.Children, dataset.Name)
 	}
-	// Downstream is preserved; normalize defensively in case the map was
-	// hand-edited before this call.
-	current.Children = uniqueSorted(current.Children)
 
 	return nil
 }
@@ -192,23 +233,43 @@ func toSet(names []string) map[string]bool {
 	return set
 }
 
-// addName inserts name into the already-sorted list, skipping duplicates.
-func addName(list []string, name string) []string {
+// withName returns a NEW sorted, duplicate-free slice that is list with name
+// inserted at its byte-order position. It never writes through list's backing
+// array: that array may be shared with another record's name list (or may have
+// spare capacity another record's window occupies), so an in-place insertion
+// could overwrite names the other record still owns. Entries other than the
+// insertion are copied verbatim; the returned slice has no spare capacity.
+func withName(list []string, name string) []string {
 	index := sort.SearchStrings(list, name)
 	if index < len(list) && list[index] == name {
-		return list
+		// Already present; return an independent copy so callers can never
+		// mutate a shared backing array through the result.
+		return append([]string(nil), list...)
 	}
-	list = append(list, "")
-	copy(list[index+1:], list[index:])
-	list[index] = name
-	return list
+	out := make([]string, 0, len(list)+1)
+	out = append(out, list[:index]...)
+	out = append(out, name)
+	out = append(out, list[index:]...)
+	return out
 }
 
-// removeName drops name from the already-sorted list if it is present.
-func removeName(list []string, name string) []string {
+// withoutName returns a NEW sorted slice equal to list with name omitted (if
+// present). Unlike an in-place append(list[:i], list[i+1:]...), it never
+// shifts the original backing array, so removing a name from one record can
+// not move or duplicate the names another record's list shares in the same
+// storage. A list without the name — including one that becomes empty — is
+// still returned as an independent slice (nil when empty, matching the
+// package's empty-lineage convention).
+func withoutName(list []string, name string) []string {
 	index := sort.SearchStrings(list, name)
 	if index >= len(list) || list[index] != name {
-		return list
+		return append([]string(nil), list...)
 	}
-	return append(list[:index], list[index+1:]...)
+	if len(list) == 1 {
+		return nil
+	}
+	out := make([]string, 0, len(list)-1)
+	out = append(out, list[:index]...)
+	out = append(out, list[index+1:]...)
+	return out
 }
