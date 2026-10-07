@@ -123,20 +123,16 @@ func CompareUpstreamLineage(beforeText, afterText, target string) (UpstreamLinea
 // targetUpstreamEdges collects every direct dependency inside target's
 // complete upstream derivation: the target's ancestor closure as nodes, and
 // each from-upstream-to-derived edge whose two endpoints belong to that
-// closure. ImportLineage already guarantees acyclicity and endpoint
-// consistency, but the endpoint membership check keeps the scope exactly the
-// closure regardless of how the graph was built. The set de-duplicates, so a
-// repeatedly listed edge counts once.
+// closure — the same node set and edge rule ExportUpstreamLineage uses.
+// ImportLineage already guarantees acyclicity and endpoint consistency, but
+// the endpoint membership check keeps the scope exactly the closure regardless
+// of how the graph was built. The set de-duplicates, so a repeatedly listed
+// edge counts once.
 func targetUpstreamEdges(graph map[string]*Lineage, target string) map[lineageExportEdge]bool {
 	included := ancestorClosure(graph, target)
 	edges := make(map[lineageExportEdge]bool)
-	for node := range included {
-		for _, parent := range graph[node].Parents {
-			if !included[parent] {
-				continue
-			}
-			edges[lineageExportEdge{From: parent, To: node}] = true
-		}
+	for _, edge := range directDependencies(graph, included) {
+		edges[edge] = true
 	}
 	return edges
 }
@@ -145,9 +141,7 @@ func targetUpstreamEdges(graph map[string]*Lineage, target string) map[lineageEx
 // order — the same two-level order the lineage exports use for edges.
 func sortDependencies(dependencies []Dependency) {
 	sort.Slice(dependencies, func(i, j int) bool {
-		if dependencies[i].From != dependencies[j].From {
-			return dependencies[i].From < dependencies[j].From
-		}
-		return dependencies[i].To < dependencies[j].To
+		return edgeLess(dependencies[i].From, dependencies[i].To,
+			dependencies[j].From, dependencies[j].To)
 	})
 }

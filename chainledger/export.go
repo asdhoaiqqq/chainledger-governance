@@ -215,15 +215,31 @@ func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (s
 		}
 	}
 
-	// Every direct dependency between included nodes is an edge. In the full
-	// upstream export every parent of an included node is included by
-	// construction; in a source-scoped export an included intermediate node may
-	// also depend on an independent, excluded source, so the parent has to be
-	// checked against the set. The dedupe set guards the one-edge-once rule even
-	// if a stored list ever repeated a name.
+	edges := directDependencies(graph, included)
+
+	data, err := json.Marshal(lineageExportDocument{Nodes: nodes, Edges: edges})
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// directDependencies collects every direct dependency whose two endpoints both
+// belong to included: each edge exactly once, written From the upstream to the
+// derived dataset, and ordered by From and then To in Go string order. This is
+// the single edge rule shared by the lineage exports and the upstream
+// comparison.
+//
+// In the full upstream export every parent of an included node is included by
+// construction; in a source-scoped export an included intermediate node may
+// also depend on an independent, excluded source, so the parent has to be
+// checked against the set. The dedupe set guards the one-edge-once rule even
+// if a stored list ever repeated a name. Iteration order of the included set
+// does not matter: the final sort fully determines the result.
+func directDependencies(graph map[string]*Lineage, included map[string]bool) []lineageExportEdge {
 	edges := make([]lineageExportEdge, 0)
 	seen := make(map[lineageExportEdge]bool)
-	for _, name := range nodes {
+	for name := range included {
 		for _, parent := range graph[name].Parents {
 			if !included[parent] {
 				continue
@@ -236,15 +252,17 @@ func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (s
 		}
 	}
 	sort.Slice(edges, func(i, j int) bool {
-		if edges[i].From != edges[j].From {
-			return edges[i].From < edges[j].From
-		}
-		return edges[i].To < edges[j].To
+		return edgeLess(edges[i].From, edges[i].To, edges[j].From, edges[j].To)
 	})
+	return edges
+}
 
-	data, err := json.Marshal(lineageExportDocument{Nodes: nodes, Edges: edges})
-	if err != nil {
-		return "", err
+// edgeLess orders from/to pairs by From and then To, both in Go string order —
+// the two-level edge order shared by the lineage exports and the upstream
+// comparison.
+func edgeLess(aFrom, aTo, bFrom, bTo string) bool {
+	if aFrom != bFrom {
+		return aFrom < bFrom
 	}
-	return string(data), nil
+	return aTo < bTo
 }
