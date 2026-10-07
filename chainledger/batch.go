@@ -75,6 +75,10 @@ type BatchReport struct {
 //     upstream is never misreported as a missing one and its original bytes
 //     stay readable in the error);
 //   - nil lineage nodes and empty dataset names are rejected;
+//   - two different dataset names must never point to the same non-nil
+//     *Lineage record: a batch rewrites a node's relationships in place, so
+//     one shared record would let an adjustment meant for one dataset silently
+//     rewrite the other, and the applied graph could never match its report;
 //   - every direct upstream must be a registered dataset, with the referrer
 //     and the referenced name both in the error;
 //   - the parent edges must be acyclic (self-dependency included), with the
@@ -102,6 +106,15 @@ func validatedGraphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 		}
 		records = append(records, GraphDataset{Name: name, Upstreams: entry.Parents})
 	}
+	// A shared record is an aliasing defect no plan can repair: the batch
+	// rewrites surviving nodes in place, so two names on one *Lineage would be
+	// changed together no matter which one the plan names. The original graph
+	// is rejected outright — even when the plan deletes one of the names or
+	// changes nothing — because the deletion must not be executed first and
+	// the graph then judged legal.
+	if first, second, shared := firstSharedLineageNode(graph); shared {
+		return nil, fmt.Errorf("%w: datasets %q and %q share the same lineage node; each dataset must have its own record, otherwise one adjustment would rewrite both", ErrInvalidArgument, first, second)
+	}
 	adj, err := normalizeDatasets(records)
 	if err != nil {
 		return nil, err
@@ -109,9 +122,44 @@ func validatedGraphAdjacency(graph map[string]*Lineage) (adjacency, error) {
 	return validateGraphAdjacency(adj)
 }
 
+// firstSharedLineageNode reports the earliest pair of dataset names that
+// point to the same non-nil *Lineage record, or shared == false when every
+// name has its own record. Nil nodes are skipped (the caller rejects them
+// separately); pointer identity is the only thing judged, so two independent
+// records whose fields happen to be identical — or whose parent lists happen
+// to share a backing slice — are not a conflict.
+//
+// The reported pair is deterministic regardless of map iteration order: for
+// each record referenced by more than one name the two smallest names (UTF-8
+// byte order, the same ordering every name list in this package uses) form
+// that record's candidate pair, and the candidate whose first name is
+// smallest wins. One record referenced by three or more names therefore
+// reports its two smallest names, and several shared records report the pair
+// that sorts first overall.
+func firstSharedLineageNode(graph map[string]*Lineage) (first, second string, shared bool) {
+	byNode := make(map[*Lineage][]string)
+	for name, entry := range graph {
+		if entry == nil {
+			continue
+		}
+		byNode[entry] = append(byNode[entry], name)
+	}
+	for _, names := range byNode {
+		if len(names) < 2 {
+			continue
+		}
+		sort.Strings(names)
+		if !shared || names[0] < first || (names[0] == first && names[1] < second) {
+			first, second, shared = names[0], names[1], true
+		}
+	}
+	return first, second, shared
+}
+
 // ValidateGraph checks the in-memory graph for structural problems: nil nodes,
 // empty names, names that are not valid UTF-8 (dataset names or direct upstream
-// references), missing upstreams, and cycles. It does not mutate the graph.
+// references), two dataset names sharing one lineage record, missing
+// upstreams, and cycles. It does not mutate the graph.
 //
 // A graph that fails validation cannot be used as the basis for a batch: an
 // adjustment plan must not be allowed to paper over pre-existing corruption.
