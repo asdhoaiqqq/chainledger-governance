@@ -61,6 +61,15 @@ import (
 //     JSON, more than one JSON value, a non-object document, a duplicated
 //     object key, a missing or null array, or an element of the wrong type is
 //     rejected.
+//   - Unknown fields are attached content, not lineage, and their values are
+//     never range-checked: a grammatical number of any magnitude — 1e400, a
+//     400-digit integer, large or small, positive or negative, in decimal or
+//     exponent spelling, at the top level, inside an edge, or nested in
+//     objects and arrays — is ignored and can neither fail the import nor
+//     become a dataset name or dependency. Only number grammar is enforced, so
+//     spellings such as 01, 1e or NaN are malformed JSON and fail the import
+//     like any other malformed value; an unknown field placed before or after
+//     the nodes, edges or endpoint members changes nothing.
 //   - An empty node name is rejected as a missing name.
 //   - A name (a node name, or an edge's "from" or "to") containing an unpaired
 //     Unicode surrogate escape is rejected. encoding/json rewrites a lone
@@ -407,9 +416,20 @@ type objectFrame struct {
 // trailing JSON value after the closing object. encoding/json accepts all
 // three silently (last key wins; null decodes into a map as no value at all;
 // trailing values are rejected by Unmarshal but with a generic message), so
-// the explicit scan makes document problems deterministic.
+// the explicit scan makes document problems deterministic. The decoder runs
+// with UseNumber so the tokenizer never converts a value to float64: that
+// would reject magnitude-overflowing numbers (1e400) even in unknown fields
+// whose values are ignored. Lexically invalid numbers (01, 1e, NaN) are
+// still tokenizer errors and therefore fail the import.
 func rejectDuplicateKeys(text string) error {
 	dec := json.NewDecoder(strings.NewReader(text))
+	// Numbers are kept as their raw JSON spelling instead of being parsed into
+	// float64: a grammatical number whose magnitude overflows a float (1e400,
+	// a 400-digit integer, in either sign) must not fail the scan when it sits
+	// in an unknown field whose value is ignored anyway. The decoder still
+	// enforces number grammar, so spellings such as 01, 1e or NaN are rejected
+	// as malformed JSON below. json.Number tokens arrive in the default case.
+	dec.UseNumber()
 	var stack []objectFrame
 	rootClosed := false
 	for {
