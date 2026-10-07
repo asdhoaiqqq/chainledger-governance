@@ -252,23 +252,44 @@ func TestCompareUpstreamLineageEmptyTarget(t *testing.T) {
 // lists.
 func TestCompareUpstreamLineageTargetNotRegistered(t *testing.T) {
 	withT := compareDoc(t, []string{"s", "t"}, [][2]string{{"s", "t"}})
-	withoutT := compareDoc(t, []string{"s"}, nil)
+	// A valid document that simply does not register t: explicit empty arrays,
+	// since a null edges field would make the document itself invalid and the
+	// failure would be the document rejection, not the missing target.
+	withoutT := `{"nodes":["s"],"edges":[]}`
 
-	if _, err := CompareUpstreamLineage(withoutT, withT, "t"); err == nil {
+	if diff, err := CompareUpstreamLineage(withoutT, withT, "t"); err == nil {
 		t.Fatal("expected error when target missing from before document")
 	} else {
 		msg := err.Error()
-		if !strings.Contains(msg, "t") || !strings.Contains(msg, "before-change") {
-			t.Fatalf("error %q must name the target and the before-change document", msg)
+		if !strings.Contains(msg, `"t"`) && !strings.Contains(msg, " t ") && !strings.HasSuffix(msg, " t") {
+			t.Fatalf("error %q must name the target", msg)
+		}
+		if !strings.Contains(msg, "before-change") {
+			t.Fatalf("error %q must identify the before-change document", msg)
+		}
+		if strings.Contains(msg, "rejected") {
+			t.Fatalf("error %q must be the target-not-registered failure, not a document rejection", msg)
+		}
+		if diff.Added != nil || diff.Removed != nil {
+			t.Fatalf("failed comparison must return the zero result, got %+v", diff)
 		}
 	}
 
-	if _, err := CompareUpstreamLineage(withT, withoutT, "t"); err == nil {
+	if diff, err := CompareUpstreamLineage(withT, withoutT, "t"); err == nil {
 		t.Fatal("expected error when target missing from after document")
 	} else {
 		msg := err.Error()
-		if !strings.Contains(msg, "t") || !strings.Contains(msg, "after-change") {
-			t.Fatalf("error %q must name the target and the after-change document", msg)
+		if !strings.Contains(msg, `"t"`) && !strings.Contains(msg, " t ") && !strings.HasSuffix(msg, " t") {
+			t.Fatalf("error %q must name the target", msg)
+		}
+		if !strings.Contains(msg, "after-change") {
+			t.Fatalf("error %q must identify the after-change document", msg)
+		}
+		if strings.Contains(msg, "rejected") {
+			t.Fatalf("error %q must be the target-not-registered failure, not a document rejection", msg)
+		}
+		if diff.Added != nil || diff.Removed != nil {
+			t.Fatalf("failed comparison must return the zero result, got %+v", diff)
 		}
 	}
 }
