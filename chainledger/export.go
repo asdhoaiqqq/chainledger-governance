@@ -215,15 +215,35 @@ func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (s
 		}
 	}
 
-	// Every direct dependency between included nodes is an edge. In the full
-	// upstream export every parent of an included node is included by
-	// construction; in a source-scoped export an included intermediate node may
-	// also depend on an independent, excluded source, so the parent has to be
-	// checked against the set. The dedupe set guards the one-edge-once rule even
-	// if a stored list ever repeated a name.
+	// Every direct dependency between included nodes is an edge, collected by
+	// the rule the lineage exports and the upstream comparison share.
+	edges := directDependenciesWithin(graph, included)
+
+	data, err := json.Marshal(lineageExportDocument{Nodes: nodes, Edges: edges})
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// directDependenciesWithin collects every direct dependency whose two
+// endpoints both belong to included: the one rule the lineage exports and the
+// upstream comparison share for turning a decided node set into edges. Each
+// edge is written {"from": upstream, "to": derived} in the actual derivation
+// direction, appears exactly once, and the result is ordered by From and then
+// To in Go string order, so the output depends only on the graph and the node
+// set — never on registration or stored upstream-list order.
+//
+// The endpoint membership check is what keeps each caller's scope exact: in
+// the full upstream export every parent of an included node is included by
+// construction, but in a source-scoped export an included intermediate node
+// may also depend on an independent, excluded source, and in the comparison
+// the closure must hold regardless of how the graph was built. The dedupe set
+// guards the one-edge-once rule even if a stored list ever repeated a name.
+func directDependenciesWithin(graph map[string]*Lineage, included map[string]bool) []lineageExportEdge {
 	edges := make([]lineageExportEdge, 0)
 	seen := make(map[lineageExportEdge]bool)
-	for _, name := range nodes {
+	for name := range included {
 		for _, parent := range graph[name].Parents {
 			if !included[parent] {
 				continue
@@ -241,10 +261,5 @@ func renderLineageExport(graph map[string]*Lineage, included map[string]bool) (s
 		}
 		return edges[i].To < edges[j].To
 	})
-
-	data, err := json.Marshal(lineageExportDocument{Nodes: nodes, Edges: edges})
-	if err != nil {
-		return "", err
-	}
-	return string(data), nil
+	return edges
 }

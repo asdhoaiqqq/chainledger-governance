@@ -1,7 +1,5 @@
 package chainledger
 
-import "sort"
-
 // Dependency is one direct lineage relationship in an upstream comparison
 // result, written in the same direction the exports use: From is the upstream
 // dataset and To is the dataset derived from it.
@@ -101,53 +99,33 @@ func CompareUpstreamLineage(beforeText, afterText, target string) (UpstreamLinea
 		return UpstreamLineageDiff{}, errInvalid("target dataset " + target + " not found in the after-change lineage document")
 	}
 
-	beforeEdges := targetUpstreamEdges(beforeGraph, target)
-	afterEdges := targetUpstreamEdges(afterGraph, target)
+	// The comparison scope in each document is the target's ancestor closure
+	// and the direct dependencies inside it — the same node set and the same
+	// edge rule the lineage exports use. Both edge lists come back deduplicated
+	// and ordered by From and then To, so the diff lists built from them are
+	// already in result order.
+	beforeEdges := directDependenciesWithin(beforeGraph, ancestorClosure(beforeGraph, target))
+	afterEdges := directDependenciesWithin(afterGraph, ancestorClosure(afterGraph, target))
+
+	beforeSet := make(map[lineageExportEdge]bool, len(beforeEdges))
+	for _, edge := range beforeEdges {
+		beforeSet[edge] = true
+	}
+	afterSet := make(map[lineageExportEdge]bool, len(afterEdges))
+	for _, edge := range afterEdges {
+		afterSet[edge] = true
+	}
 
 	diff := UpstreamLineageDiff{Added: []Dependency{}, Removed: []Dependency{}}
-	for edge := range afterEdges {
-		if !beforeEdges[edge] {
+	for _, edge := range afterEdges {
+		if !beforeSet[edge] {
 			diff.Added = append(diff.Added, Dependency{From: edge.From, To: edge.To})
 		}
 	}
-	for edge := range beforeEdges {
-		if !afterEdges[edge] {
+	for _, edge := range beforeEdges {
+		if !afterSet[edge] {
 			diff.Removed = append(diff.Removed, Dependency{From: edge.From, To: edge.To})
 		}
 	}
-	sortDependencies(diff.Added)
-	sortDependencies(diff.Removed)
 	return diff, nil
-}
-
-// targetUpstreamEdges collects every direct dependency inside target's
-// complete upstream derivation: the target's ancestor closure as nodes, and
-// each from-upstream-to-derived edge whose two endpoints belong to that
-// closure. ImportLineage already guarantees acyclicity and endpoint
-// consistency, but the endpoint membership check keeps the scope exactly the
-// closure regardless of how the graph was built. The set de-duplicates, so a
-// repeatedly listed edge counts once.
-func targetUpstreamEdges(graph map[string]*Lineage, target string) map[lineageExportEdge]bool {
-	included := ancestorClosure(graph, target)
-	edges := make(map[lineageExportEdge]bool)
-	for node := range included {
-		for _, parent := range graph[node].Parents {
-			if !included[parent] {
-				continue
-			}
-			edges[lineageExportEdge{From: parent, To: node}] = true
-		}
-	}
-	return edges
-}
-
-// sortDependencies orders dependencies by From and then To, both in Go string
-// order — the same two-level order the lineage exports use for edges.
-func sortDependencies(dependencies []Dependency) {
-	sort.Slice(dependencies, func(i, j int) bool {
-		if dependencies[i].From != dependencies[j].From {
-			return dependencies[i].From < dependencies[j].From
-		}
-		return dependencies[i].To < dependencies[j].To
-	})
 }
