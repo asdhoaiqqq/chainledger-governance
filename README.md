@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。要把这样一份血缘 JSON 文本重新交回库、成功时得到一张**独立的新血缘图**并可直接继续登记与查询，调用同一库的 `ImportLineage` 函数，见下文「导入血缘 JSON（Go 库）」一节，示例位于 [`examples/import-lineage`](examples/import-lineage/main.go)；导入文档里夹带的统计、备注与大小写不同字段哪些会成为真实依赖、哪些会被忽略，见该节「端点键只认解码后精确等于 `from`、`to` 的键」起的两个小节，示例位于 [`examples/import-lineage-fields`](examples/import-lineage-fields/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。要把这样一份血缘 JSON 文本重新交回库、成功时得到一张**独立的新血缘图**并可直接继续登记与查询，调用同一库的 `ImportLineage` 函数，见下文「导入血缘 JSON（Go 库）」一节，示例位于 [`examples/import-lineage`](examples/import-lineage/main.go)；导入文档里夹带的统计、备注与大小写不同字段哪些会成为真实依赖、哪些会被忽略，见该节「端点键只认解码后精确等于 `from`、`to` 的键」起的两个小节，示例位于 [`examples/import-lineage-fields`](examples/import-lineage-fields/main.go)。已有变更前、变更后两份血缘 JSON 文档时，要回答**某个目标数据集的完整上游依赖增加、移除了什么**，调用同一库的 `DiffUpstreamLineage` 函数，见下文「对比两份血缘文档的上游差异（Go 库）」一节，示例位于 [`examples/diff-upstreams`](examples/diff-upstreams/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -758,6 +758,67 @@ three-node cycle refused: lineage contains a cycle: a -> b -> c -> a
 - **往返字节一致。** 同一份限定来源导出导入后再次导出，文本逐字节相同。
 - **两个空数组是可用空图**，登记 `fresh` 成功；空文本、缺失端点、自依赖和三环都整次失败且不返回部分图。
 - 现有导出格式、名称限制与查询行为保持不变；导入不引入新的名称清洗，也不经过命令行——命令行继续只有 `demo`、`version`、`help`。
+
+## 对比两份血缘文档的上游差异（Go 库）
+
+`chainledger.DiffUpstreamLineage(beforeText, afterText, target)` 回答版本比较问题：调用方提供**变更前**、**变更后**两份血缘 JSON 文本（各自是当时完整血缘的一份文档，形状与导入、导出完全一致）和一个目标数据集名称，得到这个目标的**完整上游依赖**在两份文档之间增加了什么、移除了什么。两份文档各自先经过与 `ImportLineage` 完全相同的导入校验与去重，再在各自的新图上取目标的上游闭包做比较；调用方不需要自己建图，对比也不读取、不修改任何已有图。
+
+返回值是 `chainledger.UpstreamLineageDiff`，分两组：
+
+- `Added`：只在变更后文档中存在的直接依赖（新增依赖）。
+- `Removed`：只在变更前文档中存在的直接依赖（移除依赖）。
+
+每项是一条 `chainledger.LineageDiffEdge`，保留 `From`（来源）与 `To`（派生数据集）两个名称，方向与导出的 `from`、`to` 一致。双方都有的关系不列出；同一关系只出现一次；每组先按 `From`、再按 `To` 的 Go 字符串顺序排列。**没有变化时对比成功**，两组都是非 nil 的空列表——“没有变化”不是失败。
+
+比较范围是目标在各自文档中**真正依赖的完整上游**：目标自身加上沿 parent 边可达的全部直接、间接上游，以及这些节点之间的全部现存直接依赖。因此：
+
+- **所有真实分支都参与比较**，不只看目标的直接上游，也不只看某条最短说明路径。目标同时经直达关系和经中间数据集的较长路线依赖同一来源时，仅删除较长路线上的一条边也会出现在结果里。
+- **整段脱离派生的上游会完整列出。** 若某次删除使一段上游彻底不再参与目标的派生，那一段原本属于比较范围的每条依赖都作为移除列出，而不只是被剪断的那一条边。
+- **祖先换源也能看到。** 目标的直接上游没有变化、但某个祖先改换了来源时，祖先那一段实际增删的依赖照常出现在两组结果里。
+- **范围外的变化不影响结果。** 独立数据集、目标的下游、以及不参与目标派生的关系，在两份文档间怎样变化都不进入结果。
+
+名称按 JSON 解码后的**原值精确比较**：区分大小写，空格等内容原样保留。文档内节点和边的排列顺序、重复列出的节点或边都不会制造差异（导入阶段已去重）。
+
+下面的程序与 [`examples/diff-upstreams`](examples/diff-upstreams/main.go) 一致，可在仓库根目录执行 `go run ./examples/diff-upstreams` 复现。变更前 `report` 经直达边和 `raw -> mid -> report` 长路线依赖 `raw`；变更后 `mid -> report` 被删除，`mid` 由此彻底退出 `report` 的派生，于是 `raw -> mid` 也一并作为移除列出（这条边在变更后文档里仍然存在，只是不再参与 `report` 的派生）；`isolated` 的新分支和 `view` 的改接都不在 `report` 的上游范围内，不影响结果：
+
+```go
+before := `{"nodes":["raw","mid","report","view","isolated"],` +
+    `"edges":[{"from":"raw","to":"mid"},{"from":"mid","to":"report"},` +
+    `{"from":"raw","to":"report"},{"from":"report","to":"view"}]}`
+after := `{"nodes":["raw","mid","report","view","isolated","fresh"],` +
+    `"edges":[{"from":"raw","to":"mid"},{"from":"raw","to":"report"},` +
+    `{"from":"isolated","to":"view"},{"from":"isolated","to":"fresh"}]}`
+
+diff, err := chainledger.DiffUpstreamLineage(before, after, "report")
+if err != nil { /* ... */ }
+for _, edge := range diff.Removed {
+    fmt.Printf("    %s -> %s\n", edge.From, edge.To)
+}
+```
+
+实际输出（程序真实打印，不是示意）：
+
+```text
+DiffUpstreamLineage(before, after, "report"):
+  added:   []
+  removed:
+    mid -> report
+    raw -> mid
+
+no-change comparison: added=0 removed=0 err=<nil>
+
+empty target: dataset name is required
+target missing in the after document: target dataset not found in the after document: report
+after document has a cycle: after document rejected: lineage contains a cycle: a -> b -> a
+```
+
+失败规则——整次对比失败时**不返回部分差异**：
+
+- **目标名称为空**：返回缺少名称的错误（`dataset name is required`）。
+- **目标在任意一份文档中未登记**：错误指出该名称、并说明出问题的是变更前还是变更后，如 `target dataset not found in the before document: report` / `... in the after document: report`；两份都缺时先报变更前。
+- **任意一份文档未通过现有导入校验**（非法 JSON、缺失端点、依赖环等导入会拒绝的全部问题）：整次对比失败，错误以 `before document rejected: ` 或 `after document rejected: ` 开头指出哪份文档被拒绝，后接原有导入错误内容。循环依赖、缺失端点等不会被忽略。
+
+现有登记、查询、导入和导出的公开行为以及命令行入口（仍只有 `demo`、`version`、`help`）保持不变；本功能只通过 Go 库调用。
 
 ## 数据集更名（Go 库）
 
