@@ -12,7 +12,7 @@ go run ./cmd/chainledger version
 go test ./...
 ```
 
-命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。要把这样一份血缘 JSON 文本重新交回库、成功时得到一张**独立的新血缘图**并可直接继续登记与查询，调用同一库的 `ImportLineage` 函数，见下文「导入血缘 JSON（Go 库）」一节，示例位于 [`examples/import-lineage`](examples/import-lineage/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
+命令行只提供 `demo`、`version`、`help` 三个固定入口：`demo` 运行一段内置的登记与血缘演示，`version` 打印版本号。命令行**不**接收数据集名称作为查询参数。要判断“某个数据集变化会影响哪些派生数据集”，请直接在 Go 代码中调用 `chainledger` 库的 `Impacts` 函数，方式见下文「查询下游影响（Go 库）」一节；完整可运行示例位于 [`examples/impacts`](examples/impacts/main.go)。分析变化时若想把某些已登记数据集设为传播截止点、查看停止传播后的影响范围，调用同一库的 `ImpactsWithCutoffs` 函数，见下文「带传播截止名单的下游影响（Go 库）」一节，示例位于 [`examples/impacts-cutoffs`](examples/impacts-cutoffs/main.go)。反过来，要追查“一份派生数据来自哪些上游”，调用同一库的 `Upstreams` 函数，见下文「查询上游来源（Go 库）」一节，示例位于 [`examples/upstreams`](examples/upstreams/main.go)。要比较两份已登记派生数据**最近共同追到哪些上游来源**（共同来源到两个目标各自的距离与说明路径），调用同一库的 `CommonUpstreams` 函数，见下文「查询两份派生数据的最近共同上游（Go 库）」一节，示例位于 [`examples/common-upstreams`](examples/common-upstreams/main.go)。要把某个数据集**实际依赖的完整上游血缘**（全部分支、全部现存直接依赖）导出为一份 JSON 文档供其他程序读取，调用同一库的 `ExportUpstreamLineage` 函数，见下文「导出完整上游血缘（Go 库）」一节，示例位于 [`examples/export-upstreams`](examples/export-upstreams/main.go)。只想导出**某一个已登记来源怎样参与某一个已登记目标的派生**（只含该来源到该目标现存路线上的节点和直接依赖），调用同一库的 `ExportSourceTargetLineage` 函数，见下文「限定来源的上游血缘导出（Go 库）」一节，示例位于 [`examples/export-source-target`](examples/export-source-target/main.go)。要把这样一份血缘 JSON 文本重新交回库、成功时得到一张**独立的新血缘图**并可直接继续登记与查询，调用同一库的 `ImportLineage` 函数，见下文「导入血缘 JSON（Go 库）」一节，示例位于 [`examples/import-lineage`](examples/import-lineage/main.go)；导入文档里夹带的统计、备注与大小写不同字段哪些会成为真实依赖、哪些会被忽略，见该节「端点键只认解码后精确等于 `from`、`to` 的键」起的两个小节，示例位于 [`examples/import-lineage-fields`](examples/import-lineage-fields/main.go)。数据集如何登记、同名登记会替换什么，则见下文「登记数据集与维护血缘（Go 库）」一节，示例位于 [`examples/register`](examples/register/main.go)。已登记数据集如何更名、更名怎样保留依赖位置，见下文「数据集更名（Go 库）」一节，示例位于 [`examples/rename`](examples/rename/main.go)。要从血缘图中移除一个数据集的登记，调用 `chainledger.Unregister`，见下文「移除数据集登记（Go 库）」一节，示例位于 [`examples/unregister`](examples/unregister/main.go)。
 
 ## 登记数据集与维护血缘（Go 库）
 
@@ -632,6 +632,85 @@ ExportSourceTargetLineage("source", "ghost") error: dataset not found: ghost
 - **名称中不能出现未配对的 Unicode 代理项转义。即使 JSON 文本本身是合法 UTF-8，`\uD800`–`\uDFFF` 中孤立的代理项转义仍会被标准 JSON 解码悄悄改写成替代字符“�”：两个写法不同的坏名称（如 `\ud800` 与 `\ud801`）会合成同一个名称，边端点用这类转义还可能错误地连到文档中真实名为“�”的数据集。因此节点名称以及每条边 `from`、`to` 的端点名称都先按原始文本校验：高代理项转义只有紧接低代理项转义、二者共同表示一个字符时才有效（如 `\ud83d\ude00` 与直接写入的 😀 识别为同一个名称，节点和边采用不同合法写法时也能连接成功）；孤立的高代理项、孤立的低代理项、次序颠倒或中间隔着其他字符/其他转义的组合都判为无效。名称任何位置出现这个问题，整次导入都返回 nil 图和错误，即使文档还包含合法节点和关系也不返回部分图。错误会明确说明名称存在未配对的 Unicode 代理项转义、保留出错的原始转义写法（`\uXXXX`），并指出来自节点名称还是某条边的 `from` 或 `to`，不同坏名称不会都只显示成同一个“�”。真实的“�”字符（U+FFFD，直接写入或写作 `\ufffd`）是合法名称；用转义反斜线表示的普通文字（如 JSON 字符串 `"\\ud800"`）实际名称只是反斜线加后面的字母数字，完整保留、可查询可导出，不会被当作代理项转义拒绝。
 - 每条边的两个端点都必须在 `nodes` 中列出；边缺少 `from`/`to`，或端点名称未在节点中列出时，整次导入失败，错误指出该名称（如 `edge endpoint not listed in nodes: ghost`）。
 - **自依赖或任意长度的依赖环**都整次失败，错误说明成环并沿实际派生方向列出环上的数据集，环从名称最小的数据集开始首尾相接，例如 `lineage contains a cycle: a -> b -> c -> a`；自依赖报 `lineage contains a cycle: a -> a`。多个分支汇合（菱形）不是环，正常导入。
+
+#### 端点键只认解码后精确等于 `from`、`to` 的键
+
+实际文档常常夹带统计、备注或大小写不同的字段；哪些会成为真实依赖、哪些会被忽略，由下面的规则确定：
+
+- **端点按 JSON 解码后的键名精确识别。** 只有解码后恰好是 `from`、`to` 的键设置端点；`From`、`FROM`、`To`、`TO` 等大小写变体都是与 `note`、`stats` 一样的**未知字段**，其值既不校验也不使用。因此变体既不能覆盖正确的小写端点（`{"from":"raw","From":"other","to":"report"}` 导入后 `report` 只依赖 `raw`），也不能代替缺失的端点；字段排列顺序不改变结果，变体写在正确字段之前、之后或中间都一样。
+- **合法 Unicode 转义写出的同一个键仍会被识别。** 识别基于解码后的键名而非原始拼写：`"\u0066rom"`（即 `f` 的转义）与 `"f\u0072om"` 解码后都是 `from`，照常连接端点；反过来 `"\\u0066rom"`（转义反斜线加字母）解码后只是普通文字，是未知字段。同一对象里同时用明文和转义两种形式写同一个键（如 `"from"` 与 `"\u0066rom"`）属于**重复键**，按重复键拒绝。
+- **仅写 `From` 而缺少 `from` 的边整次导入失败**：返回 nil 图，错误与该字段真的不存在完全相同——`lineage document edge is missing its upstream endpoint ("from")`（只写 `To` 缺少 `to` 时报对应的 `("to")`）。同一份文档里排在它前面的合法边不会产生部分图。
+
+#### 扩展字段被忽略，但忽略有明确边界
+
+- **未知字段里的名称、对象或数组都不是节点与依赖。** 备注、统计对象中出现的数据集名称不会登记为节点，嵌套对象里的 `from`/`to` 形成员也不会连成边；这些值连“名称检查”都不参与（例如未知字段值里出现孤立代理项转义也不会按坏名称拒绝）。导入图恰好包含 `nodes` 声明的节点和小写端点声明的边。
+- **扩展值只按 JSON 语法接受，不按浮点范围接受。** 合法 JSON 数字（如 `1e400`、`-1e400`、`1e-400` 或上百位的整数）作为附带值可以出现在顶层、边对象上或嵌套备注的任意深度，即使超出 float64 范围也不会失败——它们从不被解码成数值或保存为统计元数据。但语法非法的数字（`01`、`1e` 等）无论藏在哪一层都会使整次导入失败。
+- **文档整体仍须是合法 JSON、且任何对象都不能有重复键。** “忽略未知字段”不放宽文档级校验：未知字段的嵌套对象里出现重复键（如 `"note":{"batch":"a","batch":"b"}`），整次导入仍返回 nil 图和指出重复键的错误（`lineage document contains a duplicated object key: batch`）；边对象上重复的大小写变体（两个 `"From"`）同理。
+- **扩展字段不保存也不输出。** 重新导出（`ExportUpstreamLineage` 或 `ExportSourceTargetLineage`）只得到声明的节点与直接依赖，备注、统计和变体字段没有任何痕迹；同一份无扩展字段的导出文档往返字节一致的规则不受影响。
+
+下面的程序与 [`examples/import-lineage-fields`](examples/import-lineage-fields/main.go) 一致，可在仓库根目录执行 `go run ./examples/import-lineage-fields` 复现。程序固定一份正确文档：`nodes` 只声明 `raw` 与 `report`，边对象用小写 `from`/`to` 声明 `raw -> report`，同时用大写 `From` 指向未登记的 `ghost`，边对象和顶层都带嵌套备注（含看似节点名与 `from`/`to` 形对象的数组）与 `1e400` 统计；随后打印来源查询与重新导出结果，再通过改动同一份文档展示“缺少端点”和“嵌套重复键”两种拒绝：
+
+```go
+graph, err := chainledger.ImportLineage(doc) // doc 见下
+// ...
+upstreams, _ := chainledger.Upstreams(graph, "report")
+out, _ := chainledger.ExportUpstreamLineage(graph, "report")
+
+// 改动一：删去小写 "from"，只留大写 "From"（指向 ghost）。
+// 改动二：在顶层嵌套 note 对象里重复一个 "batch" 键。
+```
+
+程序导入的那份文档是：
+
+```json
+{
+  "nodes": ["raw", "report"],
+  "edges": [
+    {
+      "from": "raw",
+      "to": "report",
+      "From": "ghost",
+      "note": {
+        "author": "ingest-job",
+        "trace": ["ghost", {"from": "ghost", "to": "phantom"}]
+      },
+      "stats": {"rows": 1e400, "ratio": 1e-400}
+    }
+  ],
+  "note": {"batch": "2026-10-07", "extra": [1, 2, {"from": "ghost", "to": "phantom"}]},
+  "stats": {"totalRows": 1e400}
+}
+```
+
+实际输出（程序真实打印，不是示意）：
+
+```text
+import ok; datasets in graph: 2
+  report parents=[raw]
+  raw    children=[report]
+
+Upstreams(report):
+  raw   distance=1 path=[raw report]
+
+Impacts(ghost) error: dataset not found: ghost
+
+ExportUpstreamLineage(report):
+{"nodes":["raw","report"],"edges":[{"from":"raw","to":"report"}]}
+
+variant 1: lowercase "from" removed, capitalized "From" stays
+  graph is nil: true
+  refused: lineage document edge is missing its upstream endpoint ("from")
+
+variant 2: a key repeated inside the nested note object
+  graph is nil: true
+  refused: lineage document contains a duplicated object key: batch
+```
+
+要点：
+
+- **进入血缘图的只有声明内容。** 图中只有 `raw`、`report` 两个节点；`report` 的唯一来源是 `raw`，距离 1，说明路径 `[raw report]`；大写 `From` 指向的 `ghost` 与备注里的 `phantom` 都不是节点，查询 `ghost` 明确按未登记报错。
+- **重新导出没有附带信息。** 输出只剩 `{"nodes":["raw","report"],"edges":[{"from":"raw","to":"report"}]}`，备注、统计和 `ghost` 不保存也不输出——用户可以直接用这一步核对附带信息有没有进入血缘图。
+- **两种改动都整次拒绝且返回 nil 图**：缺少小写端点时报与字段真的缺失相同的上游端点错误；嵌套备注里的重复键仍按重复键拒绝。
 
 下面的程序与 [`examples/import-lineage`](examples/import-lineage/main.go) 一致，可在仓库根目录执行 `go run ./examples/import-lineage` 复现。程序先建立含祖先 `pre`、独立来源 `extra`/`lone` 和目标下游 `view` 的血缘，再限定 `source -> report` 导出；导入这份文档后，新图只含五个节点：
 
