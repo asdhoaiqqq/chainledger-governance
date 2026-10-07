@@ -7,7 +7,6 @@ package chainledger
 
 import (
 	"fmt"
-	"sort"
 )
 
 // SourceTrace links one reachable root source to the path that reaches it.
@@ -36,6 +35,10 @@ type TraceReport struct {
 // snap. The snapshot is assumed to have passed ParseSnapshot; it is only read,
 // never modified.
 //
+// The root lookup itself is the one shared rule traceRootSources, the same
+// finder the snapshot comparison uses to judge whether a dataset's sources
+// changed, so the two reports can never explain a root differently.
+//
 // Every reachable root is reported exactly once with one shortest path (fewest
 // direct relations). Among equally short paths the one chosen is the smallest
 // when the names are compared element by element from the start of the path in
@@ -51,57 +54,9 @@ func TraceSources(snap *SnapshotFile, dataset string) (*TraceReport, error) {
 		return nil, fmt.Errorf("%w: dataset %q is not in the snapshot", ErrNotFound, dataset)
 	}
 
-	// Breadth-first walk from the queried dataset along direct upstream
-	// edges. best[node] holds the shortest, tie-broken path from the query to
-	// node; because every edge has the same weight, the first level at which
-	// a node is reached is its shortest distance, and keeping only the
-	// smallest candidate path per node preserves the global minimum.
-	best := map[string][]string{dataset: {dataset}}
-	frontier := []string{dataset}
-	for len(frontier) > 0 {
-		candidates := make(map[string][]string)
-		for _, node := range frontier {
-			for _, parent := range adj[node] {
-				if _, seen := best[parent]; seen {
-					continue
-				}
-				path := append(append([]string{}, best[node]...), parent)
-				if current, ok := candidates[parent]; !ok || pathLess(path, current) {
-					candidates[parent] = path
-				}
-			}
-		}
-		next := make([]string, 0, len(candidates))
-		for node, path := range candidates {
-			best[node] = path
-			next = append(next, node)
-		}
-		frontier = next
-	}
-
-	sources := make([]SourceTrace, 0)
-	for node, path := range best {
-		if len(adj[node]) == 0 {
-			sources = append(sources, SourceTrace{Root: node, Path: path})
-		}
-	}
-	sort.Slice(sources, func(i, j int) bool { return sources[i].Root < sources[j].Root })
-
 	return &TraceReport{
 		ContentID: snap.ContentID,
 		Dataset:   dataset,
-		Sources:   sources,
+		Sources:   traceRootSources(dataset, adj),
 	}, nil
-}
-
-// pathLess compares two equal-purpose paths element by element from the start
-// using plain string (UTF-8 byte) order, deciding on the first differing
-// name. A strict prefix counts as smaller, matching lexicographic order.
-func pathLess(a, b []string) bool {
-	for i := 0; i < len(a) && i < len(b); i++ {
-		if a[i] != b[i] {
-			return a[i] < b[i]
-		}
-	}
-	return len(a) < len(b)
 }

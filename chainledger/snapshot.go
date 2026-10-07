@@ -288,33 +288,6 @@ func adjacencyFromValidFile(gf GraphFile) adjacency {
 	return adj
 }
 
-// rootSources returns the root datasets reachable from node by following
-// direct upstream edges. A node without upstreams is itself a root and its own
-// source, so it is included. Nodes reached by more than one path count once.
-// The result is sorted by name and never nil.
-func rootSources(node string, adj adjacency) []string {
-	visited := make(map[string]bool)
-	var roots []string
-	var walk func(string)
-	walk = func(current string) {
-		if visited[current] {
-			return
-		}
-		visited[current] = true
-		parents := adj[current]
-		if len(parents) == 0 {
-			roots = append(roots, current)
-			return
-		}
-		for _, parent := range parents {
-			walk(parent)
-		}
-	}
-	walk(node)
-	sort.Strings(roots)
-	return orEmptyStrings(roots)
-}
-
 func orEmptyStrings(s []string) []string {
 	if s == nil {
 		return []string{}
